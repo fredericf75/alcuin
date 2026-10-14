@@ -67,6 +67,9 @@ class VaultConfig:
     )
     inbox_dir: str = "inbox"
     archive_dir: str = "archive"
+    link_pruning: bool = True
+    link_pruning_threshold: float = 0.40
+    link_pruning_max_queue: int = 10
 
     def __post_init__(self):
         inbox_pattern = f"{self.inbox_dir}/*"
@@ -122,6 +125,13 @@ class VaultConfig:
             ),
             inbox_dir=str(ingest_sec.get("inbox_dir", "inbox")),
             archive_dir=str(ingest_sec.get("archive_dir", "archive")),
+            link_pruning=bool(agent_sec.get("link_pruning", g_agent.get("link_pruning", True))),
+            link_pruning_threshold=float(
+                agent_sec.get("link_pruning_threshold", g_agent.get("link_pruning_threshold", 0.40))
+            ),
+            link_pruning_max_queue=int(
+                agent_sec.get("link_pruning_max_queue", g_agent.get("link_pruning_max_queue", 10))
+            ),
         )
 
     def apply_overrides(self, overrides: Dict[str, Any]) -> VaultConfig:
@@ -148,6 +158,9 @@ class VaultConfig:
             f"max_hops = {self.max_hops}",
             f"max_iterations = {self.max_iterations}",
             f"temperature = {self.temperature}",
+            f"link_pruning = {'true' if self.link_pruning else 'false'}",
+            f"link_pruning_threshold = {self.link_pruning_threshold}",
+            f"link_pruning_max_queue = {self.link_pruning_max_queue}",
         ]
         if self.model_name:
             agent_lines.append(f'model_name = "{self.model_name}"')

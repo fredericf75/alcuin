@@ -221,6 +221,9 @@ model_name = "llama3.2:3b"
 temperature = 0.2
 max_hops = 3
 max_iterations = 4
+link_pruning = true                # Fast System 1 semantic link gating
+link_pruning_threshold = 0.40      # Cosine similarity cutoff
+link_pruning_max_queue = 10        # Priority queue cap
 
 [storage]
 embedding_model = "nomic-embed-text"

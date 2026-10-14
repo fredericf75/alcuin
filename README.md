@@ -94,6 +94,7 @@ model_name = "llama3.2:3b"
 temperature = 0.2
 max_hops = 3
 max_iterations = 4
+link_pruning = true
 
 [storage]
 embedding_model = "nomic-embed-text"

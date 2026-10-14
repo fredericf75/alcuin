@@ -5,6 +5,7 @@ alcuin.agent.graph - LangGraph Cyclic ReAct Research Agent with Hard Turn Ceilin
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, TypedDict
@@ -365,6 +366,37 @@ class ResearchAgent:
 
         return not bool(scoped_numbers)
 
+    def score_candidate_links(
+        self,
+        query: str,
+        candidates: List[Tuple[str, str]],
+    ) -> List[Tuple[str, float]]:
+        """Score candidate wikilinks against the research query using embedding cosine similarity.
+        
+        Returns a list of (link_name, similarity_score) sorted descending by score.
+        """
+        if not candidates:
+            return []
+
+        try:
+            q_vec = self.storage.embedder.get_embedding(query)
+            q_norm = math.sqrt(sum(x * x for x in q_vec)) or 1.0
+
+            scored: List[Tuple[str, float]] = []
+            for link_clean, snippet in candidates:
+                link_text = f"{link_clean}: {snippet}" if snippet else link_clean
+                l_vec = self.storage.embedder.get_embedding(link_text)
+                l_norm = math.sqrt(sum(x * x for x in l_vec)) or 1.0
+                dot = sum(a * b for a, b in zip(q_vec, l_vec))
+                sim = max(0.0, dot / (q_norm * l_norm))
+                scored.append((link_clean, sim))
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+            return scored
+        except Exception:
+            # Fallback gracefully to retaining all candidates
+            return [(link_clean, 1.0) for link_clean, _ in candidates]
+
     def _retrieve_node(self, state: AgentState) -> Dict[str, Any]:
         evidence_list = list(state.get("evidence", []))
         visited_ids = {e["id"] for e in evidence_list}
@@ -404,6 +436,7 @@ class ResearchAgent:
             visited_queries.append(target_query)
             results = self.storage.search(target_query, top_k=4)
             new_chunks_count = 0
+            new_candidates: List[Tuple[str, str]] = []
             for r in results:
                 if r.id not in visited_ids:
                     visited_ids.add(r.id)
@@ -419,14 +452,45 @@ class ResearchAgent:
                             "score": r.score,
                         }
                     )
-                    # Add newly discovered cross-references to pending_links if in scope
+                    # Extract candidate cross-references if in broad inquiry scope
                     for link in r.wikilinks:
                         link_clean = " ".join(link.split()).strip()
                         if re.match(r"^§\s*\d+(?:\.\d+)?$", link_clean):
                             continue
                         if self._is_in_inquiry_scope(link_clean, state["question"]):
                             if link_clean not in visited_links and link_clean not in pending_links:
-                                pending_links.append(link_clean)
+                                snippet = r.breadcrumbs or ""
+                                for sentence in r.content.split(". "):
+                                    if link in sentence or link_clean in sentence:
+                                        snippet = sentence[:200].strip()
+                                        break
+                                new_candidates.append((link_clean, snippet))
+
+            # System 1 Link Pruning & Priority Queuing
+            if new_candidates:
+                if getattr(self.vault.config, "link_pruning", True):
+                    threshold = float(getattr(self.vault.config, "link_pruning_threshold", 0.40))
+                    max_queue = int(getattr(self.vault.config, "link_pruning_max_queue", 10))
+                    scored_candidates = self.score_candidate_links(state["question"], new_candidates)
+
+                    kept = [l for l, sim in scored_candidates if sim >= threshold]
+                    pruned_count = len(scored_candidates) - len(kept)
+
+                    for l in kept:
+                        if l not in pending_links:
+                            pending_links.append(l)
+
+                    if len(pending_links) > max_queue:
+                        pending_links = pending_links[:max_queue]
+
+                    if pruned_count > 0:
+                        thought_history.append(
+                            f"System 1 Link Pruner: Evaluated {len(scored_candidates)} candidate link(s); pruned {pruned_count} below threshold ({threshold:.2f})."
+                        )
+                else:
+                    for l, _ in new_candidates:
+                        if l not in pending_links:
+                            pending_links.append(l)
 
             # Targeted Topic Re-Decomposition Guard (Depth 1):
             # If query yielded zero new chunks and hasn't been re-decomposed yet, drill down!

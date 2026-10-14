@@ -37,6 +37,8 @@ class AgentState(TypedDict):
     final_answer: str
     confidence: float
     sources: List[str]
+    governor_alert: Optional[str]
+    truncation_alert: Optional[str]
 
 
 class LLMClient:
@@ -78,7 +80,12 @@ class LLMClient:
             or os.getenv("OPENAI_API_KEY")
         )
 
-    def chat(self, system_prompt: str, user_prompt: str) -> str:
+    def chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        return_metadata: bool = False,
+    ) -> Any:
         is_local = "localhost" in self.endpoint or "127.0.0.1" in self.endpoint
         is_google = (
             "generativelanguage.googleapis.com" in self.endpoint
@@ -101,12 +108,24 @@ class LLMClient:
                         data = resp.json()
                         candidates = data.get("candidates", [])
                         if candidates:
+                            finish_reason = candidates[0].get("finishReason", "")
+                            is_truncated = finish_reason in ("MAX_TOKENS", "LENGTH")
                             parts = candidates[0].get("content", {}).get("parts", [])
+                            text = ""
                             if parts:
                                 non_thought = [p.get("text", "") for p in parts if not p.get("thought", False) and p.get("text")]
                                 if non_thought:
-                                    return "\n".join(non_thought).strip()
-                                return parts[-1].get("text", "").strip()
+                                    text = "\n".join(non_thought).strip()
+                                else:
+                                    text = parts[-1].get("text", "").strip()
+                            meta = {
+                                "truncated": is_truncated,
+                                "finish_reason": finish_reason,
+                                "provider": "google",
+                            }
+                            if return_metadata:
+                                return text, meta
+                            return text
             except Exception:
                 pass
 
@@ -128,9 +147,20 @@ class LLMClient:
                     )
                     if resp.status_code == 200:
                         data = resp.json()
-                        msg = data.get("message", {}).get("content", "")
-                        if msg:
-                            return msg.strip()
+                        done_reason = data.get("done_reason", "")
+                        is_truncated = done_reason in ("length", "max_tokens")
+                        msg = data.get("message", {})
+                        text = msg.get("content", "").strip()
+                        if not text and "thinking" in msg and is_truncated:
+                            text = msg.get("thinking", "").strip()
+                        meta = {
+                            "truncated": is_truncated,
+                            "finish_reason": done_reason,
+                            "provider": "ollama",
+                        }
+                        if return_metadata:
+                            return text, meta
+                        return text
             except Exception:
                 pass
 
@@ -161,7 +191,17 @@ class LLMClient:
                     data = resp.json()
                     choices = data.get("choices", [])
                     if choices:
-                        return choices[0].get("message", {}).get("content", "").strip()
+                        finish_reason = choices[0].get("finish_reason", "")
+                        is_truncated = finish_reason in ("length", "max_tokens")
+                        text = choices[0].get("message", {}).get("content", "").strip()
+                        meta = {
+                            "truncated": is_truncated,
+                            "finish_reason": finish_reason,
+                            "provider": "openai",
+                        }
+                        if return_metadata:
+                            return text, meta
+                        return text
         except Exception:
             pass
 
@@ -183,12 +223,25 @@ class LLMClient:
                     )
                     if resp.status_code == 200:
                         data = resp.json()
-                        msg = data.get("message", {}).get("content", "")
-                        if msg:
-                            return msg.strip()
+                        done_reason = data.get("done_reason", "")
+                        is_truncated = done_reason in ("length", "max_tokens")
+                        msg = data.get("message", {})
+                        text = msg.get("content", "").strip()
+                        if not text and "thinking" in msg and is_truncated:
+                            text = msg.get("thinking", "").strip()
+                        meta = {
+                            "truncated": is_truncated,
+                            "finish_reason": done_reason,
+                            "provider": "ollama",
+                        }
+                        if return_metadata:
+                            return text, meta
+                        return text
             except Exception:
                 pass
 
+        if return_metadata:
+            return "", {"truncated": False, "finish_reason": "none", "provider": "none"}
         return ""
 
 
@@ -204,6 +257,34 @@ class ResearchAgent:
             temperature=vault.config.temperature,
         )
         self.graph = self._build_graph()
+
+    def get_model_context_window(self) -> int:
+        """Infer context window size from model name or endpoint profile."""
+        model_name = getattr(self.llm, "model", "")
+        endpoint = getattr(self.llm, "endpoint", "")
+        name = (model_name or "").lower()
+        if "128k" in name or "gemini" in name or "gpt-4o" in name or "claude" in name:
+            return 131072
+        if "gemma-4" in name or "gemma4" in name or "32k" in name:
+            return 32768
+        if "llama-3.1" in name or "llama3.1" in name or "llama-3.3" in name:
+            return 131072
+        if "llama3.2" in name or "llama-3.2" in name or "gemma-2" in name or "gemma2" in name or "phi-3" in name:
+            return 8192
+        if "16k" in name:
+            return 16384
+        is_local = "localhost" in endpoint or "127.0.0.1" in endpoint
+        return 8192 if is_local else 32768
+
+    def get_context_governor_budget(self) -> int:
+        """Compute the calibrated evidence token ceiling: min(configured, window - headroom, 0.65 * window)."""
+        cfg_max = getattr(self.vault.config, "context_governor_max_tokens", None)
+        if cfg_max is not None:
+            return int(cfg_max)
+        window = self.get_model_context_window()
+        headroom = int(getattr(self.vault.config, "context_headroom_tokens", 3000))
+        budget = min(window - headroom, int(0.65 * window))
+        return max(budget, 2000)
 
     def _build_graph(self):
         workflow = StateGraph(AgentState)
@@ -430,28 +511,17 @@ class ResearchAgent:
                 if unvisited:
                     search_targets.append(unvisited[0])
 
+        current_turn_primary: List[SearchResult] = []
+        new_candidates: List[Tuple[str, str]] = []
+
         for target_query in search_targets:
             if target_query in visited_queries:
                 continue
             visited_queries.append(target_query)
             results = self.storage.search(target_query, top_k=4)
-            new_chunks_count = 0
-            new_candidates: List[Tuple[str, str]] = []
             for r in results:
-                if r.id not in visited_ids:
-                    visited_ids.add(r.id)
-                    new_sources.add(r.file_path)
-                    new_chunks_count += 1
-                    evidence_list.append(
-                        {
-                            "id": r.id,
-                            "file_path": r.file_path,
-                            "breadcrumbs": r.breadcrumbs,
-                            "content": r.content,
-                            "wikilinks": r.wikilinks,
-                            "score": r.score,
-                        }
-                    )
+                if r.id not in visited_ids and all(p.id != r.id for p in current_turn_primary):
+                    current_turn_primary.append(r)
                     # Extract candidate cross-references if in broad inquiry scope
                     for link in r.wikilinks:
                         link_clean = " ".join(link.split()).strip()
@@ -466,44 +536,166 @@ class ResearchAgent:
                                         break
                                 new_candidates.append((link_clean, snippet))
 
-            # System 1 Link Pruning & Priority Queuing
-            if new_candidates:
-                if getattr(self.vault.config, "link_pruning", True):
-                    threshold = float(getattr(self.vault.config, "link_pruning_threshold", 0.40))
-                    max_queue = int(getattr(self.vault.config, "link_pruning_max_queue", 10))
-                    scored_candidates = self.score_candidate_links(state["question"], new_candidates)
+        # Intra-Document Sibling Expansion (SPEC-006)
+        sibling_candidates: List[SearchResult] = []
+        sibling_scores: Dict[str, float] = {}
+        if getattr(self.vault.config, "sibling_traversal", True) and current_turn_primary:
+            cand_sibling_ids = []
+            seen_cand_ids = set(visited_ids) | {p.id for p in current_turn_primary}
+            for p in current_turn_primary:
+                if "#" in p.id:
+                    file_part, chunk_str = p.id.rsplit("#", 1)
+                    if chunk_str.isdigit():
+                        num = int(chunk_str)
+                        for off in (-2, -1, 1, 2):
+                            cand_id = f"{file_part}#{num + off}"
+                            if num + off > 0 and cand_id not in seen_cand_ids:
+                                seen_cand_ids.add(cand_id)
+                                cand_sibling_ids.append(cand_id)
 
-                    kept = [l for l, sim in scored_candidates if sim >= threshold]
-                    pruned_count = len(scored_candidates) - len(kept)
+            if cand_sibling_ids:
+                fetched_siblings = self.storage.get_chunks_by_ids(cand_sibling_ids)
+                if fetched_siblings:
+                    cand_pairs = [
+                        (s.id, f"{s.breadcrumbs}: {s.content[:300]}")
+                        for s in fetched_siblings
+                    ]
+                    scored_tuples = self.score_candidate_links(state["question"], cand_pairs)
+                    threshold = float(getattr(self.vault.config, "sibling_pruning_threshold", 0.45))
+                    max_per_hit = int(getattr(self.vault.config, "sibling_max_per_hit", 2))
 
-                    for l in kept:
-                        if l not in pending_links:
-                            pending_links.append(l)
+                    fetched_map = {s.id: s for s in fetched_siblings}
+                    scored_qualified = [
+                        (cid, score) for cid, score in scored_tuples if score >= threshold and cid in fetched_map
+                    ]
+                    # Take top siblings
+                    for cid, score in scored_qualified[: len(current_turn_primary) * max_per_hit]:
+                        sibling_candidates.append(fetched_map[cid])
+                        sibling_scores[cid] = score
 
-                    if len(pending_links) > max_queue:
-                        pending_links = pending_links[:max_queue]
+        # Context Governor & Greedy Token Budget Packing
+        governor_enabled = getattr(self.vault.config, "context_governor", True)
+        budget_tokens = self.get_context_governor_budget() if governor_enabled else 999999
+        current_tokens = sum(int(len(e["content"]) / 4) for e in evidence_list)
+        pruned_high_rel: List[Dict[str, Any]] = []
+        new_chunks_count = 0
+        governor_alert = state.get("governor_alert")
 
-                    if pruned_count > 0:
-                        thought_history.append(
-                            f"System 1 Link Pruner: Evaluated {len(scored_candidates)} candidate link(s); pruned {pruned_count} below threshold ({threshold:.2f})."
-                        )
-                else:
-                    for l, _ in new_candidates:
-                        if l not in pending_links:
-                            pending_links.append(l)
+        # 1. Pack primary chunks
+        for r in current_turn_primary:
+            tok = int(len(r.content) / 4)
+            if current_tokens + tok <= budget_tokens:
+                visited_ids.add(r.id)
+                new_sources.add(r.file_path)
+                new_chunks_count += 1
+                evidence_list.append(
+                    {
+                        "id": r.id,
+                        "file_path": r.file_path,
+                        "breadcrumbs": r.breadcrumbs,
+                        "content": r.content,
+                        "wikilinks": r.wikilinks,
+                        "score": r.score,
+                    }
+                )
+                current_tokens += tok
+            else:
+                pruned_high_rel.append(
+                    {
+                        "id": r.id,
+                        "title": r.section_title or r.breadcrumbs,
+                        "score": 1.0,
+                        "tokens": tok,
+                    }
+                )
 
-            # Targeted Topic Re-Decomposition Guard (Depth 1):
-            # If query yielded zero new chunks and hasn't been re-decomposed yet, drill down!
-            if new_chunks_count == 0 and target_query not in recomposed_topics:
-                if len(target_query.split()) >= 2 and not target_query.lower().startswith("sec"):
-                    recomposed_topics.append(target_query)
-                    refined = self.refine_stagnated_topic(target_query, state["question"])
-                    if refined:
-                        # Prepend refined queries to sub_goals for immediate follow-up
-                        sub_goals = [q for q in refined if q not in visited_queries] + sub_goals
-                        thought_history.append(
-                            f"Topic '{target_query}' stagnated (0 new chunks). Re-decomposed into: {', '.join(refined)}."
-                        )
+        # 2. Pack sibling chunks (sorted descending by score)
+        sibling_candidates.sort(key=lambda s: sibling_scores.get(s.id, 0.0), reverse=True)
+        for s in sibling_candidates:
+            if s.id in visited_ids:
+                continue
+            tok = int(len(s.content) / 4)
+            score = sibling_scores.get(s.id, 0.0)
+            if current_tokens + tok <= budget_tokens:
+                visited_ids.add(s.id)
+                new_sources.add(s.file_path)
+                new_chunks_count += 1
+                evidence_list.append(
+                    {
+                        "id": s.id,
+                        "file_path": s.file_path,
+                        "breadcrumbs": s.breadcrumbs,
+                        "content": s.content,
+                        "wikilinks": s.wikilinks,
+                        "score": score,
+                    }
+                )
+                current_tokens += tok
+            else:
+                if score >= 0.50:
+                    pruned_high_rel.append(
+                        {
+                            "id": s.id,
+                            "title": s.section_title or s.breadcrumbs,
+                            "score": score,
+                            "tokens": tok,
+                        }
+                    )
+
+        if pruned_high_rel and not governor_alert:
+            window_size = self.get_model_context_window()
+            model_name = getattr(self.llm, "model", "active model")
+            pruned_tok_sum = sum(p["tokens"] for p in pruned_high_rel)
+            alert_lines = [
+                "[CONTEXT_GOVERNOR_ALERT]",
+                f"Context budget reached: {current_tokens:,} tokens (allocated for {window_size:,}-token model '{model_name}').",
+                f"Pruned {len(pruned_high_rel)} high-relevance clauses (~{pruned_tok_sum:,} tokens) to prevent context degradation:",
+            ]
+            for p in pruned_high_rel[:4]:
+                alert_lines.append(f"  - {p['id']} (Score: {p['score']:.2f}): {p['title'][:55]}")
+            alert_lines.append("Actionable Guidance: Sizing up context window is empirically justified.")
+            governor_alert = "\n".join(alert_lines)
+            thought_history.append(governor_alert)
+
+        # System 1 Link Pruning & Priority Queuing
+        if new_candidates:
+            if getattr(self.vault.config, "link_pruning", True):
+                threshold = float(getattr(self.vault.config, "link_pruning_threshold", 0.40))
+                max_queue = int(getattr(self.vault.config, "link_pruning_max_queue", 10))
+                scored_candidates = self.score_candidate_links(state["question"], new_candidates)
+
+                kept = [l for l, sim in scored_candidates if sim >= threshold]
+                pruned_count = len(scored_candidates) - len(kept)
+
+                for l in kept:
+                    if l not in pending_links:
+                        pending_links.append(l)
+
+                if len(pending_links) > max_queue:
+                    pending_links = pending_links[:max_queue]
+
+                if pruned_count > 0:
+                    thought_history.append(
+                        f"System 1 Link Pruner: Evaluated {len(scored_candidates)} candidate link(s); pruned {pruned_count} below threshold ({threshold:.2f})."
+                    )
+            else:
+                for l, _ in new_candidates:
+                    if l not in pending_links:
+                        pending_links.append(l)
+
+        # Targeted Topic Re-Decomposition Guard (Depth 1):
+        # If query yielded zero new chunks and hasn't been re-decomposed yet, drill down!
+        if new_chunks_count == 0 and search_targets and search_targets[0] not in recomposed_topics:
+            target_query = search_targets[0]
+            if len(target_query.split()) >= 2 and not target_query.lower().startswith("sec"):
+                recomposed_topics.append(target_query)
+                refined = self.refine_stagnated_topic(target_query, state["question"])
+                if refined:
+                    # Prepend refined queries to sub_goals for immediate follow-up
+                    sub_goals = [q for q in refined if q not in visited_queries] + sub_goals
+                    thought_history.append(
+                        f"Topic '{target_query}' stagnated (0 new chunks). Re-decomposed into: {', '.join(refined)}."
+                    )
 
         targets_summary = ", ".join(search_targets) if search_targets else "None (queue empty)"
         thought = f"Iteration {state['iteration'] + 1}: Retrieved {len(evidence_list)} evidence blocks across queries: {targets_summary}."
@@ -518,6 +710,7 @@ class ResearchAgent:
             "sub_goals": sub_goals,
             "recomposed_topics": recomposed_topics,
             "thought_history": thought_history,
+            "governor_alert": governor_alert,
         }
 
     def _evaluate_node(self, state: AgentState) -> Dict[str, Any]:
@@ -659,7 +852,33 @@ class ResearchAgent:
             "Direct Answer:"
         )
 
-        answer = self.llm.chat(sys_prompt, user_prompt)
+        thought_history = list(state.get("thought_history", []))
+
+        # Invoke synthesis with truncation metadata detection
+        try:
+            res = self.llm.chat(sys_prompt, user_prompt, return_metadata=True)
+        except TypeError:
+            res = self.llm.chat(sys_prompt, user_prompt)
+        if isinstance(res, tuple):
+            answer, meta = res
+        else:
+            answer, meta = res, {}
+
+        truncation_alert = None
+        if meta.get("truncated"):
+            finish_reason = meta.get("finish_reason") or "length"
+            truncation_alert = (
+                "[GENERATION_TRUNCATION_ALERT]\n"
+                f"Warning: Answer generation was halted because the model reached its context token ceiling (finish_reason: {finish_reason}).\n"
+                "The synthesized answer is incomplete.\n"
+                "Actionable Guidance: Sizing up the model context window or increasing context headroom is empirically justified."
+            )
+            thought_history.append(truncation_alert)
+            if answer:
+                answer = f"{answer}\n\n{truncation_alert}"
+            else:
+                answer = f"The model ran out of tokens before generating an answer.\n\n{truncation_alert}"
+
         if not answer:
             # Concise fallback if model endpoint is unreachable
             top_evidence = state["evidence"][0]["content"].strip()[:400] if state["evidence"] else "No evidence."
@@ -681,9 +900,15 @@ class ResearchAgent:
             confidence = max(state.get("confidence", 0.5), 0.7 if state["evidence"] else 0.0)
 
         self._record_gap_if_needed(state["question"], confidence, len(state["evidence"]), answer)
+        alert = state.get("governor_alert")
+        if alert and alert not in answer:
+            answer = f"{answer}\n\n{alert}"
         return {
             "final_answer": answer,
             "confidence": confidence,
+            "governor_alert": alert,
+            "truncation_alert": truncation_alert,
+            "thought_history": thought_history,
         }
 
     def research(self, question: str) -> AgentState:
@@ -705,6 +930,7 @@ class ResearchAgent:
             "final_answer": "",
             "confidence": 0.0,
             "sources": [],
+            "governor_alert": None,
         }
 
         result = self.graph.invoke(initial_state)
@@ -729,6 +955,7 @@ class ResearchAgent:
             "final_answer": "",
             "confidence": 0.0,
             "sources": [],
+            "governor_alert": None,
         }
 
         for step in self.graph.stream(initial_state):

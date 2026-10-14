@@ -584,7 +584,18 @@ def chunk_document_text(
         elif in_table:
             in_table = False
 
-        heading = identify_heading(line)
+        # Prevent false structural breaks on wrapped lines within paragraphs
+        is_continuation = False
+        if i > 0 and not stripped.startswith("#"):
+            prev_stripped = lines[i - 1].strip()
+            if prev_stripped:
+                if prev_stripped[-1] in (",", ";", "-", "–", "—") or (
+                    prev_stripped[-1].isalnum()
+                    and not prev_stripped.endswith((".", ":", "?", "!", '"""', "'''", "```"))
+                ):
+                    is_continuation = True
+
+        heading = None if is_continuation else identify_heading(line)
         if heading:
             level, title = heading
 

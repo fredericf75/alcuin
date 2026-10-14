@@ -70,6 +70,12 @@ class VaultConfig:
     link_pruning: bool = True
     link_pruning_threshold: float = 0.40
     link_pruning_max_queue: int = 10
+    context_governor: bool = True
+    context_governor_max_tokens: Optional[int] = None
+    context_headroom_tokens: int = 3000
+    sibling_traversal: bool = True
+    sibling_pruning_threshold: float = 0.45
+    sibling_max_per_hit: int = 2
 
     def __post_init__(self):
         inbox_pattern = f"{self.inbox_dir}/*"
@@ -132,6 +138,27 @@ class VaultConfig:
             link_pruning_max_queue=int(
                 agent_sec.get("link_pruning_max_queue", g_agent.get("link_pruning_max_queue", 10))
             ),
+            context_governor=bool(agent_sec.get("context_governor", g_agent.get("context_governor", True))),
+            context_governor_max_tokens=(
+                int(agent_sec["context_governor_max_tokens"])
+                if agent_sec.get("context_governor_max_tokens") is not None
+                else g_agent.get("context_governor_max_tokens")
+            ),
+            context_headroom_tokens=int(
+                agent_sec.get("context_headroom_tokens", g_agent.get("context_headroom_tokens", 3000))
+            ),
+            sibling_traversal=bool(
+                agent_sec.get("sibling_traversal", g_agent.get("sibling_traversal", True))
+            ),
+            sibling_pruning_threshold=float(
+                agent_sec.get(
+                    "sibling_pruning_threshold",
+                    g_agent.get("sibling_pruning_threshold", 0.45),
+                )
+            ),
+            sibling_max_per_hit=int(
+                agent_sec.get("sibling_max_per_hit", g_agent.get("sibling_max_per_hit", 2))
+            ),
         )
 
     def apply_overrides(self, overrides: Dict[str, Any]) -> VaultConfig:
@@ -161,7 +188,14 @@ class VaultConfig:
             f"link_pruning = {'true' if self.link_pruning else 'false'}",
             f"link_pruning_threshold = {self.link_pruning_threshold}",
             f"link_pruning_max_queue = {self.link_pruning_max_queue}",
+            f"context_governor = {'true' if self.context_governor else 'false'}",
+            f"context_headroom_tokens = {self.context_headroom_tokens}",
+            f"sibling_traversal = {'true' if self.sibling_traversal else 'false'}",
+            f"sibling_pruning_threshold = {self.sibling_pruning_threshold}",
+            f"sibling_max_per_hit = {self.sibling_max_per_hit}",
         ]
+        if self.context_governor_max_tokens is not None:
+            agent_lines.append(f"context_governor_max_tokens = {self.context_governor_max_tokens}")
         if self.model_name:
             agent_lines.append(f'model_name = "{self.model_name}"')
         if self.model_endpoint:

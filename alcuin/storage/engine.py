@@ -426,3 +426,33 @@ class VaultStorage:
                 found.update(links)
 
         return sorted(list(found))
+
+    def get_chunks_by_ids(self, chunk_ids: List[str]) -> List[SearchResult]:
+        """Retrieve multiple chunks directly by chunk ID."""
+        if not chunk_ids:
+            return []
+        try:
+            # Query LanceDB by ID filter
+            clauses = []
+            for cid in chunk_ids[:200]:
+                clean_id = cid.replace("'", "''")
+                clauses.append(f"id = '{clean_id}'")
+            where_sql = " or ".join(clauses)
+            arrow_tbl = self.table.search().where(where_sql).to_arrow()
+            results = []
+            for i in range(len(arrow_tbl)):
+                results.append(
+                    SearchResult(
+                        id=arrow_tbl["id"][i].as_py(),
+                        file_path=arrow_tbl["file_path"][i].as_py(),
+                        document_title=arrow_tbl["document_title"][i].as_py(),
+                        section_title=arrow_tbl["section_title"][i].as_py(),
+                        breadcrumbs=arrow_tbl["breadcrumbs"][i].as_py(),
+                        content=arrow_tbl["content"][i].as_py(),
+                        wikilinks=list(arrow_tbl["wikilinks"][i].as_py() or []),
+                        score=1.0,
+                    )
+                )
+            return results
+        except Exception:
+            return []

@@ -14,6 +14,7 @@
 * **Multimodal Inbox Ingestion (`alcuin ingest`)**: Drop raw PDFs, scans, receipts, or photos into `<vault>/inbox/`. Alcuin extracts clean Markdown notes via Tesseract OCR or local vision models, archives the originals to `<vault>/archive/`, and keeps the active vault 100% Markdown.
 * **Vault Health & Self-Healing (`alcuin lint --fix`)**: Detects dead wikilinks, sync drift, orphan database records, and missing headers. Automatically scaffolds missing folders, repairs headers, and generates stub notes.
 * **Knowledge Gap Tracking (`alcuin gaps`)**: Automatically logs unanswered or low-confidence queries, tracks recurring blind spots in your knowledge base, and resolves them when answers are found.
+* **Context Safety Governor & Sizing Telemetry**: Dynamically calculates evidence token ceilings based on the active model's context runway (60% evidence, 40% headroom for answer generation). When high-relevance candidate clauses exceed your model's window, Alcuin emits in-band sizing telemetry, empirically justifying when and why to upgrade to larger context models rather than using them as a lazy crutch.
 * **Local-First & Multi-Provider**: Powered locally by [Ollama](https://ollama.ai) (`llama3.2`, `qwen2.5`, `nomic-embed-text`) or cloud endpoints (Google Gemini, OpenAI).
 * **Dual Interface**: Direct CLI with clean Markdown output, plus an embedded FastAPI Web UI with real-time research streaming via Server-Sent Events (SSE).
 

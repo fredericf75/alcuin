@@ -272,6 +272,28 @@ class VaultLinter:
                     )
                 )
 
+        # Check intake folders (inbox / archive)
+        inbox_path = self.vault.root_path / self.vault.config.inbox_dir
+        archive_path = self.vault.root_path / self.vault.config.archive_dir
+        missing_folders = []
+        if not inbox_path.exists():
+            missing_folders.append(self.vault.config.inbox_dir)
+        if not archive_path.exists():
+            missing_folders.append(self.vault.config.archive_dir)
+
+        if missing_folders:
+            issues.append(
+                LintIssue(
+                    category=LintCategory.SYNC_DRIFT,
+                    severity=LintSeverity.WARNING,
+                    file_path=self.vault.config.inbox_dir,
+                    message=f"Vault intake folder(s) missing: {', '.join(missing_folders)}. Run 'alcuin lint --fix' to scaffold.",
+                    fixable=True,
+                    fix_description="Scaffold missing inbox/archive folders and update config.toml",
+                    details={"type": "missing_intake_folders", "folders": missing_folders},
+                )
+            )
+
         # -------------------------------------------------------------
         # 2. Document Hygiene & Frontmatter Checks
         # -------------------------------------------------------------
@@ -549,6 +571,8 @@ class VaultLinter:
         headers_to_inject: List[Tuple[Path, str]] = []  # (path, title)
         frontmatter_to_close: List[Path] = []
 
+        scaffold_intake = False
+
         for issue in report.issues:
             if not issue.fixable:
                 result.skipped.append(f"{issue.file_path}: {issue.message} (Not auto-fixable)")
@@ -556,7 +580,10 @@ class VaultLinter:
 
             itype = issue.details.get("type", "")
 
-            if itype in ("unindexed", "modified", "chunk_mismatch"):
+            if itype == "missing_intake_folders":
+                scaffold_intake = True
+
+            elif itype in ("unindexed", "modified", "chunk_mismatch"):
                 files_to_reindex.add(issue.file_path)
 
             elif itype == "empty_database":
@@ -600,6 +627,10 @@ class VaultLinter:
 
         # 1. Preview / Dry-run actions
         if dry_run:
+            if scaffold_intake:
+                result.repaired.append(
+                    f"[Dry Run] Scaffold intake folders '{self.vault.config.inbox_dir}' and '{self.vault.config.archive_dir}' and update config.toml"
+                )
             for p, title in headers_to_inject:
                 result.repaired.append(f"[Dry Run] Inject '# {title}' header into '{p.name}'")
             for p in frontmatter_to_close:
@@ -617,6 +648,19 @@ class VaultLinter:
             for f in excluded_to_remove:
                 result.repaired.append(f"[Dry Run] Remove excluded file '{f}' from manifest and LanceDB")
             return result
+
+        # 1b. Execute Intake Folder Scaffolding
+        if scaffold_intake:
+            try:
+                (self.vault.root_path / self.vault.config.inbox_dir).mkdir(parents=True, exist_ok=True)
+                (self.vault.root_path / self.vault.config.archive_dir).mkdir(parents=True, exist_ok=True)
+                with open(self.vault.config_path, "w", encoding="utf-8") as f:
+                    f.write(self.vault.config.to_toml())
+                result.repaired.append(
+                    f"Scaffolded intake folders '{self.vault.config.inbox_dir}' and '{self.vault.config.archive_dir}' and updated config.toml"
+                )
+            except Exception as e:
+                result.errors.append(f"Failed to scaffold intake folders: {e}")
 
         # 2. Execute Document Hygiene Fixes
         for p, title in headers_to_inject:

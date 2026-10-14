@@ -56,8 +56,25 @@ class VaultConfig:
         default_factory=lambda: [".pdf", ".docx", ".md", ".txt"]
     )
     exclude_patterns: List[str] = field(
-        default_factory=lambda: [".git/*", "node_modules/*", "tmp/*", ".alcuin/*"]
+        default_factory=lambda: [
+            ".git/*",
+            "node_modules/*",
+            "tmp/*",
+            ".alcuin/*",
+            "inbox/*",
+            "archive/*",
+        ]
     )
+    inbox_dir: str = "inbox"
+    archive_dir: str = "archive"
+
+    def __post_init__(self):
+        inbox_pattern = f"{self.inbox_dir}/*"
+        archive_pattern = f"{self.archive_dir}/*"
+        if inbox_pattern not in self.exclude_patterns:
+            self.exclude_patterns.append(inbox_pattern)
+        if archive_pattern not in self.exclude_patterns:
+            self.exclude_patterns.append(archive_pattern)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> VaultConfig:
@@ -93,9 +110,18 @@ class VaultConfig:
             exclude_patterns=list(
                 ingest_sec.get(
                     "exclude_patterns",
-                    [".git/*", "node_modules/*", "tmp/*", ".alcuin/*"],
+                    [
+                        ".git/*",
+                        "node_modules/*",
+                        "tmp/*",
+                        ".alcuin/*",
+                        "inbox/*",
+                        "archive/*",
+                    ],
                 )
             ),
+            inbox_dir=str(ingest_sec.get("inbox_dir", "inbox")),
+            archive_dir=str(ingest_sec.get("archive_dir", "archive")),
         )
 
     def apply_overrides(self, overrides: Dict[str, Any]) -> VaultConfig:
@@ -148,6 +174,8 @@ periodic_indexing = {"true" if self.periodic_indexing else "false"}
 index_interval_seconds = {self.index_interval_seconds}
 file_extensions = [{exts}]
 exclude_patterns = [{excludes}]
+inbox_dir = "{self.inbox_dir}"
+archive_dir = "{self.archive_dir}"
 """
 
 
@@ -273,6 +301,10 @@ class Vault:
         if not manifest_path.exists():
             with open(manifest_path, "w", encoding="utf-8") as f:
                 json.dump({"files": {}, "wikilinks": {}}, f, indent=2)
+
+        # Scaffold intake and archive folders
+        (root / cfg.inbox_dir).mkdir(parents=True, exist_ok=True)
+        (root / cfg.archive_dir).mkdir(parents=True, exist_ok=True)
 
         vault = cls(root, cfg)
         if register:

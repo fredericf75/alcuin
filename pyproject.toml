@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alcuin"
+version = "0.1.0"
+description = "Autonomous, agentic personal knowledge engine"
+authors = [{ name = "Frederic" }]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2.70",
+    "langchain-core>=0.3.35",
+    "lancedb>=0.17.0",
+    "pyarrow>=18.0.0",
+    "sentence-transformers>=3.3.0",
+    "pymupdf>=1.25.0",
+    "docx2txt>=0.8",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic>=2.10.0",
+    "httpx>=0.28.0",
+    "click>=8.1.0",
+    "rich>=13.9.0",
+    "platformdirs>=4.3.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+alcuin = "alcuin.cli.main:cli"
+
+[tool.setuptools.packages.find]
+include = ["alcuin*"]

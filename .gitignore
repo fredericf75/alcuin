@@ -1,0 +1,29 @@
+# Internal documentation repo (managed as independent git repo)
+docs_internal/
+
+# Python environment
+.venv/
+env/
+venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment & secrets
+.env
+.env.*
+*.token
+*.pem
+
+# LanceDB & databases
+*.lance/
+.lancedb/
+*.db
+*.sqlite3
+.cache/
+.pytest_cache/
+
+# OS files
+.DS_Store
+Thumbs.db

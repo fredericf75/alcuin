@@ -4,6 +4,7 @@ alcuin.cli.main - Research-First Command Line Interface for Alcuin
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,6 +17,7 @@ from rich.table import Table
 
 from alcuin.agent.graph import ResearchAgent
 from alcuin.storage.engine import VaultStorage
+from alcuin.storage.linter import LintCategory, LintSeverity, VaultLinter
 from alcuin.storage.vault import Vault, VaultRegistry
 
 console = Console()
@@ -255,6 +257,132 @@ def index(vault_target: Optional[str], force: bool):
         f"  • Unchanged: {len(report.unchanged_files)}\n"
         f"  • Total Chunks Upserted: {report.total_chunks_indexed}"
     )
+
+
+@cli.command(short_help="Audit and repair vault integrity, wikilinks, and storage sync")
+@click.argument("vault_path", required=False, type=str)
+@click.option("-v", "--vault", "vault_target", help="Vault name or directory path")
+@click.option("--fix", is_flag=True, help="Automatically repair detected issues")
+@click.option("--create-stubs", is_flag=True, help="Create placeholder markdown files for dead wikilinks")
+@click.option("--dry-run", is_flag=True, help="Preview remediation actions without modifying disk or database")
+@click.option("-y", "--yes", is_flag=True, help="Apply fixes without interactive confirmation prompt")
+@click.option("--strict", is_flag=True, help="Exit with code 1 if any warnings remain")
+@click.option("--json", "json_output", is_flag=True, help="Output diagnostic report in machine-readable JSON")
+@click.option("--verbose", "-V", is_flag=True, help="Display detailed diagnostic output")
+def lint(
+    vault_path: Optional[str],
+    vault_target: Optional[str],
+    fix: bool,
+    create_stubs: bool,
+    dry_run: bool,
+    yes: bool,
+    strict: bool,
+    json_output: bool,
+    verbose: bool,
+):
+    """Audit vault consistency, wikilinks, and LanceDB storage parity with remediation."""
+    target = vault_path or vault_target
+    vault_obj = resolve_or_prompt_vault(target=target)
+    linter = VaultLinter(vault_obj)
+
+    # If --fix requested
+    if fix:
+        if dry_run:
+            dry_res = linter.fix(create_stubs=create_stubs, dry_run=True)
+            if json_output:
+                click.echo(json.dumps(dry_res.to_dict(), indent=2))
+                return
+            console.print(f"\n[bold yellow]Remediation Plan (Dry Run) for '{vault_obj.name}':[/bold yellow]")
+            if not dry_res.repaired and not dry_res.skipped:
+                console.print("  [green]No remediation actions needed.[/green]")
+            for action in dry_res.repaired:
+                console.print(f"  [cyan]•[/cyan] {action}")
+            for skip in dry_res.skipped:
+                console.print(f"  [dim]• {skip}[/dim]")
+            return
+
+        # Pre-lint to see if there are fixable issues
+        pre_report = linter.lint()
+        has_fixes = pre_report.fixable_count > 0 or (create_stubs and any(i.category == LintCategory.DEAD_LINK for i in pre_report.issues))
+        if not has_fixes:
+            if not json_output:
+                console.print(f"[bold green]No fixable issues found in vault '{vault_obj.name}'.[/bold green]")
+        else:
+            if not yes and sys.stdin.isatty():
+                if not click.confirm(f"Apply {pre_report.fixable_count} automatic fix(es) for '{vault_obj.name}'?", default=True):
+                    console.print("[yellow]Remediation cancelled.[/yellow]")
+                    return
+
+            fix_res = linter.fix(create_stubs=create_stubs, dry_run=False)
+            if not json_output:
+                for rep in fix_res.repaired:
+                    console.print(f"[bold green]✓ Fixed:[/] {rep}")
+                for err in fix_res.errors:
+                    console.print(f"[bold red]✗ Error:[/] {err}")
+                for sk in fix_res.skipped:
+                    if verbose:
+                        console.print(f"[dim]• Skipped: {sk}[/dim]")
+                console.print("")
+
+    report = linter.lint()
+
+    if json_output:
+        click.echo(json.dumps(report.to_dict(), indent=2))
+        if report.error_count > 0 or (strict and report.warning_count > 0):
+            sys.exit(1)
+        return
+
+    if report.is_clean and not report.info_count:
+        console.print(f"[bold green]✓ Vault '{vault_obj.name}' is healthy ({report.duration_seconds}s). No integrity issues found.[/bold green]")
+        return
+    elif report.is_clean:
+        console.print(f"[bold green]✓ Vault '{vault_obj.name}' has no errors or warnings ({report.duration_seconds}s).[/bold green]")
+
+    table = Table(title=f"Vault Integrity Audit: {vault_obj.name} ({report.duration_seconds}s)")
+    table.add_column("Sev", style="bold", width=6)
+    table.add_column("Category", style="cyan", width=16)
+    table.add_column("File / Target", style="dim")
+    table.add_column("Line", justify="right", width=5)
+    table.add_column("Diagnostic Message", overflow="fold")
+    table.add_column("Fixable", justify="center", width=8)
+
+    for issue in report.issues:
+        if issue.severity == LintSeverity.ERROR:
+            sev_styled = "[bold red]ERROR[/bold red]"
+        elif issue.severity == LintSeverity.WARNING:
+            sev_styled = "[bold yellow]WARN[/bold yellow]"
+        else:
+            sev_styled = "[dim cyan]INFO[/dim cyan]"
+
+        line_str = str(issue.line_number) if issue.line_number is not None else "-"
+        fixable_str = "[green]Yes[/green]" if issue.fixable else "[dim]No[/dim]"
+
+        table.add_row(
+            sev_styled,
+            issue.category.value,
+            issue.file_path,
+            line_str,
+            issue.message,
+            fixable_str,
+        )
+
+    console.print(table)
+    console.print(
+        f"\n[bold]Audit Summary for '{vault_obj.name}':[/bold] "
+        f"[red]{report.error_count} error(s)[/red], "
+        f"[yellow]{report.warning_count} warning(s)[/yellow], "
+        f"[dim]{report.info_count} info[/dim]. "
+        f"[cyan]{report.fixable_count} fixable[/cyan]."
+    )
+
+    if not fix and report.fixable_count > 0:
+        console.print(
+            "[bold yellow]Tip:[/] Run [bold cyan]alcuin lint --fix[/bold cyan] to automatically repair issues "
+            "(add [bold cyan]--create-stubs[/bold cyan] for dead links)."
+        )
+
+    if report.error_count > 0 or (strict and report.warning_count > 0):
+        sys.exit(1)
 
 
 @cli.command(short_help="Start FastAPI Web UI and background periodic indexing daemon")

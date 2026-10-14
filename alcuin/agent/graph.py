@@ -548,11 +548,22 @@ class ResearchAgent:
             return "synthesize"
         return "retrieve"
 
+    def _record_gap_if_needed(self, question: str, confidence: float, evidence_count: int, answer: str) -> None:
+        try:
+            from alcuin.storage.gaps import KnowledgeGapTracker
+            tracker = KnowledgeGapTracker(self.vault)
+            tracker.record_query(query=question, confidence=confidence, evidence_count=evidence_count, answer=answer)
+        except Exception:
+            pass
+
     def _synthesize_node(self, state: AgentState) -> Dict[str, Any]:
         if not state["evidence"]:
+            answer = "No relevant documents or evidence found in vault."
+            confidence = 0.0
+            self._record_gap_if_needed(state["question"], confidence, 0, answer)
             return {
-                "final_answer": "No relevant documents or evidence found in vault.",
-                "confidence": 0.0,
+                "final_answer": answer,
+                "confidence": confidence,
             }
 
         # Budget evidence to fit model context window (dynamic by model endpoint)
@@ -593,9 +604,22 @@ class ResearchAgent:
                 f"> {top_evidence}..."
             )
 
+        ans_lower = answer.lower()
+        if (
+            "not found" in ans_lower
+            or "no relevant documents" in ans_lower
+            or "information is not found" in ans_lower
+            or "not contained in the vault" in ans_lower
+            or "not contained in the provided evidence" in ans_lower
+        ):
+            confidence = 0.0
+        else:
+            confidence = max(state.get("confidence", 0.5), 0.7 if state["evidence"] else 0.0)
+
+        self._record_gap_if_needed(state["question"], confidence, len(state["evidence"]), answer)
         return {
             "final_answer": answer,
-            "confidence": max(state.get("confidence", 0.5), 0.7 if state["evidence"] else 0.0),
+            "confidence": confidence,
         }
 
     def research(self, question: str) -> AgentState:

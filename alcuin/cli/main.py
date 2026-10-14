@@ -385,6 +385,88 @@ def lint(
         sys.exit(1)
 
 
+@cli.group(short_help="Inspect and manage logged unanswered questions", invoke_without_command=True)
+@click.pass_context
+def gaps(ctx):
+    """Knowledge gap tracking commands."""
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(gaps_list)
+
+
+@gaps.command(name="list", short_help="List logged knowledge gaps")
+@click.option("-v", "--vault", "vault_target", help="Vault name or directory path")
+@click.option("--all", "show_all", is_flag=True, help="Include resolved and dismissed gaps")
+def gaps_list(vault_target: Optional[str] = None, show_all: bool = False):
+    """List knowledge gaps logged for a vault."""
+    from alcuin.storage.gaps import KnowledgeGapTracker
+
+    vault_obj = resolve_or_prompt_vault(target=vault_target)
+    tracker = KnowledgeGapTracker(vault_obj)
+    items = tracker.list_gaps(include_resolved=show_all)
+    if not items:
+        status_suffix = " (including resolved)" if show_all else ""
+        console.print(f"[dim]No knowledge gaps found in '{vault_obj.name}'{status_suffix}.[/dim]")
+        return
+
+    table = Table(title=f"Knowledge Gaps: {vault_obj.name}")
+    table.add_column("Status", width=12)
+    table.add_column("Count", justify="right", width=6)
+    table.add_column("Query")
+    table.add_column("Suggested Note", style="cyan")
+    table.add_column("Last Asked", style="dim", width=19)
+
+    for g in items:
+        if g.status == "resolved":
+            status_styled = "[green]Resolved[/green]"
+        elif g.status == "dismissed":
+            status_styled = "[dim]Dismissed[/dim]"
+        else:
+            status_styled = (
+                "[bold yellow]Unresolved[/bold yellow]"
+                if g.ask_count >= 3
+                else "[yellow]Unresolved[/yellow]"
+            )
+
+        last_asked = g.last_asked_at[:19].replace("T", " ")
+        table.add_row(
+            status_styled,
+            str(g.ask_count),
+            g.query,
+            f"{g.suggested_title}.md",
+            last_asked,
+        )
+
+    console.print(table)
+
+
+@gaps.command(name="resolve", short_help="Mark a knowledge gap as resolved")
+@click.argument("target")
+@click.option("-v", "--vault", "vault_target", help="Vault name or directory path")
+def gaps_resolve(target: str, vault_target: Optional[str]):
+    """Mark a knowledge gap as resolved by query substring or ID."""
+    from alcuin.storage.gaps import KnowledgeGapTracker
+
+    vault_obj = resolve_or_prompt_vault(target=vault_target)
+    tracker = KnowledgeGapTracker(vault_obj)
+    if tracker.resolve_gap(target):
+        console.print(f"[bold green]Resolved knowledge gap matching '{target}'.[/bold green]")
+    else:
+        console.print(f"[bold red]No matching knowledge gap found for '{target}'.[/bold red]")
+
+
+@gaps.command(name="clear", short_help="Clear resolved or all knowledge gaps")
+@click.option("-v", "--vault", "vault_target", help="Vault name or directory path")
+@click.option("--all", "clear_all", is_flag=True, help="Clear all gaps including unresolved")
+def gaps_clear(vault_target: Optional[str], clear_all: bool):
+    """Purge knowledge gaps from storage."""
+    from alcuin.storage.gaps import KnowledgeGapTracker
+
+    vault_obj = resolve_or_prompt_vault(target=vault_target)
+    tracker = KnowledgeGapTracker(vault_obj)
+    cleared = tracker.clear_gaps(only_resolved=not clear_all)
+    console.print(f"[bold green]Cleared {cleared} gap record(s) from '{vault_obj.name}'.[/bold green]")
+
+
 @cli.command(short_help="Start FastAPI Web UI and background periodic indexing daemon")
 @click.option("--host", default="127.0.0.1", help="Server host address")
 @click.option("--port", default=8000, type=int, help="Server port")

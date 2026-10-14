@@ -10,6 +10,7 @@ import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -31,6 +32,7 @@ class LintCategory(str, Enum):
     SYNC_DRIFT = "sync-drift"
     STORAGE_DRIFT = "storage-drift"
     DOCUMENT_HYGIENE = "document-hygiene"
+    KNOWLEDGE_GAP = "knowledge-gap"
 
 
 @dataclass
@@ -495,6 +497,36 @@ class VaultLinter:
                     fixable=False,
                 )
             )
+        # -------------------------------------------------------------
+        # 5. Knowledge Gap Checks
+        # -------------------------------------------------------------
+        try:
+            from alcuin.storage.gaps import KnowledgeGapTracker
+
+            gap_tracker = KnowledgeGapTracker(self.vault)
+            unresolved_gaps = gap_tracker.list_gaps(include_resolved=False)
+            for gap in unresolved_gaps:
+                sev = LintSeverity.WARNING if gap.ask_count >= 3 else LintSeverity.INFO
+                issues.append(
+                    LintIssue(
+                        category=LintCategory.KNOWLEDGE_GAP,
+                        severity=sev,
+                        file_path=".alcuin/knowledge_gaps.json",
+                        message=f"Unresolved question gap: '{gap.query}' (asked {gap.ask_count} time(s)).",
+                        fixable=not gap.stub_created,
+                        fix_description=f"Create stub note '{gap.suggested_title}.md' for missing knowledge topic",
+                        details={
+                            "type": "knowledge_gap",
+                            "gap_id": gap.id,
+                            "query": gap.query,
+                            "title": gap.suggested_title,
+                            "ask_count": gap.ask_count,
+                            "stub_created": gap.stub_created,
+                        },
+                    )
+                )
+        except Exception:
+            pass
 
         duration = round(time.time() - start_time, 2)
         return LintReport(
@@ -511,6 +543,7 @@ class VaultLinter:
 
         files_to_reindex: Set[str] = set()
         stubs_to_create: Dict[str, str] = {}  # target -> source_file
+        gap_stubs_to_create: List[Dict[str, Any]] = []  # knowledge gap details
         orphans_to_purge: Set[str] = set()
         excluded_to_remove: Set[str] = set()
         headers_to_inject: List[Tuple[Path, str]] = []  # (path, title)
@@ -548,6 +581,14 @@ class VaultLinter:
                         f"Dead wikilink '[[{issue.details.get('target')}]]' in {issue.file_path} (Pass --create-stubs to generate placeholder notes)"
                     )
 
+            elif itype == "knowledge_gap":
+                if create_stubs:
+                    gap_stubs_to_create.append(issue.details)
+                else:
+                    result.skipped.append(
+                        f"Unresolved question gap '{issue.details.get('query')}' (Pass --create-stubs to generate placeholder notes)"
+                    )
+
             elif itype in ("empty_file", "whitespace_only", "missing_heading"):
                 full_p = self.vault.root_path / issue.file_path
                 title = full_p.stem.replace("_", " ").replace("-", " ").title()
@@ -565,6 +606,10 @@ class VaultLinter:
                 result.repaired.append(f"[Dry Run] Close YAML frontmatter in '{p.name}'")
             for target, src in stubs_to_create.items():
                 result.repaired.append(f"[Dry Run] Create stub note '{target}.md' from link in '{src}'")
+            for g_info in gap_stubs_to_create:
+                t = g_info.get("title", "Gap")
+                q = g_info.get("query", "")
+                result.repaired.append(f"[Dry Run] Create stub note '{t}.md' for knowledge gap '{q}'")
             for f in files_to_reindex:
                 result.repaired.append(f"[Dry Run] Re-index '{f}' into LanceDB")
             for f in orphans_to_purge:
@@ -618,6 +663,37 @@ class VaultLinter:
                     files_to_reindex.add(rel_stub)
             except Exception as e:
                 result.errors.append(f"Failed to create stub note for '{target}': {e}")
+
+        # 3b. Execute Knowledge Gap Stub Creation
+        if gap_stubs_to_create:
+            try:
+                from alcuin.storage.gaps import KnowledgeGapTracker
+
+                gap_tracker = KnowledgeGapTracker(self.vault)
+                for g_info in gap_stubs_to_create:
+                    title = g_info.get("title", "Gap")
+                    query = g_info.get("query", "")
+                    gid = g_info.get("gap_id", "")
+                    safe_stem = re.sub(r'[\\/*?:"<>|]', "_", title)
+                    stub_file = self.vault.root_path / f"{safe_stem}.md"
+                    try:
+                        if not stub_file.exists():
+                            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                            stub_content = (
+                                f"# {title}\n\n"
+                                f"*Knowledge gap recorded by Alcuin on {date_str}.*\n"
+                                f"*User Query: \"{query}\"*\n"
+                            )
+                            stub_file.write_text(stub_content, encoding="utf-8")
+                            rel_stub = str(stub_file.relative_to(self.vault.root_path))
+                            result.repaired.append(f"Created stub note '{rel_stub}' for knowledge gap '{query}'")
+                            newly_created_stubs.append(rel_stub)
+                            files_to_reindex.add(rel_stub)
+                        gap_tracker.mark_stub_created(gid)
+                    except Exception as e:
+                        result.errors.append(f"Failed to create stub note for knowledge gap '{query}': {e}")
+            except Exception as e:
+                result.errors.append(f"Failed to process knowledge gap stubs: {e}")
 
         # 4. Execute Storage Drift / Orphan Purge
         if orphans_to_purge or excluded_to_remove:

@@ -73,6 +73,7 @@ class VaultConfig:
     context_governor: bool = True
     context_governor_max_tokens: Optional[int] = None
     context_headroom_tokens: Optional[int] = None
+    context_window: int = 16384
     sibling_traversal: bool = True
     sibling_pruning_threshold: float = 0.45
     sibling_max_per_hit: int = 2
@@ -153,6 +154,12 @@ class VaultConfig:
                     else None
                 )
             ),
+            context_window=int(
+                agent_sec.get(
+                    "context_window",
+                    g_agent.get("context_window", 16384),
+                )
+            ),
             sibling_traversal=bool(
                 agent_sec.get("sibling_traversal", g_agent.get("sibling_traversal", True))
             ),
@@ -203,6 +210,8 @@ class VaultConfig:
             agent_lines.append(f"context_headroom_tokens = {self.context_headroom_tokens}")
         if self.context_governor_max_tokens is not None:
             agent_lines.append(f"context_governor_max_tokens = {self.context_governor_max_tokens}")
+        if self.context_window != 16384:
+            agent_lines.append(f"context_window = {self.context_window}")
         if self.model_name:
             agent_lines.append(f'model_name = "{self.model_name}"')
         if self.model_endpoint:

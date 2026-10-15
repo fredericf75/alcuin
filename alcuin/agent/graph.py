@@ -39,6 +39,7 @@ class AgentState(TypedDict):
     sources: List[str]
     governor_alert: Optional[str]
     truncation_alert: Optional[str]
+    evidence_only: bool
 
 
 class LLMClient:
@@ -51,6 +52,8 @@ class LLMClient:
         temperature: float = 0.2,
         api_key: Optional[str] = None,
         timeout: float = 600.0,
+        context_window: Optional[int] = None,
+        think: Optional[bool] = None,
     ):
         global_cfg = VaultRegistry.get_config_dir()
         cfg_file = global_cfg / "config.toml"
@@ -73,8 +76,12 @@ class LLMClient:
         self.model = resolved_model
         self.temperature = temperature
         self.timeout = timeout
+        self.context_window = context_window
+        self.think = think
         self.api_key = (
             api_key
+            or (os.getenv("OPENROUTER_API_KEY") if "openrouter" in resolved_endpoint else None)
+            or os.getenv("OPENROUTER_API_KEY")
             or os.getenv("GEMINI_API_KEY")
             or os.getenv("GOOGLE_API_KEY")
             or os.getenv("OPENAI_API_KEY")
@@ -87,10 +94,15 @@ class LLMClient:
         return_metadata: bool = False,
     ) -> Any:
         is_local = "localhost" in self.endpoint or "127.0.0.1" in self.endpoint
+        is_openrouter = "openrouter.ai" in self.endpoint
         is_google = (
-            "generativelanguage.googleapis.com" in self.endpoint
-            or "google" in self.endpoint
-            or (self.api_key and (self.model.startswith(("gemini", "gemma")) and not is_local))
+            not is_openrouter
+            and not is_local
+            and (
+                "generativelanguage.googleapis.com" in self.endpoint
+                or "google" in self.endpoint
+                or (self.api_key and self.model.startswith(("gemini", "gemma")))
+            )
         )
 
         # 1. If Google AI Studio (native generateContent API)
@@ -133,17 +145,23 @@ class LLMClient:
         if is_local:
             try:
                 with httpx.Client(timeout=self.timeout) as client:
+                    ollama_options: Dict[str, Any] = {"temperature": self.temperature}
+                    if self.context_window:
+                        ollama_options["num_ctx"] = int(self.context_window)
+                    ollama_body: Dict[str, Any] = {
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "stream": False,
+                        "options": ollama_options,
+                    }
+                    if self.think is not None:
+                        ollama_body["think"] = self.think
                     resp = client.post(
                         f"{self.endpoint}/api/chat",
-                        json={
-                            "model": self.model,
-                            "messages": [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_prompt},
-                            ],
-                            "stream": False,
-                            "options": {"temperature": self.temperature},
-                        },
+                        json=ollama_body,
                     )
                     if resp.status_code == 200:
                         data = resp.json()
@@ -170,11 +188,13 @@ class LLMClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
         try:
             with httpx.Client(timeout=self.timeout) as client:
-                target_url = (
-                    self.endpoint
-                    if self.endpoint.endswith("/chat/completions")
-                    else f"{self.endpoint}/v1/chat/completions"
-                )
+                base_ep = self.endpoint.rstrip("/")
+                if base_ep.endswith("/chat/completions"):
+                    target_url = base_ep
+                elif base_ep.endswith("/v1"):
+                    target_url = f"{base_ep}/chat/completions"
+                else:
+                    target_url = f"{base_ep}/v1/chat/completions"
                 resp = client.post(
                     target_url,
                     headers=headers,
@@ -185,6 +205,7 @@ class LLMClient:
                             {"role": "user", "content": user_prompt},
                         ],
                         "temperature": self.temperature,
+                        "max_tokens": 2048,
                     },
                 )
                 if resp.status_code == 200:
@@ -209,17 +230,23 @@ class LLMClient:
         if not is_local:
             try:
                 with httpx.Client(timeout=self.timeout) as client:
+                    ollama_options: Dict[str, Any] = {"temperature": self.temperature}
+                    if self.context_window:
+                        ollama_options["num_ctx"] = int(self.context_window)
+                    fallback_body: Dict[str, Any] = {
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "stream": False,
+                        "options": ollama_options,
+                    }
+                    if self.think is not None:
+                        fallback_body["think"] = self.think
                     resp = client.post(
                         f"{self.endpoint}/api/chat",
-                        json={
-                            "model": self.model,
-                            "messages": [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_prompt},
-                            ],
-                            "stream": False,
-                            "options": {"temperature": self.temperature},
-                        },
+                        json=fallback_body,
                     )
                     if resp.status_code == 200:
                         data = resp.json()
@@ -251,45 +278,29 @@ class ResearchAgent:
     def __init__(self, vault: Vault, llm: Optional[LLMClient] = None):
         self.vault = vault
         self.storage = VaultStorage(vault)
+        ctx_win = getattr(vault.config, "context_window", 16384)
         self.llm = llm or LLMClient(
             endpoint=vault.config.model_endpoint,
             model=vault.config.model_name,
             temperature=vault.config.temperature,
+            context_window=ctx_win,
         )
+        if hasattr(self.llm, "context_window") and self.llm.context_window is None:
+            self.llm.context_window = ctx_win
         self.graph = self._build_graph()
 
     def get_model_context_window(self) -> int:
-        """Infer context window size from model name or endpoint profile."""
-        model_name = getattr(self.llm, "model", "")
-        endpoint = getattr(self.llm, "endpoint", "")
-        name = (model_name or "").lower()
-        if "128k" in name or "gemini" in name or "gpt-4o" in name or "claude" in name:
-            return 131072
-        if "gemma-4" in name or "gemma4" in name or "32k" in name:
-            return 32768
-        if "llama-3.1" in name or "llama3.1" in name or "llama-3.3" in name:
-            return 131072
-        if "llama3.2" in name or "llama-3.2" in name or "gemma-2" in name or "gemma2" in name or "phi-3" in name:
-            return 8192
-        if "16k" in name:
-            return 16384
-        is_local = "localhost" in endpoint or "127.0.0.1" in endpoint
-        return 8192 if is_local else 32768
+        """Return configured model context window from vault config or LLM client."""
+        if hasattr(self.vault, "config") and hasattr(self.vault.config, "context_window"):
+            return int(self.vault.config.context_window)
+        if hasattr(self.llm, "context_window") and self.llm.context_window is not None:
+            return int(self.llm.context_window)
+        return 16384
 
     def resolve_model_headroom(self, window_tokens: int) -> int:
         """Resolve dynamic model generation headroom with a 50% safety cap on context window."""
         cfg_headroom = getattr(self.vault.config, "context_headroom_tokens", None)
-        if cfg_headroom is not None:
-            hr = int(cfg_headroom)
-        else:
-            name = (self.llm.model or "").lower()
-            if any(r in name for r in ("gemma4", "gemma-4", "deepseek-r1", "qwq", "o1", "o3", "r1")):
-                hr = 5000
-            elif any(i in name for i in ("llama", "phi", "mistral", "qwen2")):
-                hr = 1500
-            else:
-                hr = 3000
-
+        hr = int(cfg_headroom) if cfg_headroom is not None else 2000
         max_safe = max(int(0.50 * window_tokens), 1000)
         return min(hr, max_safe)
 
@@ -315,7 +326,7 @@ class ResearchAgent:
         workflow.add_conditional_edges(
             "evaluate",
             self._route_evaluation,
-            {"retrieve": "retrieve", "synthesize": "synthesize"},
+            {"retrieve": "retrieve", "synthesize": "synthesize", "end": END},
         )
         workflow.add_edge("synthesize", END)
 
@@ -819,6 +830,8 @@ class ResearchAgent:
 
     def _route_evaluation(self, state: AgentState) -> str:
         if state["is_sufficient"]:
+            if state.get("evidence_only", False):
+                return "end"
             return "synthesize"
         return "retrieve"
 
@@ -840,9 +853,8 @@ class ResearchAgent:
                 "confidence": confidence,
             }
 
-        # Budget evidence to fit model context window (dynamic by model endpoint)
-        is_local = "localhost" in self.llm.endpoint or "127.0.0.1" in self.llm.endpoint
-        max_evidence_chars = 16000 if is_local else 120000
+        # Budget evidence to fit model context window (coupled to calibrated Context Governor)
+        max_evidence_chars = self.get_context_governor_budget() * 4
         budgeted_chunks = []
         total_chars = 0
 
@@ -928,7 +940,7 @@ class ResearchAgent:
             "thought_history": thought_history,
         }
 
-    def research(self, question: str) -> AgentState:
+    def research(self, question: str, evidence_only: bool = False) -> AgentState:
         """Execute full research cycle synchronously."""
         initial_state: AgentState = {
             "question": question,
@@ -948,12 +960,13 @@ class ResearchAgent:
             "confidence": 0.0,
             "sources": [],
             "governor_alert": None,
+            "evidence_only": evidence_only,
         }
 
         result = self.graph.invoke(initial_state)
         return result
 
-    def stream_research(self, question: str) -> Iterator[Tuple[str, Dict[str, Any]]]:
+    def stream_research(self, question: str, evidence_only: bool = False) -> Iterator[Tuple[str, Dict[str, Any]]]:
         """Stream intermediate state changes for live CLI and SSE Web UI."""
         initial_state: AgentState = {
             "question": question,
@@ -973,6 +986,7 @@ class ResearchAgent:
             "confidence": 0.0,
             "sources": [],
             "governor_alert": None,
+            "evidence_only": evidence_only,
         }
 
         for step in self.graph.stream(initial_state):

@@ -105,6 +105,30 @@ def cli(ctx):
         click.echo(ctx.get_help())
 
 
+def format_evidence_dossier(chunks: List[Dict[str, Any]]) -> str:
+    """Format admitted evidence chunks into a clean text dossier."""
+    if not chunks:
+        return "No evidence found in vault."
+    lines = [
+        "=" * 80,
+        f"{'GROUNDING EVIDENCE DOSSIER':^80}",
+        "=" * 80,
+    ]
+    for i, chunk in enumerate(chunks, 1):
+        bc = chunk.get("breadcrumbs", "") or chunk.get("file_path", "Document")
+        fp = chunk.get("file_path", "")
+        score = chunk.get("score")
+        score_str = f" | Score: {score:.2f}" if score is not None else ""
+        header = f"[{i}] {bc} ({fp}){score_str}"
+        content = chunk.get("content", "").strip()
+        lines.append(header)
+        lines.append(f"    {content}")
+        if i < len(chunks):
+            lines.append("-" * 80)
+    lines.append("=" * 80)
+    return "\n".join(lines)
+
+
 @cli.command(
     name="research",
     short_help="Research a question across vault documents (Default command)",
@@ -117,6 +141,10 @@ def cli(ctx):
 @click.option("--model-endpoint", help="LLM model API endpoint URL")
 @click.option("--temperature", type=float, help="LLM sampling temperature")
 @click.option("--headroom", type=int, help="Generation runway tokens (overrides vault config)")
+@click.option("--context-window", "--ctx", type=int, help="Model context window in tokens (overrides vault config)")
+@click.option("-e", "--with-evidence", is_flag=True, help="Append the full admitted grounding evidence dossier below the answer")
+@click.option("-E", "--evidence-only", is_flag=True, help="Output only the admitted grounding evidence dossier, bypassing synthesis")
+@click.option("--json", "json_output", is_flag=True, help="Output results as structured JSON")
 @click.option("--verbose", "-V", is_flag=True, help="Display live agent thought iterations and research steps")
 def research_cmd(
     question: Tuple[str, ...],
@@ -127,6 +155,10 @@ def research_cmd(
     model_endpoint: Optional[str],
     temperature: Optional[float],
     headroom: Optional[int] = None,
+    context_window: Optional[int] = None,
+    with_evidence: bool = False,
+    evidence_only: bool = False,
+    json_output: bool = False,
     verbose: bool = False,
 ):
     """Run autonomous multi-hop research on a question."""
@@ -142,35 +174,74 @@ def research_cmd(
         "model_endpoint": model_endpoint,
         "temperature": temperature,
         "context_headroom_tokens": headroom,
+        "context_window": context_window,
     }
 
     vault = resolve_or_prompt_vault(target=vault_target, overrides=overrides)
-    if verbose:
+    if verbose and not json_output:
         console.print(f"\n[dim]Using vault '[bold]{vault.name}[/bold]' ({vault.root_path})[/dim]")
         console.print(f"[bold cyan]Researching:[/bold cyan] {query}\n")
 
     agent = ResearchAgent(vault)
 
-    status_text = "[bold green]Researching...[/bold green]"
-    with console.status(status_text, spinner="dots") as status:
-        final_state = None
-        for node_name, state_update in agent.stream_research(query):
-            if "thought_history" in state_update and state_update["thought_history"]:
-                latest_thought = state_update["thought_history"][-1]
-                if verbose:
-                    status.update(f"[dim]{latest_thought}[/dim]")
-                    console.print(f"  [dim]• {latest_thought}[/dim]")
-            final_state = state_update
+    status_text = "[bold green]Retrieving evidence...[/bold green]" if evidence_only else "[bold green]Researching...[/bold green]"
+    chunks: List[Dict[str, Any]] = []
+    final_state = None
 
-    if not final_state or not final_state.get("final_answer"):
-        final_state = agent.research(query)
+    kwargs: Dict[str, Any] = {"evidence_only": True} if evidence_only else {}
+    if json_output:
+        # Non-interactive mode for piping
+        final_state = agent.research(query, **kwargs)
+        chunks = final_state.get("evidence", [])
+    else:
+        with console.status(status_text, spinner="dots") as status:
+            for node_name, state_update in agent.stream_research(query, **kwargs):
+                if "evidence" in state_update:
+                    chunks = state_update["evidence"]
+                if "thought_history" in state_update and state_update["thought_history"]:
+                    latest_thought = state_update["thought_history"][-1]
+                    if verbose:
+                        status.update(f"[dim]{latest_thought}[/dim]")
+                        console.print(f"  [dim]• {latest_thought}[/dim]")
+                final_state = state_update
 
-    answer = final_state.get("final_answer", "No answer could be synthesized.")
-    confidence = final_state.get("confidence", 0.0)
-    sources = final_state.get("sources", [])
+        if not chunks or (not evidence_only and (not final_state or not final_state.get("final_answer"))):
+            final_state = agent.research(query, **kwargs)
+            chunks = final_state.get("evidence", [])
+
+    answer = final_state.get("final_answer", "") if final_state else ""
+    confidence = final_state.get("confidence", 0.0) if final_state else 0.0
+    sources = final_state.get("sources", []) if final_state else []
+
+    if json_output:
+        if evidence_only:
+            payload = {
+                "query": query,
+                "chunks": chunks,
+                "evidence_count": len(chunks),
+            }
+        else:
+            payload = {
+                "query": query,
+                "final_answer": answer,
+                "confidence": confidence,
+                "sources": sources,
+            }
+            if with_evidence:
+                payload["evidence"] = chunks
+        click.echo(json.dumps(payload, indent=2))
+        return
+
+    if evidence_only:
+        click.echo(format_evidence_dossier(chunks))
+        return
 
     console.print("\n")
-    console.print(Markdown(answer))
+    console.print(Markdown(answer or "No answer could be synthesized."))
+
+    if with_evidence:
+        console.print("\n")
+        console.print(format_evidence_dossier(chunks))
 
     if verbose:
         footer = f"\n[dim]Confidence: {int(confidence * 100)}%"

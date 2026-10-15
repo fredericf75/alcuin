@@ -50,24 +50,22 @@ def test_chunker_wrapped_sentence_no_split():
 def test_context_governor_budget_calculation(mock_vault):
     agent = ResearchAgent(vault=mock_vault)
 
-    # 1. 8k local instruct model (llama) -> dynamic 1500 token headroom
-    agent.llm.model = "llama3.2:3b"
-    agent.llm.endpoint = "http://localhost:11434"
-    assert agent.get_model_context_window() == 8192
-    assert agent.resolve_model_headroom(8192) == 1500
-    assert agent.get_context_governor_budget() == min(8192 - 1500, int(0.65 * 8192))
+    # 1. Default context window (16k) and default headroom (2k)
+    assert agent.get_model_context_window() == 16384
+    assert agent.resolve_model_headroom(16384) == 2000
+    assert agent.get_context_governor_budget() == min(16384 - 2000, int(0.65 * 16384))
 
-    # 2. 32k reasoning model (gemma-4-31b) -> dynamic 5000 token headroom
-    agent.llm.model = "gemma-4-31b"
-    agent.llm.endpoint = "https://generativelanguage.googleapis.com"
+    # 2. Configured context window (e.g. 32k window via vault config or LLM client)
+    mock_vault.config.context_window = 32768
     assert agent.get_model_context_window() == 32768
-    assert agent.resolve_model_headroom(32768) == 5000
-    assert agent.get_context_governor_budget() == min(32768 - 5000, int(0.65 * 32768))
+    assert agent.resolve_model_headroom(32768) == 2000
+    assert agent.get_context_governor_budget() == min(32768 - 2000, int(0.65 * 32768))
 
-    # 3. 50% safety cap on small context windows (e.g. 4k window caps 5000 headroom at 2000)
+    # 3. 50% safety cap on small context windows (e.g. 4k window caps 2500 headroom at 2000)
+    mock_vault.config.context_headroom_tokens = 2500
     assert agent.resolve_model_headroom(4000) == 2000
 
-    # 4. Custom user-defined headroom override (e.g. 1500 tokens for short-output tasks)
+    # 4. Custom user-defined headroom override (e.g. 1500 tokens for instruct models)
     mock_vault.config.context_headroom_tokens = 1500
     assert agent.resolve_model_headroom(32768) == 1500
     assert agent.get_context_governor_budget() == min(32768 - 1500, int(0.65 * 32768))
@@ -301,3 +299,37 @@ def test_synthesize_node_emits_generation_truncation_alert(mock_vault):
     assert "finish_reason: length" in res["final_answer"]
     assert res["truncation_alert"] is not None
     assert any("[GENERATION_TRUNCATION_ALERT]" in t for t in res["thought_history"])
+
+
+def test_llm_client_forwards_num_ctx_to_ollama(monkeypatch):
+    posted_payload = {}
+
+    class MockResponse:
+        status_code = 200
+
+        def json(self):
+            return {"message": {"content": "ok"}, "done_reason": "stop"}
+
+    class MockClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def post(self, url, json=None, **kwargs):
+            nonlocal posted_payload
+            posted_payload = json
+            return MockResponse()
+
+    import httpx
+    monkeypatch.setattr(httpx, "Client", MockClient)
+
+    client = LLMClient(model="custom-model", endpoint="http://localhost:11434", context_window=32768)
+    ans = client.chat("sys", "usr")
+    assert ans == "ok"
+    assert "options" in posted_payload
+    assert posted_payload["options"]["num_ctx"] == 32768

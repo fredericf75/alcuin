@@ -204,7 +204,35 @@ Open `http://localhost:8000` in your browser.
 
 ---
 
-## 5. Configuration
+## 5. Effective Prompting & Multi-Clause Research
+
+Alcuin's multi-hop engine automatically decomposes queries and traverses cross-document references. Because complex domains (such as municipal codes, technical protocols, and commercial contracts) often distribute requirements across dozens of separate sections, how you phrase your prompt significantly impacts retrieval and synthesis fidelity.
+
+### 5.1 Itemize Multi-Topic Inquiries
+When researching questions that span disparate rules or sections, **enumerate your specific questions**:
+```bash
+alcuin "Under the construction agreement:
+1. Within how many days must notice of differing site conditions be given?
+2. What is the deadline to initiate a claim for delay?
+3. Who acts as the Initial Decision Maker by default?
+4. Is mediation mandatory before binding arbitration?"
+```
+
+*Why this matters*: Alcuin automatically detects numbered or lettered sub-clauses and executes dedicated retrieval passes for each item. This ensures that a prominent topic (such as general contract dispute resolution) does not crowd out smaller, specific requirements (such as 14-day notice deadlines).
+
+### 5.2 State Requirements Explicitly
+While human readers infer implicit requests, language models perform best when expectations are stated directly:
+* **Ambiguous**: *"What happens if the tenant doesn't pay rent?"*
+* **Targeted**: *"Under the lease, what is the base rent due date, the late fee grace period and percentage, the written notice required before an Event of Default, and the overdue interest rate?"*
+
+### 5.3 Model Selection & Cognitive Sizing
+Alcuin guarantees exhaustive evidence delivery into the model's context window. However, downstream synthesis accuracy depends on the model's parameter scale and reasoning capacity:
+* **Local 3B–7B Models** (`llama3.2:3b`, `qwen2.5:7b-instruct`): Fast, fully offline, and private. Excellent for factual extraction, document summaries, and clear-cut rules.
+* **Frontier & Heavy Models (30B+)** (`gemma-4-31b-it`, Gemini, GPT-4): Strongly recommended when resolving subtle competing legal clauses (such as distinguishing a 10-day monetary default cure from a 30-day general cure) or synthesizing across 30+ dense contract chunks.
+
+---
+
+## 6. Configuration
 
 Configuration is loaded hierarchically:
 1. **CLI Flags** (highest priority)
@@ -261,7 +289,7 @@ alcuin --model openai/gpt-4o-mini "what is our insurance deductible?"
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 ### "Tesseract not installed or not in PATH"
 Ensure Tesseract is installed:

@@ -448,8 +448,82 @@ def identify_heading(line: str) -> Optional[Tuple[int, str]]:
 
 
 # =====================================================================
-# Clause-Aware Chunking Engine
+# Clause-Aware Chunking Engine & Tabular Serialization
 # =====================================================================
+
+def serialize_tabular_data(text: str) -> str:
+    """Detect Markdown pipe tables and plain text schedules, appending machine-readable key-value blocks."""
+    if "<!-- TABLE_DATA:" in text:
+        return text
+
+    lines = text.splitlines()
+    output_lines: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # 1. Check for Markdown Pipe Table
+        if re.match(r"^\s*\|.*\|\s*$", line):
+            table_lines = [line]
+            j = i + 1
+            while j < len(lines) and re.match(r"^\s*\|.*\|\s*$", lines[j]):
+                table_lines.append(lines[j])
+                j += 1
+            if len(table_lines) >= 3 and re.match(r"^\s*\|[\s:\-\|]+\|\s*$", table_lines[1]):
+                raw_headers = [c.strip() for c in table_lines[0].strip().strip("|").split("|")]
+                data_rows = []
+                for row_str in table_lines[2:]:
+                    cells = [c.strip() for c in row_str.strip().strip("|").split("|")]
+                    data_rows.append(cells)
+
+                table_data = None
+                if len(raw_headers) == 2:
+                    table_data = {r[0]: (r[1] if len(r) > 1 else "") for r in data_rows if r}
+                elif len(raw_headers) > 2:
+                    table_data = [
+                        {raw_headers[idx]: (r[idx] if idx < len(r) else "") for idx in range(len(raw_headers))}
+                        for r in data_rows if r
+                    ]
+
+                output_lines.extend(table_lines)
+                if table_data:
+                    json_str = json.dumps(table_data, indent=2)
+                    output_lines.append(f"<!-- TABLE_DATA:\n{json_str}\n-->")
+                i = j
+                continue
+
+        # 2. Check for plain text fee/penalty schedule (e.g. Offense Penalty / 1st $20.00 fine)
+        if re.match(r"^\s*(?:Offense|Violation|Item|Tier)\s+(?:Penalty|Fine|Fee|Amount|Sanction)\s*$", line, re.IGNORECASE):
+            sched_lines = [line]
+            j = i + 1
+            entries: Dict[str, str] = {}
+            while j < len(lines):
+                row = lines[j].strip()
+                if not row:
+                    j += 1
+                    continue
+                m = re.match(r"^([0-9]+(?:st|nd|rd|th)|[A-Za-z0-9\.\-]+)\s{2,}(\$[\s0-9\.,]+.*)$", row)
+                if m:
+                    entries[m.group(1).strip()] = m.group(2).strip()
+                    sched_lines.append(lines[j])
+                    j += 1
+                else:
+                    break
+            if entries:
+                output_lines.extend(sched_lines)
+                json_str = json.dumps(entries, indent=2)
+                output_lines.append(f"<!-- TABLE_DATA:\n{json_str}\n-->")
+                i = j
+                continue
+
+        output_lines.append(line)
+        i += 1
+
+    res = "\n".join(output_lines)
+    if text.endswith("\n"):
+        res += "\n"
+    return res
+
 
 def chunk_document_text(
     document_title: str,
@@ -477,6 +551,23 @@ def chunk_document_text(
         if not clean_content:
             return
 
+        def add_chunk(raw_text: str, title: str):
+            serialized = serialize_tabular_data(raw_text)
+            c_type = "table" if "<!-- TABLE_DATA:" in serialized else chunk_type
+            chunks.append(
+                DocumentChunk(
+                    chunk_id=len(chunks) + 1,
+                    document_title=document_title,
+                    section_title=title,
+                    hierarchy=list(hierarchy),
+                    breadcrumbs=build_breadcrumbs(),
+                    content=serialized,
+                    char_count=len(serialized),
+                    token_estimate=int(len(serialized) / 4),
+                    chunk_type=c_type,
+                )
+            )
+
         if len(clean_content) > max_size:
             splitter = "\n\n" if "\n\n" in clean_content else "\n"
             sub_paragraphs = clean_content.split(splitter)
@@ -490,38 +581,14 @@ def chunk_document_text(
                     for slice_start in range(0, p_len, max_size):
                         slice_p = p[slice_start : slice_start + max_size]
                         sub_title = f"{current_section_title} (Part {part_idx})"
-                        chunks.append(
-                            DocumentChunk(
-                                chunk_id=len(chunks) + 1,
-                                document_title=document_title,
-                                section_title=sub_title,
-                                hierarchy=list(hierarchy),
-                                breadcrumbs=build_breadcrumbs(),
-                                content=slice_p,
-                                char_count=len(slice_p),
-                                token_estimate=int(len(slice_p) / 4),
-                                chunk_type=chunk_type,
-                            )
-                        )
+                        add_chunk(slice_p, sub_title)
                         part_idx += 1
                     continue
 
                 if curr_len + p_len > max_size and buffer_paras:
                     part_content = splitter.join(buffer_paras)
                     sub_title = f"{current_section_title} (Part {part_idx})"
-                    chunks.append(
-                        DocumentChunk(
-                            chunk_id=len(chunks) + 1,
-                            document_title=document_title,
-                            section_title=sub_title,
-                            hierarchy=list(hierarchy),
-                            breadcrumbs=build_breadcrumbs(),
-                            content=part_content,
-                            char_count=len(part_content),
-                            token_estimate=int(len(part_content) / 4),
-                            chunk_type=chunk_type,
-                        )
-                    )
+                    add_chunk(part_content, sub_title)
                     buffer_paras = [p]
                     curr_len = p_len
                     part_idx += 1
@@ -532,33 +599,9 @@ def chunk_document_text(
             if buffer_paras:
                 part_content = splitter.join(buffer_paras)
                 sub_title = f"{current_section_title} (Part {part_idx})" if part_idx > 1 else current_section_title
-                chunks.append(
-                    DocumentChunk(
-                        chunk_id=len(chunks) + 1,
-                        document_title=document_title,
-                        section_title=sub_title,
-                        hierarchy=list(hierarchy),
-                        breadcrumbs=build_breadcrumbs(),
-                        content=part_content,
-                        char_count=len(part_content),
-                        token_estimate=int(len(part_content) / 4),
-                        chunk_type=chunk_type,
-                    )
-                )
+                add_chunk(part_content, sub_title)
         else:
-            chunks.append(
-                DocumentChunk(
-                    chunk_id=len(chunks) + 1,
-                    document_title=document_title,
-                    section_title=current_section_title,
-                    hierarchy=list(hierarchy),
-                    breadcrumbs=build_breadcrumbs(),
-                    content=clean_content,
-                    char_count=len(clean_content),
-                    token_estimate=int(len(clean_content) / 4),
-                    chunk_type=chunk_type,
-                )
-            )
+            add_chunk(clean_content, current_section_title)
 
     i = 0
     while i < len(lines):

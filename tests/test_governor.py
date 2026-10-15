@@ -50,23 +50,29 @@ def test_chunker_wrapped_sentence_no_split():
 def test_context_governor_budget_calculation(mock_vault):
     agent = ResearchAgent(vault=mock_vault)
 
-    # 1. 8k local model -> ~5,000 tokens (leaves 3,192 tok headroom)
+    # 1. 8k local instruct model (llama) -> dynamic 1500 token headroom
     agent.llm.model = "llama3.2:3b"
     agent.llm.endpoint = "http://localhost:11434"
     assert agent.get_model_context_window() == 8192
-    assert agent.get_context_governor_budget() == min(8192 - 3000, int(0.65 * 8192))
+    assert agent.resolve_model_headroom(8192) == 1500
+    assert agent.get_context_governor_budget() == min(8192 - 1500, int(0.65 * 8192))
 
-    # 2. 32k model -> min(32768 - 3000, 0.65 * 32768) = ~21,299 tokens
+    # 2. 32k reasoning model (gemma-4-31b) -> dynamic 5000 token headroom
     agent.llm.model = "gemma-4-31b"
     agent.llm.endpoint = "https://generativelanguage.googleapis.com"
     assert agent.get_model_context_window() == 32768
-    assert agent.get_context_governor_budget() == min(32768 - 3000, int(0.65 * 32768))
+    assert agent.resolve_model_headroom(32768) == 5000
+    assert agent.get_context_governor_budget() == min(32768 - 5000, int(0.65 * 32768))
 
-    # 3. Custom user-defined headroom (e.g. 1500 tokens for short-output tasks)
+    # 3. 50% safety cap on small context windows (e.g. 4k window caps 5000 headroom at 2000)
+    assert agent.resolve_model_headroom(4000) == 2000
+
+    # 4. Custom user-defined headroom override (e.g. 1500 tokens for short-output tasks)
     mock_vault.config.context_headroom_tokens = 1500
+    assert agent.resolve_model_headroom(32768) == 1500
     assert agent.get_context_governor_budget() == min(32768 - 1500, int(0.65 * 32768))
 
-    # 4. Explicit max tokens override
+    # 5. Explicit max tokens override
     mock_vault.config.context_governor_max_tokens = 3500
     assert agent.get_context_governor_budget() == 3500
 

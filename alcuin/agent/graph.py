@@ -276,13 +276,30 @@ class ResearchAgent:
         is_local = "localhost" in endpoint or "127.0.0.1" in endpoint
         return 8192 if is_local else 32768
 
+    def resolve_model_headroom(self, window_tokens: int) -> int:
+        """Resolve dynamic model generation headroom with a 50% safety cap on context window."""
+        cfg_headroom = getattr(self.vault.config, "context_headroom_tokens", None)
+        if cfg_headroom is not None:
+            hr = int(cfg_headroom)
+        else:
+            name = (self.llm.model or "").lower()
+            if any(r in name for r in ("gemma4", "gemma-4", "deepseek-r1", "qwq", "o1", "o3", "r1")):
+                hr = 5000
+            elif any(i in name for i in ("llama", "phi", "mistral", "qwen2")):
+                hr = 1500
+            else:
+                hr = 3000
+
+        max_safe = max(int(0.50 * window_tokens), 1000)
+        return min(hr, max_safe)
+
     def get_context_governor_budget(self) -> int:
         """Compute the calibrated evidence token ceiling: min(configured, window - headroom, 0.65 * window)."""
         cfg_max = getattr(self.vault.config, "context_governor_max_tokens", None)
         if cfg_max is not None:
             return int(cfg_max)
         window = self.get_model_context_window()
-        headroom = int(getattr(self.vault.config, "context_headroom_tokens", 3000))
+        headroom = self.resolve_model_headroom(window)
         budget = min(window - headroom, int(0.65 * window))
         return max(budget, 2000)
 

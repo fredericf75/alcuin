@@ -72,7 +72,7 @@ class VaultConfig:
     link_pruning_max_queue: int = 10
     context_governor: bool = True
     context_governor_max_tokens: Optional[int] = None
-    context_headroom_tokens: int = 3000
+    context_headroom_tokens: Optional[int] = None
     sibling_traversal: bool = True
     sibling_pruning_threshold: float = 0.45
     sibling_max_per_hit: int = 2
@@ -144,8 +144,14 @@ class VaultConfig:
                 if agent_sec.get("context_governor_max_tokens") is not None
                 else g_agent.get("context_governor_max_tokens")
             ),
-            context_headroom_tokens=int(
-                agent_sec.get("context_headroom_tokens", g_agent.get("context_headroom_tokens", 3000))
+            context_headroom_tokens=(
+                int(agent_sec["context_headroom_tokens"])
+                if agent_sec.get("context_headroom_tokens") is not None
+                else (
+                    int(g_agent["context_headroom_tokens"])
+                    if g_agent.get("context_headroom_tokens") is not None
+                    else None
+                )
             ),
             sibling_traversal=bool(
                 agent_sec.get("sibling_traversal", g_agent.get("sibling_traversal", True))
@@ -189,11 +195,12 @@ class VaultConfig:
             f"link_pruning_threshold = {self.link_pruning_threshold}",
             f"link_pruning_max_queue = {self.link_pruning_max_queue}",
             f"context_governor = {'true' if self.context_governor else 'false'}",
-            f"context_headroom_tokens = {self.context_headroom_tokens}",
             f"sibling_traversal = {'true' if self.sibling_traversal else 'false'}",
             f"sibling_pruning_threshold = {self.sibling_pruning_threshold}",
             f"sibling_max_per_hit = {self.sibling_max_per_hit}",
         ]
+        if self.context_headroom_tokens is not None:
+            agent_lines.append(f"context_headroom_tokens = {self.context_headroom_tokens}")
         if self.context_governor_max_tokens is not None:
             agent_lines.append(f"context_governor_max_tokens = {self.context_governor_max_tokens}")
         if self.model_name:

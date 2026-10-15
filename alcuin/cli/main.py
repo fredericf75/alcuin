@@ -116,6 +116,7 @@ def cli(ctx):
 @click.option("--model", "model_name", help="LLM model name (overrides vault and global config)")
 @click.option("--model-endpoint", help="LLM model API endpoint URL")
 @click.option("--temperature", type=float, help="LLM sampling temperature")
+@click.option("--headroom", type=int, help="Generation runway tokens (overrides vault config)")
 @click.option("--verbose", "-V", is_flag=True, help="Display live agent thought iterations and research steps")
 def research_cmd(
     question: Tuple[str, ...],
@@ -125,6 +126,7 @@ def research_cmd(
     model_name: Optional[str],
     model_endpoint: Optional[str],
     temperature: Optional[float],
+    headroom: Optional[int] = None,
     verbose: bool = False,
 ):
     """Run autonomous multi-hop research on a question."""
@@ -139,6 +141,7 @@ def research_cmd(
         "model_name": model_name,
         "model_endpoint": model_endpoint,
         "temperature": temperature,
+        "context_headroom_tokens": headroom,
     }
 
     vault = resolve_or_prompt_vault(target=vault_target, overrides=overrides)

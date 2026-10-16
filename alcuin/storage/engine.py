@@ -7,6 +7,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 from dataclasses import asdict, dataclass, field
@@ -411,9 +412,18 @@ class VaultStorage:
             # Fallback to vector search
             res = self.table.search(query_vec).limit(top_k).to_list()
 
+        q_norm = math.sqrt(sum(x * x for x in query_vec)) or 1.0
+
         results: List[SearchResult] = []
         for r in res:
-            score = float(r.get("_score", r.get("_distance", 1.0)))
+            v = r.get("vector")
+            if v is not None and len(v) == len(query_vec):
+                v_norm = math.sqrt(sum(x * x for x in v)) or 1.0
+                dot = sum(a * b for a, b in zip(query_vec, v))
+                score = float(dot / (q_norm * v_norm))
+            else:
+                score = float(r.get("_relevance_score", r.get("_score", 1.0)))
+
             results.append(
                 SearchResult(
                     id=r["id"],
@@ -426,6 +436,7 @@ class VaultStorage:
                     score=score,
                 )
             )
+
         return results
 
     def get_linked_pages(self, page_target: str) -> List[str]:

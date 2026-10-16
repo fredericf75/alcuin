@@ -29,6 +29,7 @@ class AgentState(TypedDict):
     visited_links: List[str]
     pending_links: List[str]
     sub_goals: List[str]
+    sub_questions: List[str]
     visited_queries: List[str]
     recomposed_topics: List[str]
     evidence: List[Dict[str, Any]]
@@ -332,51 +333,150 @@ class ResearchAgent:
 
         return workflow.compile()
 
-    def decompose_query(self, question: str) -> List[str]:
-        """Decompose a complex or multi-part query into targeted retrieval queries."""
-        has_subparts = bool(re.search(r"(?:[A-Z]\.|\b\d+\.)", question))
+    def decompose_query(self, question: str) -> Tuple[List[str], List[str]]:
+        """Decompose a complex or multi-part query into:
+        1. sub_goals: targeted keyword queries for document search.
+        2. sub_questions: full grammatical questions for answer synthesis.
+        """
+        has_subparts = bool(re.search(r"(?:[A-Z]\.|\b\d+[\.\)])", question))
         is_long = len(question.split()) > 25
 
         if not (has_subparts or is_long):
-            return [question]
+            return [question], [question]
 
-        queries: List[str] = []
+        # 1. Deterministic extraction: Full numbered or lettered items
+        matches = re.findall(r"(?:^|\n)\s*(?:[A-Z]\.|\d+[\.\)])\s*([^\n]+)", question)
+        cleaned_items = [re.sub(r"^\s*(?:[A-Z]\.|\d+[\.\)])\s*", "", m).strip() for m in matches if len(m.strip()) >= 8]
 
-        # 1. Deterministic extraction: Full labeled clauses (e.g. A. Right of Entry... B. Specific Violations...)
-        clause_matches = re.findall(r"([A-Z]\.\s*[^\n]+(?:\n(?![A-Z]\.|\d+\.)[^\n]+)?)", question)
-        for c in clause_matches:
-            cleaned = " ".join(c.split())
-            cleaned = re.sub(r"^[A-Z]\.\s*", "", cleaned)
-            shortened = cleaned[:160].strip()
-            if shortened and shortened not in queries:
-                queries.append(shortened)
+        if len(cleaned_items) >= 2:
+            sub_questions = cleaned_items
+            sub_goals: List[str] = []
+            filler = {"within", "how", "many", "days", "after", "must", "the", "a", "an", "for", "is", "under", "what", "which", "of", "are"}
+            for q in cleaned_items:
+                q_clean = q.rstrip("?.:;!")
+                words = q_clean.split()
+                if len(words) <= 8:
+                    sub_goals.append(q_clean)
+                else:
+                    meaningful = [w for w in words if w.lower() not in filler]
+                    sub_goals.append(" ".join(meaningful[:6]) if len(meaningful) >= 3 else " ".join(words[:6]))
+            return sub_goals, sub_questions
 
-        # 2. Numbered items (e.g. 1. The property owner..., 2. The primary dwelling...)
-        num_matches = re.findall(r"\b\d+\.\s*([^\n\.\?]{8,120})", question)
-        for n in num_matches:
-            n_clean = " ".join(n.split())[:120].strip()
-            if n_clean and n_clean not in queries:
-                queries.append(n_clean)
+        # 2. Dual-field LLM decomposition for unstructured inquiries
+        sys_prompt = (
+            "You are a research query planner.\n"
+            "Identify every distinct question, condition, metric, exception, or consequence raised in the user's inquiry.\n"
+            "Respond with a JSON object adhering strictly to this schema:\n"
+            "{\n"
+            '  "sub_goals": [\n'
+            '    {\n'
+            '      "question": "Full grammatical question addressing one specific issue",\n'
+            '      "search_query": "3 to 6 keywords for document retrieval"\n'
+            '    }\n'
+            '  ]\n'
+            "}\n"
+            "Output ONLY valid JSON."
+        )
+        llm_resp = self.llm.chat(sys_prompt, question[:2000])
+        sub_goals: List[str] = []
+        sub_questions: List[str] = []
 
-        # 3. Augment with LLM decomposition if needed for unformatted queries
-        if len(queries) < 2:
-            sys_prompt = (
-                "You are a research query planner.\n"
-                "Break down the user's inquiry into 2 to 4 concise search queries (3 to 6 keywords each) "
-                "designed to retrieve the relevant statutes, sections, and facts from a document database.\n"
-                "Output each search query on a new line. Do not number or prefix them."
-            )
-            llm_resp = self.llm.chat(sys_prompt, question[:2000])
-            if llm_resp:
+        if llm_resp:
+            try:
+                m = re.search(r"\{.*\}", llm_resp, re.DOTALL)
+                if m:
+                    data = json.loads(m.group(0))
+                    items = data.get("sub_goals", [])
+                    for it in items:
+                        if isinstance(it, dict):
+                            q = str(it.get("question", "")).strip()
+                            s = str(it.get("search_query", "")).strip()
+                            if q and s:
+                                sub_questions.append(q)
+                                sub_goals.append(s)
+                        elif isinstance(it, str) and it.strip():
+                            sub_questions.append(it.strip())
+                            sub_goals.append(it.strip())
+            except Exception:
+                pass
+
+            if not sub_goals:
+                try:
+                    m = re.search(r"\[.*\]", llm_resp, re.DOTALL)
+                    if m:
+                        items = json.loads(m.group(0))
+                        if isinstance(items, list):
+                            for it in items:
+                                if isinstance(it, dict):
+                                    q = str(it.get("question", "")).strip()
+                                    s = str(it.get("search_query", "")).strip()
+                                    if q and s:
+                                        sub_questions.append(q)
+                                        sub_goals.append(s)
+                                elif isinstance(it, str) and it.strip():
+                                    sub_questions.append(it.strip())
+                                    sub_goals.append(it.strip())
+                except Exception:
+                    pass
+
+            # Resilient fallback if non-JSON lines
+            if not sub_goals:
                 for line in llm_resp.strip().splitlines():
-                    cleaned = re.sub(r"^[\d\.\-\*\•\s]+", "", line).strip()
-                    if cleaned and len(cleaned.split()) >= 2 and cleaned not in queries:
-                        queries.append(cleaned)
+                    l_clean = line.strip()
+                    l_lower = l_clean.lower()
+                    if any(l_lower.startswith(p) for p in ("here are", "here is", "to locate", "based on", "the following")):
+                        continue
+                    if l_clean.endswith(":"):
+                        continue
+                    cleaned = re.sub(r"^[\d\.\-\*\•\s]+", "", l_clean).strip()
+                    cleaned = re.sub(r'^(?:(?:search\s+)?query:\s*)+', '', cleaned, flags=re.IGNORECASE).strip(' "\'')
+                    if cleaned and len(cleaned.split()) >= 2 and cleaned not in sub_goals:
+                        sub_goals.append(cleaned)
+                        sub_questions.append(cleaned)
 
-        if not queries:
-            queries = [question]
+        if sub_goals:
+            return sub_goals, sub_questions
+        return [question], [question]
 
-        return queries[:8]
+    def prune_by_score_cliff(
+        self,
+        results: List[SearchResult],
+        min_drop: float = 0.12,
+        min_relative_drop: float = 0.20,
+    ) -> List[SearchResult]:
+        """Apply adaptive score-cliff pruning to a sorted list of SearchResults for a sub-goal."""
+        if len(results) <= 1:
+            return results
+
+        # Ensure results are strictly ordered descending by semantic score
+        sorted_results = sorted(results, key=lambda x: x.score, reverse=True)
+
+        # Guardrail: top hit must have meaningful semantic signal
+        if sorted_results[0].score < 0.40:
+            return []
+
+        scores = [r.score for r in sorted_results]
+        deltas = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
+
+        cutoff_idx = None
+        for i, delta in enumerate(deltas):
+            # Condition 1: Minimum absolute drop
+            if delta < min_drop:
+                continue
+            # Condition 2: Minimum relative drop from predecessor
+            if scores[i] <= 0 or (delta / scores[i]) < min_relative_drop:
+                continue
+            # Condition 3: Gradient dominance over previous plateau (if i > 0)
+            if i > 0:
+                mean_prior = sum(deltas[:i]) / i
+                if delta < 2.0 * mean_prior:
+                    continue
+            cutoff_idx = i + 1
+            break
+
+        if cutoff_idx is not None:
+            return sorted_results[:cutoff_idx]
+        return sorted_results
 
     def refine_stagnated_topic(self, topic: str, question: str) -> List[str]:
         """Drill down and re-decompose a topic that yielded no new evidence (Depth-1)."""
@@ -514,14 +614,15 @@ class ResearchAgent:
         visited_links = list(state.get("visited_links", []))
         visited_queries = list(state.get("visited_queries", []))
         sub_goals = list(state.get("sub_goals", []))
+        sub_questions = list(state.get("sub_questions", []))
         recomposed_topics = list(state.get("recomposed_topics", []))
         thought_history = list(state.get("thought_history", []))
 
-        # 1. On turn 0, decompose question into discrete sub-goals
+        # 1. On turn 0, decompose question into discrete sub-goals and sub-questions
         if state["iteration"] == 0:
-            sub_goals = self.decompose_query(state["question"])
-            # Batch first 2-3 sub_goals for initial search
-            search_targets = [g for g in sub_goals if g not in visited_queries][:3]
+            sub_goals, sub_questions = self.decompose_query(state["question"])
+            # Batch discrete sub-goals up to 5 concurrent queries on initial turn
+            search_targets = [g for g in sub_goals if g not in visited_queries][:5]
             if not search_targets:
                 search_targets = [state["question"]]
         else:
@@ -546,8 +647,9 @@ class ResearchAgent:
             if target_query in visited_queries:
                 continue
             visited_queries.append(target_query)
-            results = self.storage.search(target_query, top_k=4)
-            for r in results:
+            raw_results = self.storage.search(target_query, top_k=4)
+            qualified = self.prune_by_score_cliff(raw_results)
+            for r in qualified:
                 if r.id not in visited_ids and all(p.id != r.id for p in current_turn_primary):
                     current_turn_primary.append(r)
                     # Extract candidate cross-references if in broad inquiry scope
@@ -571,7 +673,8 @@ class ResearchAgent:
             cand_sibling_ids = []
             seen_cand_ids = set(visited_ids) | {p.id for p in current_turn_primary}
             for p in current_turn_primary:
-                if "#" in p.id:
+                # Only expand siblings for primary hits with strong semantic relevance
+                if p.score >= 0.58 and "#" in p.id:
                     file_part, chunk_str = p.id.rsplit("#", 1)
                     if chunk_str.isdigit():
                         num = int(chunk_str)
@@ -589,7 +692,7 @@ class ResearchAgent:
                         for s in fetched_siblings
                     ]
                     scored_tuples = self.score_candidate_links(state["question"], cand_pairs)
-                    threshold = float(getattr(self.vault.config, "sibling_pruning_threshold", 0.45))
+                    threshold = float(getattr(self.vault.config, "sibling_pruning_threshold", 0.58))
                     max_per_hit = int(getattr(self.vault.config, "sibling_max_per_hit", 2))
 
                     fetched_map = {s.id: s for s in fetched_siblings}
@@ -674,13 +777,20 @@ class ResearchAgent:
             window_size = self.get_model_context_window()
             model_name = getattr(self.llm, "model", "active model")
             pruned_tok_sum = sum(p["tokens"] for p in pruned_high_rel)
+            unaddressed_goals = [g for g in sub_goals if g not in visited_queries]
             alert_lines = [
                 "[CONTEXT_GOVERNOR_ALERT]",
                 f"Context budget reached: {current_tokens:,} tokens (allocated for {window_size:,}-token model '{model_name}').",
-                f"Pruned {len(pruned_high_rel)} high-relevance clauses (~{pruned_tok_sum:,} tokens) to prevent context degradation:",
+                f"Pruned {len(pruned_high_rel)} tail / lower-ranked clauses (~{pruned_tok_sum:,} tokens) to prevent context degradation:",
             ]
             for p in pruned_high_rel[:4]:
                 alert_lines.append(f"  - {p['id']} (Score: {p['score']:.2f}): {p['title'][:55]}")
+            if unaddressed_goals:
+                alert_lines.append(f"Deferred {len(unaddressed_goals)} remaining sub-goal(s) due to context capacity:")
+                for g in unaddressed_goals[:3]:
+                    alert_lines.append(f"  - {g}")
+                if len(unaddressed_goals) > 3:
+                    alert_lines.append(f"  ... and {len(unaddressed_goals) - 3} more")
             alert_lines.append("Actionable Guidance: Sizing up context window is empirically justified.")
             governor_alert = "\n".join(alert_lines)
             thought_history.append(governor_alert)
@@ -736,6 +846,7 @@ class ResearchAgent:
             "visited_links": visited_links,
             "visited_queries": visited_queries,
             "sub_goals": sub_goals,
+            "sub_questions": sub_questions,
             "recomposed_topics": recomposed_topics,
             "thought_history": thought_history,
             "governor_alert": governor_alert,
@@ -805,13 +916,19 @@ class ResearchAgent:
             except Exception:
                 pass
 
-        # If LLM said sufficient but we haven't visited primary sub-goals yet, don't stop prematurely
-        if sufficient and unvisited_goals and len(state["evidence"]) < 8:
-            sufficient = False
+        # If LLM said sufficient but primary decomposed sub-goals remain unsearched, do not stop prematurely
+        # UNLESS the Context Governor has already saturated the model's budget
+        has_governor_saturation = bool(state.get("governor_alert"))
+        if sufficient and unvisited_goals:
+            if not has_governor_saturation:
+                sufficient = False
 
         # Deterministic Anti-Stagnation Fallback: Never repeat the same query!
         if not sufficient:
-            if not next_query or next_query in visited_queries or next_query == state["question"]:
+            if has_governor_saturation:
+                sufficient = True
+                thought = "Evaluation: Context capacity reached. Halting further retrieval to synthesize from admitted evidence."
+            elif not next_query or next_query in visited_queries or next_query == state["question"]:
                 if unvisited_goals:
                     next_query = unvisited_goals[0]
                 elif pending_links:
@@ -869,17 +986,28 @@ class ResearchAgent:
 
         sys_prompt = (
             "You are Alcuin, an autonomous knowledge assistant. Answer the user's question directly and concisely "
-            "based strictly on the provided evidence. "
-            "If the user asks for a specific fact (such as a date, name, birthday, amount, or threshold), give only the direct answer. "
-            "Do not recite unnecessary background, filler, or raw evidence dumps. "
-            "When citing tables, schedules, deadlines, or fine structures, transcribe the row values and numbers verbatim. "
+            "based strictly on the provided evidence.\n"
+            "If multiple questions or core tasks are identified, address each in a separate numbered response.\n"
+            "State the exact numerical deadline, threshold, or entity directly before providing explanatory context.\n"
+            "When citing tables, schedules, deadlines, or fine structures, transcribe the row values and numbers verbatim.\n"
             "If the evidence does not contain the answer, state clearly and concisely that the information is not found."
         )
-        user_prompt = (
-            f"Question: {state['question']}\n\n"
-            f"Evidence:\n{evidence_text}\n\n"
-            "Direct Answer:"
-        )
+
+        sub_questions = state.get("sub_questions", [])
+        if sub_questions and len(sub_questions) >= 2:
+            questions_text = "\n".join([f"{i+1}. {q}" for i, q in enumerate(sub_questions)])
+            user_prompt = (
+                f"User Inquiry:\n{state['question']}\n\n"
+                f"Questions to Address:\n{questions_text}\n\n"
+                f"Evidence:\n{evidence_text}\n\n"
+                "Provide a direct, numbered response explicitly answering each Question using the evidence:\n"
+            )
+        else:
+            user_prompt = (
+                f"Question: {state['question']}\n\n"
+                f"Evidence:\n{evidence_text}\n\n"
+                "Direct Answer:"
+            )
 
         thought_history = list(state.get("thought_history", []))
 
@@ -951,6 +1079,7 @@ class ResearchAgent:
             "visited_links": [],
             "pending_links": [],
             "sub_goals": [],
+            "sub_questions": [],
             "visited_queries": [],
             "recomposed_topics": [],
             "evidence": [],
@@ -977,6 +1106,7 @@ class ResearchAgent:
             "visited_links": [],
             "pending_links": [],
             "sub_goals": [],
+            "sub_questions": [],
             "visited_queries": [],
             "recomposed_topics": [],
             "evidence": [],

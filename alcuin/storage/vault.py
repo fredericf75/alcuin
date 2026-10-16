@@ -76,7 +76,7 @@ class VaultConfig:
     context_headroom_tokens: Optional[int] = None
     context_window: int = 16384
     sibling_traversal: bool = True
-    sibling_pruning_threshold: float = 0.45
+    sibling_pruning_threshold: float = 0.58
     sibling_max_per_hit: int = 2
 
     def __post_init__(self):
@@ -169,7 +169,7 @@ class VaultConfig:
             sibling_pruning_threshold=float(
                 agent_sec.get(
                     "sibling_pruning_threshold",
-                    g_agent.get("sibling_pruning_threshold", 0.45),
+                    g_agent.get("sibling_pruning_threshold", 0.58),
                 )
             ),
             sibling_max_per_hit=int(

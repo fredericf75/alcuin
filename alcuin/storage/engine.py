@@ -75,66 +75,88 @@ class IndexReport:
 
 
 class EmbeddingClient:
-    """Provides vector embeddings using Ollama with deterministic offline fallback."""
+    """Provides vector embeddings using OpenAI-compatible /v1/embeddings, Ollama, or deterministic fallback."""
 
     def __init__(self, endpoint: str = "http://localhost:11434", model: str = "nomic-embed-text"):
-        self.endpoint = endpoint.rstrip("/")
-        self.model = model
+        self.endpoint = endpoint.rstrip("/") if endpoint else "http://localhost:11434"
+        self.model = model or "nomic-embed-text"
+        self._available: Optional[bool] = None
+
+    def _is_openai(self) -> bool:
+        ep = self.endpoint.lower()
+        return ep.endswith("/v1") or ep.endswith("/embeddings") or "/v1/" in ep or ":8000" in ep
 
     def get_embedding(self, text: str) -> List[float]:
-        try:
-            with httpx.Client(timeout=10.0) as client:
-                resp = client.post(
-                    f"{self.endpoint}/api/embeddings",
-                    json={"model": self.model, "prompt": text},
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    emb = data.get("embedding")
-                    if emb and len(emb) == EMBEDDING_DIM:
-                        return [float(x) for x in emb]
-        except Exception:
-            pass
-
-        # Offline fallback: deterministic pseudo-embedding
+        res = self.get_embeddings_batch([text], batch_size=1)
+        if res:
+            return res[0]
         return self._fallback_embedding(text)
 
     def get_embeddings_batch(self, texts: List[str], batch_size: int = 32) -> List[List[float]]:
         if not texts:
             return []
+        if self._available is False:
+            return [self._fallback_embedding(t) for t in texts]
+
         results: List[List[float]] = []
+        is_openai = self._is_openai()
+
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
             batch_embs = None
             try:
                 with httpx.Client(timeout=30.0) as client:
-                    resp = client.post(
-                        f"{self.endpoint}/api/embed",
-                        json={"model": self.model, "input": batch},
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        embs = data.get("embeddings")
-                        if embs and len(embs) == len(batch):
-                            batch_embs = [[float(x) for x in emb] for emb in embs]
+                    if is_openai:
+                        base = self.endpoint
+                        if base.endswith("/embeddings"):
+                            url = base
+                        elif base.endswith("/v1"):
+                            url = f"{base}/embeddings"
+                        else:
+                            url = f"{base}/v1/embeddings"
+                        resp = client.post(
+                            url,
+                            json={"model": self.model, "input": batch},
+                        )
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            items = data.get("data", [])
+                            if items:
+                                items_sorted = sorted(items, key=lambda x: x.get("index", 0))
+                                batch_embs = [item["embedding"] for item in items_sorted if "embedding" in item]
+                    else:
+                        resp = client.post(
+                            f"{self.endpoint}/api/embed",
+                            json={"model": self.model, "input": batch},
+                        )
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            embs = data.get("embeddings")
+                            if embs and len(embs) == len(batch):
+                                batch_embs = [[float(x) for x in emb] for emb in embs]
+                if batch_embs and len(batch_embs) == len(batch):
+                    self._available = True
+                else:
+                    batch_embs = None
             except Exception:
-                pass
+                self._available = False
+                batch_embs = None
+
             if batch_embs is not None:
                 results.extend(batch_embs)
             else:
-                results.extend([self.get_embedding(t) for t in batch])
+                self._available = False
+                results.extend([self._fallback_embedding(t) for t in batch])
         return results
 
     @staticmethod
     def _fallback_embedding(text: str) -> List[float]:
         """Generates a deterministic normalized embedding vector for tests/offline mode."""
         h = hashlib.sha256(text.encode("utf-8")).digest()
-        # Seed 768 dimensions deterministically
         vec = []
         for i in range(EMBEDDING_DIM):
             byte_val = h[i % len(h)]
             vec.append((byte_val / 255.0) - 0.5)
-        # Normalize
         norm = sum(x * x for x in vec) ** 0.5 or 1.0
         return [x / norm for x in vec]
 
@@ -200,7 +222,7 @@ class VaultStorage:
         self.db_dir.mkdir(parents=True, exist_ok=True)
         self.db = lancedb.connect(str(self.db_dir))
         self.embedder = EmbeddingClient(
-            endpoint=vault.config.model_endpoint,
+            endpoint=vault.config.embedding_endpoint or vault.config.model_endpoint,
             model=vault.config.embedding_model,
         )
         self.table = self._get_or_create_table()

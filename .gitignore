@@ -1,10 +1,12 @@
 # Internal documentation repo (managed as independent git repo)
 docs_internal/
+alcuin-internal_docs/
 
 # Python environment
 .venv/
 env/
 venv/
+uv.lock
 *.egg-info/
 __pycache__/
 *.py[cod]

@@ -48,6 +48,7 @@ class VaultConfig:
     model_name: str = ""
     temperature: float = 0.2
     embedding_model: str = "nomic-embed-text"
+    embedding_endpoint: Optional[str] = None
     fts_weight: float = 0.3
     vector_weight: float = 0.7
     periodic_indexing: bool = True
@@ -97,19 +98,21 @@ class VaultConfig:
         storage_sec = data.get("storage", {})
         ingest_sec = data.get("ingestion", {})
 
-        def_endpoint = os.environ.get("ALCUIN_ENDPOINT") or g_agent.get("model_endpoint") or "http://localhost:11434"
-        def_model = os.environ.get("ALCUIN_MODEL") or g_agent.get("model_name") or ""
-        def_embed = g_storage.get("embedding_model") or "nomic-embed-text"
+        model_ep = os.environ.get("ALCUIN_ENDPOINT") or agent_sec.get("model_endpoint") or g_agent.get("model_endpoint") or "http://localhost:11434"
+        model_nm = os.environ.get("ALCUIN_MODEL") or agent_sec.get("model_name") or g_agent.get("model_name") or ""
+        embed_md = os.environ.get("ALCUIN_EMBEDDING_MODEL") or storage_sec.get("embedding_model") or g_storage.get("embedding_model") or "nomic-embed-text"
+        embed_ep = os.environ.get("ALCUIN_EMBEDDING_ENDPOINT") or storage_sec.get("embedding_endpoint") or g_storage.get("embedding_endpoint") or None
 
         return cls(
             name=vault_sec.get("name", "default"),
             description=vault_sec.get("description", ""),
             max_hops=int(agent_sec.get("max_hops", g_agent.get("max_hops", 3))),
             max_iterations=int(agent_sec.get("max_iterations", g_agent.get("max_iterations", 4))),
-            model_endpoint=agent_sec.get("model_endpoint", def_endpoint),
-            model_name=agent_sec.get("model_name", def_model),
+            model_endpoint=model_ep,
+            model_name=model_nm,
             temperature=float(agent_sec.get("temperature", g_agent.get("temperature", 0.2))),
-            embedding_model=storage_sec.get("embedding_model", def_embed),
+            embedding_model=embed_md,
+            embedding_endpoint=embed_ep,
             fts_weight=float(storage_sec.get("fts_weight", 0.3)),
             vector_weight=float(storage_sec.get("vector_weight", 0.7)),
             periodic_indexing=bool(ingest_sec.get("periodic_indexing", True)),
@@ -218,6 +221,17 @@ class VaultConfig:
             agent_lines.append(f'model_endpoint = "{self.model_endpoint}"')
         agent_block = "\n".join(agent_lines)
 
+        storage_lines = [
+            f'embedding_model = "{self.embedding_model}"',
+        ]
+        if self.embedding_endpoint:
+            storage_lines.append(f'embedding_endpoint = "{self.embedding_endpoint}"')
+        storage_lines.extend([
+            f"fts_weight = {self.fts_weight}",
+            f"vector_weight = {self.vector_weight}",
+        ])
+        storage_block = "\n".join(storage_lines)
+
         return f"""# Alcuin Vault Configuration
 
 [vault]
@@ -228,9 +242,7 @@ description = "{self.description}"
 {agent_block}
 
 [storage]
-embedding_model = "{self.embedding_model}"
-fts_weight = {self.fts_weight}
-vector_weight = {self.vector_weight}
+{storage_block}
 
 [ingestion]
 periodic_indexing = {"true" if self.periodic_indexing else "false"}

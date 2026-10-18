@@ -438,45 +438,141 @@ class ResearchAgent:
             return sub_goals, sub_questions
         return [question], [question]
 
+    @staticmethod
+    def _normalize_section_key(section_title: str) -> str:
+        """Strip trailing '(Part N)' from a section title to group split section chunks."""
+        return re.sub(
+            r"\s*\(part\s+\d+\)\s*$", "", (section_title or "").strip(), flags=re.IGNORECASE
+        ).lower()
+
+    @staticmethod
+    def _matches_structural_anchor(
+        r: SearchResult,
+        query: str,
+        include_doc_title: bool = True,
+    ) -> bool:
+        """Check if a chunk's structural header (section_title, breadcrumbs, document_title) or
+        TABLE_DATA keys match the query's identifiers or keywords, strictly excluding body prose."""
+        if not query or not query.strip():
+            return False
+
+        q_lower = query.lower()
+
+        sec_title = (r.section_title or "").lower()
+        doc_title = (r.document_title or "").lower()
+        breadcrumbs = (r.breadcrumbs or "").lower()
+        if not include_doc_title and doc_title and breadcrumbs.startswith(doc_title):
+            breadcrumbs = breadcrumbs[len(doc_title) :].lstrip(" >")
+
+        table_match = re.search(r"<!--\s*TABLE_DATA:\s*(.*?)\s*-->", r.content or "", re.DOTALL)
+        table_text = table_match.group(1).lower() if table_match else ""
+
+        header_parts = [sec_title, breadcrumbs, table_text]
+        if include_doc_title:
+            file_stem = os.path.splitext(os.path.basename(r.file_path or ""))[0].lower()
+            header_parts.extend([doc_title, file_stem])
+        anchor_text = " ".join(p for p in header_parts if p)
+        if not anchor_text.strip():
+            return False
+
+        # Rule 2a: Structural Identifier Match (e.g. 6-132, 15.1.3, 1099-INT, Sec. 5, RFC 9110)
+        compound_ids = re.findall(r"\b[a-z0-9]*\d+(?:[\-\.][a-z0-9]+)+\b", q_lower)
+        prefixed_ids = [
+            m.group(0).strip()
+            for m in re.finditer(
+                r"\b(?:sec\.?|section|§|article|chapter|clause|rfc|schedule|exhibit|appendix)\s*#?[0-9]+[a-z]?\b",
+                q_lower,
+            )
+        ]
+        identifiers = list(dict.fromkeys(compound_ids + prefixed_ids))
+        if identifiers:
+            if all(ident in anchor_text for ident in identifiers):
+                return True
+
+        # Rule 2b: Heading / Note Title / Table-Key Match on substantive query keywords
+        stop_words = {
+            "section", "article", "chapter", "clause", "schedule", "exhibit", "appendix",
+            "under", "what", "when", "where", "which", "within", "many", "days", "must",
+            "does", "from", "that", "this", "with", "have", "about", "there", "their",
+        }
+        keywords = [w for w in re.findall(r"[a-z]{4,}", q_lower) if w not in stop_words]
+        if keywords:
+            matched = sum(1 for w in keywords if w in anchor_text)
+            required = max(1, math.ceil(0.65 * len(keywords)))
+            if matched >= required:
+                return True
+
+        return False
+
     def prune_by_score_cliff(
         self,
         results: List[SearchResult],
         min_drop: float = 0.12,
         min_relative_drop: float = 0.20,
+        query: str = "",
     ) -> List[SearchResult]:
-        """Apply adaptive score-cliff pruning to a sorted list of SearchResults for a sub-goal."""
+        """Apply adaptive score-cliff pruning (Track 1) with non-body structural header & table rescue (Track 2)."""
         if len(results) <= 1:
             return results
 
         # Ensure results are strictly ordered descending by semantic score
         sorted_results = sorted(results, key=lambda x: x.score, reverse=True)
 
-        # Guardrail: top hit must have meaningful semantic signal
+        # Track 1: Pure Vector Cliff
         if sorted_results[0].score < 0.40:
-            return []
+            admitted: List[SearchResult] = []
+            pruned: List[SearchResult] = list(sorted_results)
+        else:
+            scores = [r.score for r in sorted_results]
+            deltas = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
 
-        scores = [r.score for r in sorted_results]
-        deltas = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
-
-        cutoff_idx = None
-        for i, delta in enumerate(deltas):
-            # Condition 1: Minimum absolute drop
-            if delta < min_drop:
-                continue
-            # Condition 2: Minimum relative drop from predecessor
-            if scores[i] <= 0 or (delta / scores[i]) < min_relative_drop:
-                continue
-            # Condition 3: Gradient dominance over previous plateau (if i > 0)
-            if i > 0:
-                mean_prior = sum(deltas[:i]) / i
-                if delta < 2.0 * mean_prior:
+            cutoff_idx = None
+            for i, delta in enumerate(deltas):
+                # Condition 1: Minimum absolute drop
+                if delta < min_drop:
                     continue
-            cutoff_idx = i + 1
-            break
+                # Condition 2: Minimum relative drop from predecessor
+                if scores[i] <= 0 or (delta / scores[i]) < min_relative_drop:
+                    continue
+                # Condition 3: Gradient dominance over previous plateau (if i > 0)
+                if i > 0:
+                    mean_prior = sum(deltas[:i]) / i
+                    if delta < 2.0 * mean_prior:
+                        continue
+                cutoff_idx = i + 1
+                break
 
-        if cutoff_idx is not None:
-            return sorted_results[:cutoff_idx]
-        return sorted_results
+            if cutoff_idx is not None:
+                admitted = sorted_results[:cutoff_idx]
+                pruned = sorted_results[cutoff_idx:]
+            else:
+                admitted = list(sorted_results)
+                pruned = []
+
+        # Track 2: Non-Body Structural Header & Companion Table Rescue
+        if pruned:
+            distinct_files = {r.file_path for r in sorted_results if r.file_path}
+            include_doc_title = len(distinct_files) > 1
+            admitted_sec_keys = {
+                self._normalize_section_key(a.section_title)
+                for a in admitted
+                if a.section_title and a.section_title != "Preamble / General"
+            }
+
+            for r in pruned:
+                # 1. Rescue if structural header or TABLE_DATA matches query identifiers/keywords
+                if query and self._matches_structural_anchor(r, query, include_doc_title=include_doc_title):
+                    admitted.append(r)
+                    if r.section_title and r.section_title != "Preamble / General":
+                        admitted_sec_keys.add(self._normalize_section_key(r.section_title))
+                    continue
+
+                # 2. Rescue companion TABLE_DATA chunk sharing the same section_title as an admitted chunk
+                if "<!-- TABLE_DATA:" in (r.content or "") and r.section_title:
+                    if self._normalize_section_key(r.section_title) in admitted_sec_keys:
+                        admitted.append(r)
+
+        return admitted
 
     def refine_stagnated_topic(self, topic: str, question: str) -> List[str]:
         """Drill down and re-decompose a topic that yielded no new evidence (Depth-1)."""
@@ -648,7 +744,7 @@ class ResearchAgent:
                 continue
             visited_queries.append(target_query)
             raw_results = self.storage.search(target_query, top_k=4)
-            qualified = self.prune_by_score_cliff(raw_results)
+            qualified = self.prune_by_score_cliff(raw_results, query=target_query)
             for r in qualified:
                 if r.id not in visited_ids and all(p.id != r.id for p in current_turn_primary):
                     current_turn_primary.append(r)

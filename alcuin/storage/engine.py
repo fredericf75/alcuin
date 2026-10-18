@@ -437,6 +437,7 @@ class VaultStorage:
                 )
             )
 
+        results.sort(key=lambda x: x.score, reverse=True)
         return results
 
     def get_linked_pages(self, page_target: str) -> List[str]:

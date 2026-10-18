@@ -182,6 +182,10 @@ def test_remediation_apply_fixes_and_verify_clean(test_vault):
     headerless = v_dir / "Todo.md"
     headerless.write_text("Call the clinic tomorrow.", encoding="utf-8")
 
+    # 2b. Add unclosed frontmatter file
+    malformed = v_dir / "Malformed.md"
+    malformed.write_text("---\ntitle: Malformed\nauthor: Alice\n\nBody paragraph outside frontmatter.", encoding="utf-8")
+
     # 3. Inject orphan chunk into LanceDB
     storage.table.add(
         [
@@ -212,6 +216,11 @@ def test_remediation_apply_fixes_and_verify_clean(test_vault):
 
     # Verify headerless file had title injected
     assert "# Todo" in (v_dir / "Todo.md").read_text(encoding="utf-8")
+
+    # Verify unclosed frontmatter was closed immediately after metadata and before body text
+    repaired_malformed = malformed.read_text(encoding="utf-8")
+    assert repaired_malformed.startswith("---\ntitle: Malformed\nauthor: Alice\n---\n")
+    assert repaired_malformed.index("\n---\n") < repaired_malformed.index("Body paragraph outside frontmatter.")
 
     # Verify post-fix audit is clean
     clean_report = linter.lint()

@@ -75,3 +75,125 @@ def test_score_cliff_below_guardrail(tmp_path):
     ]
     pruned = agent.prune_by_score_cliff(hits)
     assert len(pruned) == 0
+
+
+def test_score_cliff_structural_identifier_rescue_ignores_body_mentions(tmp_path):
+    vault = Vault.init(tmp_path / "v5", name="v5")
+    agent = ResearchAgent(vault=vault)
+
+    hits = [
+        SearchResult(
+            id="c1",
+            file_path="code.md",
+            document_title="Town Code",
+            section_title="Sec. 6-10: Overview",
+            breadcrumbs="Town Code > Sec. 6-10: Overview",
+            content="General animal control rules.",
+            wikilinks=[],
+            score=0.78,
+        ),
+        SearchResult(
+            id="c2",
+            file_path="code.md",
+            document_title="Town Code",
+            section_title="Sec. 6-28: Tethering",
+            breadcrumbs="Town Code > Sec. 6-28: Tethering",
+            content="Violations of tethering are subject to penalties under Sec. 6-132.",
+            wikilinks=["Sec. 6-132"],
+            score=0.48,
+        ),
+        SearchResult(
+            id="c3",
+            file_path="code.md",
+            document_title="Town Code",
+            section_title="Sec. 6-132: Escalating Penalties",
+            breadcrumbs="Town Code > Sec. 6-132: Escalating Penalties",
+            content="1st offense: $20. 2nd offense: $50.",
+            wikilinks=[],
+            score=0.44,
+        ),
+    ]
+
+    # Query targets Sec. 6-132: c2 only mentions 6-132 in body prose (must NOT be rescued),
+    # whereas c3 has 6-132 in section_title (MUST be rescued).
+    pruned = agent.prune_by_score_cliff(hits, query="Sec. 6-132")
+    admitted_ids = [p.id for p in pruned]
+    assert "c1" in admitted_ids
+    assert "c3" in admitted_ids
+    assert "c2" not in admitted_ids
+
+
+def test_score_cliff_split_section_and_table_rescue(tmp_path):
+    vault = Vault.init(tmp_path / "v6", name="v6")
+    agent = ResearchAgent(vault=vault)
+
+    hits = [
+        SearchResult(
+            id="c1",
+            file_path="code.md",
+            document_title="Town Code",
+            section_title="Sec. 6-132: Penalties (Part 1)",
+            breadcrumbs="Town Code > Sec. 6-132: Penalties",
+            content="Civil penalties for animal control violations shall escalate by offense.",
+            wikilinks=[],
+            score=0.84,
+        ),
+        SearchResult(
+            id="c2",
+            file_path="code.md",
+            document_title="Town Code",
+            section_title="Sec. 6-132: Penalties (Part 2)",
+            breadcrumbs="Town Code > Sec. 6-132: Penalties",
+            content="| Offense | Fine |\n| 1st | $20 |\n<!-- TABLE_DATA:\n{\"1st\": \"$20\"}\n-->",
+            wikilinks=[],
+            score=0.45,
+        ),
+        SearchResult(
+            id="c3",
+            file_path="code.md",
+            document_title="Town Code",
+            section_title="Sec. 8-10: Housing",
+            breadcrumbs="Town Code > Sec. 8-10: Housing",
+            content="Unrelated housing clause.",
+            wikilinks=[],
+            score=0.42,
+        ),
+    ]
+
+    # Even without section number in query, c2 is the companion TABLE_DATA chunk for admitted section c1
+    pruned = agent.prune_by_score_cliff(hits, query="escalating fine schedule for animal violations")
+    admitted_ids = [p.id for p in pruned]
+    assert admitted_ids == ["c1", "c2"]
+
+
+def test_score_cliff_graph_hop_title_rescue(tmp_path):
+    vault = Vault.init(tmp_path / "v7", name="v7")
+    agent = ResearchAgent(vault=vault)
+
+    # Multi-file vault where fallback or short hop query scores < 0.40 in vector space
+    hits = [
+        SearchResult(
+            id="c1",
+            file_path="pediatrician.md",
+            document_title="Dr. Sarah Miller Pediatrics",
+            section_title="Clinic Contact",
+            breadcrumbs="Dr. Sarah Miller Pediatrics > Clinic Contact",
+            content="Phone: 555-0199.",
+            wikilinks=[],
+            score=0.22,
+        ),
+        SearchResult(
+            id="c2",
+            file_path="car.md",
+            document_title="Toyota Maintenance",
+            section_title="Oil Change",
+            breadcrumbs="Toyota Maintenance > Oil Change",
+            content="Changed oil at 45k miles.",
+            wikilinks=[],
+            score=0.15,
+        ),
+    ]
+
+    pruned = agent.prune_by_score_cliff(hits, query="Dr. Sarah Miller Pediatrics")
+    assert [p.id for p in pruned] == ["c1"]
+

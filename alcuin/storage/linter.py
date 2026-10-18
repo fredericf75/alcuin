@@ -663,6 +663,25 @@ class VaultLinter:
                 result.errors.append(f"Failed to scaffold intake folders: {e}")
 
         # 2. Execute Document Hygiene Fixes
+        for p in frontmatter_to_close:
+            try:
+                rel = str(p.relative_to(self.vault.root_path))
+                lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+                insert_idx = len(lines)
+                for idx in range(1, len(lines)):
+                    stripped = lines[idx].strip()
+                    if not stripped or stripped.startswith("#") or not re.match(
+                        r"^(?:[A-Za-z0-9_\-]+\s*:|-\s+)", stripped
+                    ):
+                        insert_idx = idx
+                        break
+                lines.insert(insert_idx, "---")
+                p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                result.repaired.append(f"Closed YAML frontmatter delimiter in '{rel}'")
+                files_to_reindex.add(rel)
+            except Exception as e:
+                result.errors.append(f"Failed to close frontmatter in {p}: {e}")
+
         for p, title in headers_to_inject:
             try:
                 rel = str(p.relative_to(self.vault.root_path))
@@ -673,23 +692,25 @@ class VaultLinter:
                     if not curr.strip():
                         p.write_text(f"# {title}\n\n", encoding="utf-8")
                     else:
-                        p.write_text(f"# {title}\n\n{curr}", encoding="utf-8")
+                        lines = curr.splitlines()
+                        if lines and lines[0].strip() == "---":
+                            close_idx = None
+                            for idx in range(1, len(lines)):
+                                if lines[idx].strip() == "---":
+                                    close_idx = idx
+                                    break
+                            if close_idx is not None:
+                                before = "\n".join(lines[: close_idx + 1])
+                                after = "\n".join(lines[close_idx + 1 :]).lstrip("\n")
+                                p.write_text(f"{before}\n\n# {title}\n\n{after}\n", encoding="utf-8")
+                            else:
+                                p.write_text(f"# {title}\n\n{curr}", encoding="utf-8")
+                        else:
+                            p.write_text(f"# {title}\n\n{curr}", encoding="utf-8")
                 result.repaired.append(f"Injected header '# {title}' into '{rel}'")
                 files_to_reindex.add(rel)
             except Exception as e:
                 result.errors.append(f"Failed to inject header into {p}: {e}")
-
-        for p in frontmatter_to_close:
-            try:
-                rel = str(p.relative_to(self.vault.root_path))
-                lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-                # Find best place to close frontmatter or append
-                lines.insert(len(lines), "---")
-                p.write_text("\n".join(lines) + "\n", encoding="utf-8")
-                result.repaired.append(f"Closed YAML frontmatter delimiter in '{rel}'")
-                files_to_reindex.add(rel)
-            except Exception as e:
-                result.errors.append(f"Failed to close frontmatter in {p}: {e}")
 
         # 3. Execute Stub Creation
         newly_created_stubs = []

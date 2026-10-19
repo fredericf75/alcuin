@@ -415,9 +415,10 @@ class VaultStorage:
         q_norm = math.sqrt(sum(x * x for x in query_vec)) or 1.0
 
         results: List[SearchResult] = []
+        is_live_vector = self.embedder._available is not False
         for r in res:
             v = r.get("vector")
-            if v is not None and len(v) == len(query_vec):
+            if is_live_vector and v is not None and len(v) == len(query_vec):
                 v_norm = math.sqrt(sum(x * x for x in v)) or 1.0
                 dot = sum(a * b for a, b in zip(query_vec, v))
                 score = float(dot / (q_norm * v_norm))

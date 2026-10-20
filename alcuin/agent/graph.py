@@ -383,20 +383,56 @@ class ResearchAgent:
 
         # 1. Deterministic extraction: Full numbered or lettered items
         matches = re.findall(r"(?:^|\n)\s*(?:[A-Z]\.|\d+[\.\)])\s*([^\n]+)", question)
-        cleaned_items = [re.sub(r"^\s*(?:[A-Z]\.|\d+[\.\)])\s*", "", m).strip() for m in matches if len(m.strip()) >= 8]
+        cleaned_items = [
+            re.sub(r"^\s*(?:[A-Z]\.|\d+[\.\)])\s*", "", m).strip()
+            for m in matches
+            if len(m.strip()) >= 8
+        ]
 
         if len(cleaned_items) >= 2:
             sub_questions = cleaned_items
             sub_goals: List[str] = []
-            filler = {"within", "how", "many", "days", "after", "must", "the", "a", "an", "for", "is", "under", "what", "which", "of", "are"}
+
+            # Harvest domain-agnostic technical codes, citations, numbers, and identifiers across question
+            global_identifiers = re.findall(
+                r"\b(?:§\s*\d+|[A-Z]{2,}(?:[\-\/][A-Z0-9]+)*|\b[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+\b|\d+[\-\w]+)\b",
+                question,
+            )
+
+            filler = {
+                "within", "how", "many", "days", "after", "must", "the", "a", "an", "for",
+                "is", "under", "what", "which", "of", "are", "in", "to", "at", "by", "on",
+                "shall", "may", "can", "could", "be", "do", "does", "specifically", "rule",
+                "section", "both", "either", "or", "and", "if", "there", "has", "have", "with",
+            }
+
             for q in cleaned_items:
                 q_clean = q.rstrip("?.:;!")
-                words = q_clean.split()
-                if len(words) <= 8:
-                    sub_goals.append(q_clean)
+                clause_identifiers = re.findall(
+                    r"\b(?:§\s*\d+|[A-Z]{2,}(?:[\-\/][A-Z0-9]+)*|\b[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+\b|\d+[\-\w]+)\b",
+                    q_clean,
+                )
+                body = re.sub(
+                    r"^(?:in|under|pursuant to|according to|for|with respect to|regarding)\s+[^,;:\n]+[,\-:]\s*",
+                    "",
+                    q_clean,
+                    flags=re.IGNORECASE,
+                )
+                words = re.findall(r"\b[\w\-\.]+\b", body)
+                meaningful = [w for w in words if w.lower() not in filler]
+                anchors = list(dict.fromkeys(clause_identifiers + [g for g in global_identifiers if g.lower() in q.lower()]))
+                content_terms = [w for w in meaningful if w not in anchors]
+
+                if len(content_terms) <= 8:
+                    selected = content_terms
                 else:
-                    meaningful = [w for w in words if w.lower() not in filler]
-                    sub_goals.append(" ".join(meaningful[:6]) if len(meaningful) >= 3 else " ".join(words[:6]))
+                    selected = content_terms[:4] + content_terms[-4:]
+
+                search_query = " ".join(dict.fromkeys(anchors + selected))
+                if not search_query.strip():
+                    search_query = q_clean
+                sub_goals.append(search_query)
+
             return sub_goals, sub_questions
 
         # 2. Dual-field LLM decomposition for unstructured inquiries

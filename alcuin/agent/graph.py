@@ -43,6 +43,25 @@ class AgentState(TypedDict):
     evidence_only: bool
 
 
+def _extract_and_clean_thinking(raw_text: str) -> Tuple[str, str]:
+    """Extract latent reasoning enclosed in <think>...</think> tags (or template-prefixed </think>) and return (clean_text, thinking_trace)."""
+    if not raw_text:
+        return "", ""
+    thinking = ""
+    if "<think>" in raw_text:
+        m = re.search(r"<think>(.*?)(?:</think>|$)", raw_text, flags=re.DOTALL)
+        if m:
+            thinking = m.group(1).strip()
+        cleaned_text = re.sub(r"<think>.*?(?:</think>|$)", "", raw_text, flags=re.DOTALL).strip()
+        return cleaned_text, thinking
+    if "</think>" in raw_text:
+        parts = raw_text.split("</think>", 1)
+        thinking = parts[0].strip()
+        cleaned_text = parts[1].strip()
+        return cleaned_text, thinking
+    return raw_text.strip(), ""
+
+
 class LLMClient:
     """Interacts with LLM endpoint (Ollama / Google AI Studio / OpenAI-compatible / Fallback)."""
 
@@ -131,14 +150,16 @@ class LLMClient:
                                     text = "\n".join(non_thought).strip()
                                 else:
                                     text = parts[-1].get("text", "").strip()
+                            clean_text, thinking = _extract_and_clean_thinking(text)
                             meta = {
                                 "truncated": is_truncated,
                                 "finish_reason": finish_reason,
                                 "provider": "google",
+                                "thinking": thinking,
                             }
                             if return_metadata:
-                                return text, meta
-                            return text
+                                return clean_text, meta
+                            return clean_text
             except Exception:
                 pass
 
@@ -169,17 +190,21 @@ class LLMClient:
                         done_reason = data.get("done_reason", "")
                         is_truncated = done_reason in ("length", "max_tokens")
                         msg = data.get("message", {})
+                        ollama_thinking = msg.get("thinking", "").strip() if isinstance(msg, dict) else ""
                         text = msg.get("content", "").strip()
-                        if not text and "thinking" in msg and is_truncated:
-                            text = msg.get("thinking", "").strip()
+                        if not text and ollama_thinking and is_truncated:
+                            text = ollama_thinking
+                        clean_text, extracted_thinking = _extract_and_clean_thinking(text)
+                        final_thinking = ollama_thinking or extracted_thinking
                         meta = {
                             "truncated": is_truncated,
                             "finish_reason": done_reason,
                             "provider": "ollama",
+                            "thinking": final_thinking,
                         }
                         if return_metadata:
-                            return text, meta
-                        return text
+                            return clean_text, meta
+                        return clean_text
             except Exception:
                 pass
 
@@ -215,15 +240,17 @@ class LLMClient:
                     if choices:
                         finish_reason = choices[0].get("finish_reason", "")
                         is_truncated = finish_reason in ("length", "max_tokens")
-                        text = choices[0].get("message", {}).get("content", "").strip()
+                        raw_text = choices[0].get("message", {}).get("content", "").strip()
+                        clean_text, thinking = _extract_and_clean_thinking(raw_text)
                         meta = {
                             "truncated": is_truncated,
                             "finish_reason": finish_reason,
                             "provider": "openai",
+                            "thinking": thinking,
                         }
                         if return_metadata:
-                            return text, meta
-                        return text
+                            return clean_text, meta
+                        return clean_text
         except Exception:
             pass
 
@@ -254,29 +281,38 @@ class LLMClient:
                         done_reason = data.get("done_reason", "")
                         is_truncated = done_reason in ("length", "max_tokens")
                         msg = data.get("message", {})
+                        ollama_thinking = msg.get("thinking", "").strip() if isinstance(msg, dict) else ""
                         text = msg.get("content", "").strip()
-                        if not text and "thinking" in msg and is_truncated:
-                            text = msg.get("thinking", "").strip()
+                        if not text and ollama_thinking and is_truncated:
+                            text = ollama_thinking
+                        clean_text, extracted_thinking = _extract_and_clean_thinking(text)
+                        final_thinking = ollama_thinking or extracted_thinking
                         meta = {
                             "truncated": is_truncated,
                             "finish_reason": done_reason,
                             "provider": "ollama",
+                            "thinking": final_thinking,
                         }
                         if return_metadata:
-                            return text, meta
-                        return text
+                            return clean_text, meta
+                        return clean_text
             except Exception:
                 pass
 
         if return_metadata:
-            return "", {"truncated": False, "finish_reason": "none", "provider": "none"}
+            return "", {"truncated": False, "finish_reason": "none", "provider": "none", "thinking": ""}
         return ""
 
 
 class ResearchAgent:
     """Autonomous multi-hop knowledge research agent."""
 
-    def __init__(self, vault: Vault, llm: Optional[LLMClient] = None):
+    def __init__(
+        self,
+        vault: Vault,
+        llm: Optional[LLMClient] = None,
+        planner_llm: Optional[LLMClient] = None,
+    ):
         self.vault = vault
         self.storage = VaultStorage(vault)
         ctx_win = getattr(vault.config, "context_window", 16384)
@@ -288,6 +324,7 @@ class ResearchAgent:
         )
         if hasattr(self.llm, "context_window") and self.llm.context_window is None:
             self.llm.context_window = ctx_win
+        self.planner_llm = planner_llm or self.llm
         self.graph = self._build_graph()
 
     def get_model_context_window(self) -> int:
@@ -377,7 +414,8 @@ class ResearchAgent:
             "}\n"
             "Output ONLY valid JSON."
         )
-        llm_resp = self.llm.chat(sys_prompt, question[:2000])
+        llm_resp = self.planner_llm.chat(sys_prompt, question[:2000])
+        llm_resp, _ = _extract_and_clean_thinking(llm_resp)
         sub_goals: List[str] = []
         sub_questions: List[str] = []
 
@@ -546,8 +584,9 @@ class ResearchAgent:
                 admitted = sorted_results[:cutoff_idx]
                 pruned = sorted_results[cutoff_idx:]
             else:
-                admitted = list(sorted_results)
-                pruned = []
+                cap = min(len(sorted_results), 6)
+                admitted = sorted_results[:cap]
+                pruned = sorted_results[cap:]
 
         # Track 2: Non-Body Structural Header & Companion Table Rescue
         if pruned:
@@ -596,7 +635,8 @@ class ResearchAgent:
             "designed to locate the relevant sections in a document database.\n"
             "Output each query on a new line. Do not number or prefix them."
         )
-        llm_resp = self.llm.chat(sys_prompt, f"Context:\n{context_str}\n\nHigh-level topic: {topic}")
+        llm_resp = self.planner_llm.chat(sys_prompt, f"Context:\n{context_str}\n\nHigh-level topic: {topic}")
+        llm_resp, _ = _extract_and_clean_thinking(llm_resp)
         refined: List[str] = []
         if llm_resp:
             for line in llm_resp.strip().splitlines():
@@ -1118,6 +1158,9 @@ class ResearchAgent:
             answer, meta = res, {}
 
         truncation_alert = None
+        if meta.get("thinking"):
+            thought_history.append(f"[LATENT_THOUGHT_TRACE]\n{meta['thinking']}")
+
         if meta.get("truncated"):
             finish_reason = meta.get("finish_reason") or "length"
             truncation_alert = (

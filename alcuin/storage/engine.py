@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -93,7 +94,9 @@ class EmbeddingClient:
             return res[0]
         return self._fallback_embedding(text)
 
-    def get_embeddings_batch(self, texts: List[str], batch_size: int = 32) -> List[List[float]]:
+    def get_embeddings_batch(
+        self, texts: List[str], batch_size: int = 16, max_retries: int = 3
+    ) -> List[List[float]]:
         if not texts:
             return []
         if self._available is False:
@@ -105,49 +108,78 @@ class EmbeddingClient:
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
             batch_embs = None
-            try:
-                with httpx.Client(timeout=30.0) as client:
-                    if is_openai:
-                        base = self.endpoint
-                        if base.endswith("/embeddings"):
-                            url = base
-                        elif base.endswith("/v1"):
-                            url = f"{base}/embeddings"
+            last_error: Optional[Exception] = None
+
+            for attempt in range(max_retries):
+                try:
+                    with httpx.Client(timeout=120.0) as client:
+                        if is_openai:
+                            base = self.endpoint
+                            if base.endswith("/embeddings"):
+                                url = base
+                            elif base.endswith("/v1"):
+                                url = f"{base}/embeddings"
+                            else:
+                                url = f"{base}/v1/embeddings"
+                            resp = client.post(
+                                url,
+                                json={"model": self.model, "input": batch},
+                            )
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                items = data.get("data", [])
+                                if items:
+                                    items_sorted = sorted(items, key=lambda x: x.get("index", 0))
+                                    batch_embs = [
+                                        item["embedding"]
+                                        for item in items_sorted
+                                        if "embedding" in item
+                                    ]
+                            else:
+                                last_error = RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
                         else:
-                            url = f"{base}/v1/embeddings"
-                        resp = client.post(
-                            url,
-                            json={"model": self.model, "input": batch},
-                        )
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            items = data.get("data", [])
-                            if items:
-                                items_sorted = sorted(items, key=lambda x: x.get("index", 0))
-                                batch_embs = [item["embedding"] for item in items_sorted if "embedding" in item]
+                            resp = client.post(
+                                f"{self.endpoint}/api/embed",
+                                json={"model": self.model, "input": batch},
+                            )
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                embs = data.get("embeddings")
+                                if embs and len(embs) == len(batch):
+                                    batch_embs = [[float(x) for x in emb] for emb in embs]
+                            else:
+                                last_error = RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+
+                    if batch_embs and len(batch_embs) == len(batch):
+                        self._available = True
+                        break
                     else:
-                        resp = client.post(
-                            f"{self.endpoint}/api/embed",
-                            json={"model": self.model, "input": batch},
-                        )
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            embs = data.get("embeddings")
-                            if embs and len(embs) == len(batch):
-                                batch_embs = [[float(x) for x in emb] for emb in embs]
-                if batch_embs and len(batch_embs) == len(batch):
-                    self._available = True
-                else:
-                    batch_embs = None
-            except Exception:
-                self._available = False
-                batch_embs = None
+                        batch_embs = None
+                except (httpx.ConnectError, ConnectionRefusedError) as e:
+                    # Initial probe failure: mark unavailable for offline unit tests
+                    if self._available is None:
+                        self._available = False
+                        return [self._fallback_embedding(t) for t in texts]
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        time.sleep(1.0 * (attempt + 1))
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        time.sleep(1.0 * (attempt + 1))
 
             if batch_embs is not None:
                 results.extend(batch_embs)
             else:
+                # If we were previously connected to a live neural model, fail loudly!
+                if self._available is True:
+                    raise RuntimeError(
+                        f"Embedding server at {self.endpoint} failed for batch of {len(batch)} chunks "
+                        f"after {max_retries} attempts: {last_error}"
+                    )
                 self._available = False
                 results.extend([self._fallback_embedding(t) for t in batch])
+
         return results
 
     @staticmethod
@@ -342,9 +374,12 @@ class VaultStorage:
             try:
                 doc_title, raw_text, chunks = chunk_file_in_memory(full_path)
                 file_links = extract_wikilinks(raw_text)
-                wikilinks_map[rel_path] = file_links
+                # Batch embed and prepare records
+                chunk_texts = [f"{c.breadcrumbs}\n{c.content}" for c in chunks]
+                embeddings = self.embedder.get_embeddings_batch(chunk_texts)
 
-                # Update manifest entry
+                wikilinks_map[rel_path] = file_links
+                # Update manifest entry only after embedding succeeds
                 known_files[rel_path] = {
                     "sha256": sha,
                     "mtime": full_path.stat().st_mtime,
@@ -353,10 +388,6 @@ class VaultStorage:
                     "wikilinks": file_links,
                     "updated_at": now_str,
                 }
-
-                # Batch embed and prepare records
-                chunk_texts = [f"{c.breadcrumbs}\n{c.content}" for c in chunks]
-                embeddings = self.embedder.get_embeddings_batch(chunk_texts)
 
                 for chunk, vec in zip(chunks, embeddings):
                     chunk_links = extract_wikilinks(chunk.content)
@@ -376,6 +407,7 @@ class VaultStorage:
                     )
             except Exception as e:
                 print(f"Error processing {rel_path}: {e}")
+                raise
 
         if all_new_records:
             self.table.add(all_new_records)
@@ -416,14 +448,20 @@ class VaultStorage:
 
         results: List[SearchResult] = []
         is_live_vector = self.embedder._available is not False
+        has_relevance_score = any("_relevance_score" in r for r in res)
+        top_rrf = max((float(r.get("_relevance_score", 0.0)) for r in res), default=1.0) or 1.0
+
         for r in res:
-            v = r.get("vector")
-            if is_live_vector and v is not None and len(v) == len(query_vec):
-                v_norm = math.sqrt(sum(x * x for x in v)) or 1.0
-                dot = sum(a * b for a, b in zip(query_vec, v))
-                score = float(dot / (q_norm * v_norm))
+            if has_relevance_score and top_rrf > 0:
+                score = float(r.get("_relevance_score", 0.0)) / top_rrf
             else:
-                score = float(r.get("_relevance_score", r.get("_score", 1.0)))
+                v = r.get("vector")
+                if is_live_vector and v is not None and len(v) == len(query_vec):
+                    v_norm = math.sqrt(sum(x * x for x in v)) or 1.0
+                    dot = sum(a * b for a, b in zip(query_vec, v))
+                    score = float(dot / (q_norm * v_norm))
+                else:
+                    score = float(r.get("_score", 1.0))
 
             results.append(
                 SearchResult(

@@ -442,7 +442,7 @@ def identify_heading(line: str) -> Optional[Tuple[int, str]]:
         if len(clean_text) > 60:
             clean_text = clean_text[:57] + "..."
         title = f"({marker}) {clean_text}"
-        return 3, title
+        return 4, title
 
     return None
 
@@ -655,11 +655,15 @@ def chunk_document_text(
                 else:
                     hierarchy = [document_title, title]
                 current_section_title = title
-            elif level >= 3:
+            elif level == 3:
                 if len(hierarchy) >= 3:
-                    hierarchy = hierarchy[:3] + [title]
-                elif len(hierarchy) == 2:
                     hierarchy = hierarchy[:2] + [title]
+                else:
+                    hierarchy.append(title)
+                current_section_title = title
+            elif level >= 4:
+                if len(hierarchy) >= 4:
+                    hierarchy = hierarchy[:3] + [title]
                 else:
                     hierarchy.append(title)
                 current_section_title = title

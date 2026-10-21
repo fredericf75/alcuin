@@ -20,6 +20,13 @@ from alcuin.storage.vault import Vault, VaultRegistry
 load_dotenv()
 
 
+class CoverageItem(TypedDict):
+    id: int
+    sub_question: str
+    status: str  # "COVERED" | "MISSING"
+    gap_query: Optional[str]
+
+
 class AgentState(TypedDict):
     question: str
     iteration: int
@@ -30,6 +37,7 @@ class AgentState(TypedDict):
     pending_links: List[str]
     sub_goals: List[str]
     sub_questions: List[str]
+    coverage_matrix: List[CoverageItem]
     visited_queries: List[str]
     recomposed_topics: List[str]
     evidence: List[Dict[str, Any]]
@@ -1043,6 +1051,7 @@ class ResearchAgent:
 
         # Check if there are still unvisited sub-goals or pending links
         unvisited_goals = [g for g in sub_goals if g not in visited_queries]
+        sub_questions = state.get("sub_questions", [])
 
         # Ask LLM if evidence is sufficient (dynamic budget based on endpoint)
         is_local = "localhost" in self.llm.endpoint or "127.0.0.1" in self.llm.endpoint
@@ -1058,33 +1067,77 @@ class ResearchAgent:
 
         context_snippets = "\n---\n".join(eval_snippets)
 
-        sys_prompt = (
-            "You are an evidence sufficiency evaluator. Respond ONLY in valid JSON.\n"
-            "Analyze whether the collected evidence directly and completely answers the user's question.\n"
-            "Format: {\"sufficient\": true/false, \"thought\": \"...\", \"next_query\": \"...\", \"confidence\": 0.0-1.0}"
-        )
-        user_prompt = (
-            f"Question: {state['question']}\n\n"
-            f"Collected Evidence:\n{context_snippets}\n\n"
-            "Is this evidence sufficient to answer the question?"
-        )
+        if sub_questions:
+            questions_checklist = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(sub_questions))
+            sys_prompt = (
+                "You are an evidence sufficiency evaluator and research auditor. Respond ONLY in valid JSON.\n"
+                "Examine the Collected Evidence against each Sub-Question.\n"
+                "For each sub-question, determine whether the evidence directly answers it (COVERED) or lacks the required details (MISSING).\n"
+                "If MISSING, provide a concise 3-to-6 keyword search query (gap_query) to retrieve the missing information.\n"
+                "Format: {\"coverage\": [{\"id\": 1, \"status\": \"COVERED\"}, {\"id\": 2, \"status\": \"MISSING\", \"gap_query\": \"...\"}], \"all_covered\": true/false, \"thought\": \"...\", \"confidence\": 0.0-1.0}"
+            )
+            user_prompt = (
+                f"User Inquiry:\n{state['question']}\n\n"
+                f"Sub-Questions to Verify:\n{questions_checklist}\n\n"
+                f"Collected Evidence:\n{context_snippets}\n\n"
+                "Audit the coverage of each sub-question against the collected evidence:"
+            )
+        else:
+            sys_prompt = (
+                "You are an evidence sufficiency evaluator. Respond ONLY in valid JSON.\n"
+                "Analyze whether the collected evidence directly and completely answers the user's question.\n"
+                "Format: {\"sufficient\": true/false, \"thought\": \"...\", \"next_query\": \"...\", \"confidence\": 0.0-1.0}"
+            )
+            user_prompt = (
+                f"Question: {state['question']}\n\n"
+                f"Collected Evidence:\n{context_snippets}\n\n"
+                "Is this evidence sufficient to answer the question?"
+            )
 
         response = self.llm.chat(sys_prompt, user_prompt)
         sufficient = False
         next_query = ""
         thought = f"Evaluation: Evidence reviewed ({iteration}/{max_iter})."
         confidence = 0.5
+        coverage_matrix: List[CoverageItem] = []
 
         if response:
             try:
                 match = re.search(r"\{.*\}", response, re.DOTALL)
                 if match:
                     parsed = json.loads(match.group(0))
-                    sufficient = bool(parsed.get("sufficient", False))
                     thought = parsed.get("thought", thought)
-                    if parsed.get("next_query"):
-                        next_query = parsed["next_query"].strip()
                     confidence = float(parsed.get("confidence", 0.5))
+
+                    raw_coverage = parsed.get("coverage", [])
+                    if isinstance(raw_coverage, list) and raw_coverage and sub_questions:
+                        all_items_covered = True
+                        for item in raw_coverage:
+                            if not isinstance(item, dict):
+                                continue
+                            item_id = item.get("id", 0)
+                            q_text = sub_questions[item_id - 1] if 0 < item_id <= len(sub_questions) else ""
+                            status = str(item.get("status", "")).upper()
+                            gap = item.get("gap_query", "").strip() if item.get("gap_query") else None
+                            if status != "COVERED":
+                                all_items_covered = False
+                                if not next_query and gap and gap not in visited_queries:
+                                    next_query = gap
+                            coverage_matrix.append({
+                                "id": item_id,
+                                "sub_question": q_text,
+                                "status": status,
+                                "gap_query": gap,
+                            })
+                        explicit_all = parsed.get("all_covered")
+                        if explicit_all is not None:
+                            sufficient = bool(explicit_all) and all_items_covered
+                        else:
+                            sufficient = all_items_covered
+                    else:
+                        sufficient = bool(parsed.get("sufficient", False))
+                        if parsed.get("next_query"):
+                            next_query = parsed["next_query"].strip()
             except Exception:
                 pass
 
@@ -1113,6 +1166,7 @@ class ResearchAgent:
             "iteration": iteration,
             "is_sufficient": sufficient,
             "current_query": next_query,
+            "coverage_matrix": coverage_matrix,
             "confidence": confidence,
             "thought_history": state["thought_history"] + [f"Eval (turn {iteration}): {thought}"],
         }
@@ -1255,6 +1309,7 @@ class ResearchAgent:
             "pending_links": [],
             "sub_goals": [],
             "sub_questions": [],
+            "coverage_matrix": [],
             "visited_queries": [],
             "recomposed_topics": [],
             "evidence": [],
@@ -1282,6 +1337,7 @@ class ResearchAgent:
             "pending_links": [],
             "sub_goals": [],
             "sub_questions": [],
+            "coverage_matrix": [],
             "visited_queries": [],
             "recomposed_topics": [],
             "evidence": [],

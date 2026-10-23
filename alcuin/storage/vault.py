@@ -78,6 +78,7 @@ class VaultConfig:
     sibling_traversal: bool = True
     sibling_pruning_threshold: float = 0.58
     sibling_max_per_hit: int = 2
+    ast_sibling_attenuation: float = 0.72
 
     def __post_init__(self):
         inbox_pattern = f"{self.inbox_dir}/*"
@@ -175,6 +176,12 @@ class VaultConfig:
             sibling_max_per_hit=int(
                 agent_sec.get("sibling_max_per_hit", g_agent.get("sibling_max_per_hit", 2))
             ),
+            ast_sibling_attenuation=float(
+                agent_sec.get(
+                    "ast_sibling_attenuation",
+                    g_agent.get("ast_sibling_attenuation", 0.72),
+                )
+            ),
         )
 
     def apply_overrides(self, overrides: Dict[str, Any]) -> VaultConfig:
@@ -208,6 +215,7 @@ class VaultConfig:
             f"sibling_traversal = {'true' if self.sibling_traversal else 'false'}",
             f"sibling_pruning_threshold = {self.sibling_pruning_threshold}",
             f"sibling_max_per_hit = {self.sibling_max_per_hit}",
+            f"ast_sibling_attenuation = {self.ast_sibling_attenuation}",
         ]
         if self.context_headroom_tokens is not None:
             agent_lines.append(f"context_headroom_tokens = {self.context_headroom_tokens}")

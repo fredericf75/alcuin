@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from alcuin.agent.graph import ResearchAgent
+from alcuin.agent.graph import ModelNotFoundError, ResearchAgent
 from alcuin.api.daemon import PeriodicIndexer
 from alcuin.storage.engine import VaultStorage
 from alcuin.storage.vault import Vault, VaultConfig, VaultRegistry
@@ -174,16 +174,28 @@ async def research(req: ResearchRequest):
 
     def event_generator():
         final_state = None
-        for node_name, state_update in agent.stream_research(req.question):
-            final_state = state_update
-            thought = ""
-            if "thought_history" in state_update and state_update["thought_history"]:
-                thought = state_update["thought_history"][-1]
-            data = json.dumps({"node": node_name, "thought": thought})
-            yield f"event: step\ndata: {data}\n\n"
+        try:
+            for node_name, state_update in agent.stream_research(req.question):
+                final_state = state_update
+                thought = ""
+                if "thought_history" in state_update and state_update["thought_history"]:
+                    thought = state_update["thought_history"][-1]
+                data = json.dumps({"node": node_name, "thought": thought})
+                yield f"event: step\ndata: {data}\n\n"
 
-        if not final_state or not final_state.get("final_answer"):
-            final_state = agent.research(req.question)
+            if not final_state or not final_state.get("final_answer"):
+                final_state = agent.research(req.question)
+        except ModelNotFoundError as e:
+            err_data = json.dumps(
+                {
+                    "error": str(e),
+                    "model": e.model,
+                    "endpoint": e.endpoint,
+                    "available_models": e.available_models,
+                }
+            )
+            yield f"event: error\ndata: {err_data}\n\n"
+            return
 
         result_data = json.dumps(
             {

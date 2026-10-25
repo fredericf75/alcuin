@@ -15,7 +15,7 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 
-from alcuin.agent.graph import ResearchAgent
+from alcuin.agent.graph import ModelNotFoundError, ResearchAgent
 from alcuin.storage.engine import VaultStorage
 from alcuin.storage.linter import LintCategory, LintSeverity, VaultLinter
 from alcuin.storage.vault import Vault, VaultRegistry
@@ -180,6 +180,8 @@ def research_cmd(
     vault = resolve_or_prompt_vault(target=vault_target, overrides=overrides)
     if verbose and not json_output:
         console.print(f"\n[dim]Using vault '[bold]{vault.name}[/bold]' ({vault.root_path})[/dim]")
+        model_name_disp = vault.config.model_name or "default"
+        console.print(f"[dim]Model: [bold]{model_name_disp}[/bold] | Endpoint: {vault.config.model_endpoint}[/dim]")
         console.print(f"[bold cyan]Researching:[/bold cyan] {query}\n")
 
     agent = ResearchAgent(vault)
@@ -189,25 +191,50 @@ def research_cmd(
     final_state = None
 
     kwargs: Dict[str, Any] = {"evidence_only": True} if evidence_only else {}
-    if json_output:
-        # Non-interactive mode for piping
-        final_state = agent.research(query, **kwargs)
-        chunks = final_state.get("evidence", [])
-    else:
-        with console.status(status_text, spinner="dots") as status:
-            for node_name, state_update in agent.stream_research(query, **kwargs):
-                if "evidence" in state_update:
-                    chunks = state_update["evidence"]
-                if "thought_history" in state_update and state_update["thought_history"]:
-                    latest_thought = state_update["thought_history"][-1]
-                    if verbose:
-                        status.update(f"[dim]{latest_thought}[/dim]")
-                        console.print(f"  [dim]• {latest_thought}[/dim]")
-                final_state = state_update
-
-        if not chunks or (not evidence_only and (not final_state or not final_state.get("final_answer"))):
+    try:
+        if json_output:
+            # Non-interactive mode for piping
             final_state = agent.research(query, **kwargs)
             chunks = final_state.get("evidence", [])
+        else:
+            with console.status(status_text, spinner="dots") as status:
+                for node_name, state_update in agent.stream_research(query, **kwargs):
+                    if "evidence" in state_update:
+                        chunks = state_update["evidence"]
+                    if "thought_history" in state_update and state_update["thought_history"]:
+                        latest_thought = state_update["thought_history"][-1]
+                        if verbose:
+                            status.update(f"[dim]{latest_thought}[/dim]")
+                            console.print(f"  [dim]• {latest_thought}[/dim]")
+                    final_state = state_update
+
+            if not chunks or (not evidence_only and (not final_state or not final_state.get("final_answer"))):
+                final_state = agent.research(query, **kwargs)
+                chunks = final_state.get("evidence", [])
+    except ModelNotFoundError as e:
+        if json_output:
+            err_payload = {
+                "error": str(e),
+                "model": e.model,
+                "endpoint": e.endpoint,
+                "available_models": e.available_models,
+            }
+            click.echo(json.dumps(err_payload, indent=2))
+            sys.exit(1)
+        avail_text = (
+            "\n[bold cyan]Available models on this endpoint:[/bold cyan]\n"
+            + "\n".join(f"  • {m}" for m in e.available_models)
+            if e.available_models
+            else "[dim]Could not retrieve model list from endpoint.[/dim]"
+        )
+        console.print(
+            Panel(
+                f"[bold red]Model '{e.model}' not found on endpoint '{e.endpoint}'.[/bold red]\n{avail_text}",
+                title="[bold red]Model Not Found[/bold red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
 
     answer = final_state.get("final_answer", "") if final_state else ""
     confidence = final_state.get("confidence", 0.0) if final_state else 0.0

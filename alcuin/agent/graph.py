@@ -74,6 +74,29 @@ def _extract_and_clean_thinking(raw_text: str) -> Tuple[str, str]:
     return raw_text.strip(), ""
 
 
+class ModelNotFoundError(RuntimeError):
+    """Raised when a requested model is not found on the target endpoint."""
+
+    def __init__(
+        self,
+        model: str,
+        endpoint: str,
+        available_models: Optional[List[str]] = None,
+    ):
+        self.model = model
+        self.endpoint = endpoint
+        self.available_models = available_models or []
+        avail_msg = (
+            f"\n\nAvailable models on '{endpoint}':\n"
+            + "\n".join(f"  • {m}" for m in self.available_models)
+            if self.available_models
+            else ""
+        )
+        super().__init__(
+            f"Model '{model}' not found on endpoint '{endpoint}'.{avail_msg}"
+        )
+
+
 class LLMClient:
     """Interacts with LLM endpoint (Ollama / Google AI Studio / OpenAI-compatible / Fallback)."""
 
@@ -118,6 +141,40 @@ class LLMClient:
             or os.getenv("GOOGLE_API_KEY")
             or os.getenv("OPENAI_API_KEY")
         )
+
+    def get_available_models(self) -> List[str]:
+        """Query endpoint for installed / available models (Ollama or OpenAI-compatible)."""
+        try:
+            with httpx.Client(timeout=3.0) as client:
+                # 1. Probe Ollama /api/tags
+                try:
+                    resp = client.get(f"{self.endpoint}/api/tags")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        tags = [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+                        if tags:
+                            return sorted(tags)
+                except Exception:
+                    pass
+
+                # 2. Probe OpenAI /v1/models or /models
+                base_ep = self.endpoint.rstrip("/")
+                target_url = f"{base_ep}/models" if base_ep.endswith("/v1") else f"{base_ep}/v1/models"
+                headers: Dict[str, str] = {}
+                if self.api_key:
+                    headers["Authorization"] = f"Bearer {self.api_key}"
+                try:
+                    resp = client.get(target_url, headers=headers)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        m_ids = [m.get("id", "") for m in data.get("data", []) if m.get("id")]
+                        if m_ids:
+                            return sorted(m_ids)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return []
 
     def chat(
         self,
@@ -217,6 +274,17 @@ class LLMClient:
                         if return_metadata:
                             return clean_text, meta
                         return clean_text
+                    elif resp.status_code == 404:
+                        err_msg = ""
+                        try:
+                            err_msg = str(resp.json().get("error", ""))
+                        except Exception:
+                            pass
+                        if "not found" in err_msg.lower() or not err_msg:
+                            avail = self.get_available_models()
+                            raise ModelNotFoundError(self.model, self.endpoint, avail)
+            except ModelNotFoundError:
+                raise
             except Exception:
                 pass
 
@@ -263,6 +331,19 @@ class LLMClient:
                         if return_metadata:
                             return clean_text, meta
                         return clean_text
+                elif resp.status_code == 404:
+                    err_msg = ""
+                    try:
+                        err_data = resp.json()
+                        if isinstance(err_data, dict):
+                            err_msg = str(err_data.get("error", ""))
+                    except Exception:
+                        pass
+                    if "model" in err_msg.lower() or "not found" in err_msg.lower():
+                        avail = self.get_available_models()
+                        raise ModelNotFoundError(self.model, self.endpoint, avail)
+        except ModelNotFoundError:
+            raise
         except Exception:
             pass
 
@@ -308,6 +389,17 @@ class LLMClient:
                         if return_metadata:
                             return clean_text, meta
                         return clean_text
+                    elif resp.status_code == 404:
+                        err_msg = ""
+                        try:
+                            err_msg = str(resp.json().get("error", ""))
+                        except Exception:
+                            pass
+                        if "not found" in err_msg.lower() or not err_msg:
+                            avail = self.get_available_models()
+                            raise ModelNotFoundError(self.model, self.endpoint, avail)
+            except ModelNotFoundError:
+                raise
             except Exception:
                 pass
 

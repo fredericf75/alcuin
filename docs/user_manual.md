@@ -1,32 +1,33 @@
 # Alcuin User Manual
 
-Welcome to the comprehensive user manual for **Alcuin**, an autonomous, local-first personal knowledge engine.
+Welcome to the official user manual for **Alcuin**, an autonomous, local-first personal knowledge engine. Alcuin turns collections of plain Markdown files and document archives into a queryable, self-healing knowledge graph using local language models, embedded vector storage, and cyclic graph reasoning.
 
 ---
 
 ## 1. Philosophy & Architecture
 
-Alcuin is designed around three core principles:
+Alcuin is built on four core architectural principles:
 
-1. **In-Situ Vault Architecture**: Your markdown files stay where they are. Alcuin does not import notes into an opaque proprietary database. You can continue editing your files with Obsidian, VS Code, Neovim, or standard command-line tools.
-2. **Local-First & Private**: Notes, embeddings, and agent reasoning run locally by default using [LanceDB](https://lancedb.com/) and [Ollama](https://ollama.ai). Your private records, financial receipts, and legal documents never leave your machine unless you choose a cloud provider.
-3. **Hybrid Search & Cyclic Graph Agent**: Alcuin combines BM25 full-text search (lexical keyword matching) and vector embeddings (semantic meaning) with bidirectional markdown wikilink traversal (`[[Note Name]]`). A multi-hop cyclic agent navigates documents, follows links, and synthesizes answers with citations.
+1. **In-Situ Vault Architecture**: Your markdown files stay exactly where they are. Alcuin does not lock your notes into an opaque proprietary database. You can continue editing, creating, and linking your notes with [Obsidian](https://obsidian.md), VS Code, Neovim, or standard command-line tools.
+2. **Local-First & Completely Private**: Embeddings, indexing, and agentic reasoning run entirely on your local hardware by default using [LanceDB](https://lancedb.com/) and [Ollama](https://ollama.ai). Your personal wiki, financial records, medical histories, and contracts never touch the cloud unless you explicitly configure a remote provider.
+3. **Hybrid Search & Cyclic Graph Agent**: Alcuin combines BM25 full-text keyword search with dense vector embeddings (`nomic-embed-text`) and bidirectional Markdown wikilink traversal (`[[Note Name]]`). An autonomous multi-hop reasoning agent navigates documents, evaluates evidence sufficiency, follows promising links, and synthesizes answers with exact citations.
+4. **Bounded Governors & Deterministic Rigor**: A mathematical **Context Governor** dynamically budgets evidence to prevent local LLM context overflow, an **Output Governor** audits synthesis completeness against multi-part inquiries, and a **Retrieval Friction Monitor** surfaces self-healing opportunities when queries require complex multi-hop traversal.
 
 ---
 
 ## 2. Prerequisites & Installation
 
 ### System Requirements
-* Python 3.11 or higher
-* [Ollama](https://ollama.com/) (recommended for local offline operation)
-* *(Optional)* [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) for scanning paper receipts, documents, and PDFs
+* **Python**: 3.11 or higher
+* **Local LLM Engine**: [Ollama](https://ollama.com/) (recommended for local offline operation)
+* **OCR Support (Optional)**: [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) for extracting scanned PDFs, images, and physical documents
 
 ### Installing Dependencies
 
-#### Ubuntu / Debian
+#### Ubuntu / Debian Linux
 ```bash
 sudo apt update
-sudo apt install python3-pip tesseract-ocr
+sudo apt install python3-pip python3-venv tesseract-ocr
 ```
 
 #### macOS (Homebrew)
@@ -40,139 +41,279 @@ Install Tesseract via winget:
 winget install UB-Mannheim.TesseractOCR
 ```
 
-### Pulling Ollama Models
-For best local performance:
+---
+
+### Pulling Recommended Ollama Models
+
+For local operation, pull the embedding model and at least one local reasoning model:
+
 ```bash
-# Recommended embedding model (384 dimensions, fast & accurate)
+# Recommended embedding model (384-dimensional dense vectors, fast & accurate)
 ollama pull nomic-embed-text
 
-# Recommended default local agent models
-ollama pull llama3.2:3b     # Lightweight, fast
-ollama pull qwen2.5:7b      # High-reasoning local model
+# Recommended default local reasoning models
+ollama pull llama3.2:3b     # Ultra-fast, lightweight (requires ~2GB VRAM)
+ollama pull qwen2.5:7b      # High-reasoning local model (requires ~5GB VRAM)
 ```
 
+---
+
 ### Installing Alcuin
+
+Clone the repository and install in editable development mode within a virtual environment:
+
 ```bash
 git clone https://github.com/fredericf75/alcuin.git
 cd alcuin
+python3 -m venv .venv
+source .venv/bin/activate    # On Windows: .venv\Scripts\Activate.ps1
 pip install -e .
 ```
 
-Verify installation:
+Verify your installation:
 ```bash
 alcuin --help
 ```
 
 ---
 
-## 3. Vault Structure
+## 3. Vault Architecture & Multi-Vault Management
 
-An Alcuin vault is any directory containing markdown files and a localized `.alcuin/` metadata directory.
+An Alcuin vault is any folder containing markdown files and an in-situ `.alcuin/` metadata directory.
 
 ```text
 my-vault/
-├── .alcuin/                <-- Managed automatically by Alcuin
+├── .alcuin/                <-- Automatically created and managed by Alcuin
 │   ├── config.toml         <-- Local vault configuration & exclusions
 │   ├── lancedb/            <-- Embedded vector store & full-text index
-│   ├── graph.json          <-- Bidirectional wikilink graph cache
-│   └── gaps.json           <-- Unanswered queries & blind spots
-├── inbox/                  <-- Drop raw PDFs, images, receipts here
+│   ├── manifest.json       <-- File hashes, modification times, & wikilink graph
+│   └── knowledge_gaps.json <-- Unanswered queries & blind spots
+├── inbox/                  <-- Drop raw PDFs, DOCX, scans, and receipts here
 ├── archive/                <-- Ingested raw files moved here safely
+├── findings/               <-- Synthesized research findings saved as notes
 ├── 00_Meta/
 │   ├── Index.md
-│   └── Contacts.md
-├── Finance/
-│   ├── Taxes 2025.md
-│   └── Insurance.md
-└── Family/
+│   └── People.md
+├── Legal/
+│   ├── Lease.md
+│   └── Ordinances.md
+└── Personal/
     └── Charlie.md
 ```
 
 ### The Intake Invariant
-* **Active Vault is 100% Markdown**: Raw binaries (PDFs, PNGs, JPEGs) never pollute active note searches.
-* **Decoupled Archive**: Files moved to `archive/` remain preserved. Even if an archived file is deleted or pruned, your synthesized Markdown note remains intact.
+* **Active Vault is 100% Markdown**: Raw binaries (`.pdf`, `.png`, `.docx`) are kept in `inbox/` or `archive/` so they never pollute active semantic note searches.
+* **Preserved Archive**: Moving ingested files to `archive/` preserves original evidentiary records. Even if an archive file is moved or deleted, the synthesized Markdown note remains permanently intact.
 
 ---
 
-## 4. Workflows & Commands
+### Managing Vaults (`alcuin vault`)
 
-### 4.1 Research (`alcuin <question>`)
-Alcuin uses natural language querying directly from the command line:
+Alcuin maintains a global registry of vaults located at `~/.config/alcuin/vaults.toml`. You can register, switch, and query multiple vaults from anywhere on your system.
 
+#### 1. Initialize a New Vault
+Initialize a new vault in the current directory or a target folder:
 ```bash
-# Direct question
-alcuin what is our home insurance policy number and deductible?
+# In the current directory
+alcuin init
 
-# Multi-hop inquiry across multiple documents
-alcuin who is Charlie's pediatrician and what is their clinic address?
+# In a specific directory with a custom name
+alcuin vault init /path/to/my_notes --name personal
 ```
 
-#### Research Options:
-* `--max-hops <int>`: Maximum wikilink hops the agent will traverse (default: `3`).
-* `--model <name>`: Override model for this query (e.g., `--model qwen2.5:7b`).
-* `--model-endpoint <url>`: Override Ollama or API endpoint.
-* `--temperature <float>`: Agent creativity/sampling temperature (default: `0.2`).
-* `--verbose`: Stream internal agent thought steps and hops to the terminal.
+#### 2. List Registered Vaults
+```bash
+alcuin vault list
+```
+Displays an overview table of registered vaults, filesystem paths, and active status.
+
+#### 3. Register and Unregister Vaults
+```bash
+# Register an existing vault directory
+alcuin vault register /mnt/wiki --name svr_wiki
+
+# Unregister a vault from the global registry (does not delete note files)
+alcuin vault unregister svr_wiki
+```
+
+#### 4. Set the Default Vault
+Set the default vault used when commands are run outside a vault directory:
+```bash
+alcuin vault default svr_wiki
+```
+
+#### 5. Prune Dead or Moved Vaults
+Automatically remove stale registry entries for paths that no longer exist:
+```bash
+alcuin vault prune
+```
+
+#### 6. Targeting Vaults Across Any Command
+Every Alcuin command supports the `-v, --vault <name|path>` option. You never need to `cd` into a directory to research or manage it:
+```bash
+alcuin --vault svr_wiki "What is our home insurance deductible?"
+alcuin lint --vault personal
+alcuin index --vault aia_vault
+```
 
 ---
 
-### 4.2 Document Ingestion (`alcuin ingest`)
-Drop physical document scans, digital receipts, statements, and images into `inbox/`, then process them:
+## 4. Autonomous Research Engine
+
+Alcuin's core capability is multi-hop agentic research across your notes.
+
+```bash
+# Direct natural language question
+alcuin "What are the decibel noise limits between 9 PM and 2 AM?"
+
+# Multi-clause or multi-part inquiry
+alcuin "Under the construction agreement, what is the notice deadline for differing site conditions and who acts as the initial decision maker?"
+```
+
+### Research Options & CLI Flags
+
+| Flag | Short | Description |
+| :--- | :--- | :--- |
+| `-v, --vault <target>` | `-v` | Vault name or directory path |
+| `--model <name>` | | Override LLM model (e.g. `qwen2.5:7b`, `llama3.2:3b`) |
+| `--model-endpoint <url>` | | Override Ollama endpoint URL (e.g. `http://localhost:11434`) |
+| `--temperature <float>` | | Sampling temperature (default: `0.2` for factual rigor) |
+| `--max-hops <int>` | | Maximum wikilink traversal depth (default: `3`) |
+| `--max-iterations <int>` | | Maximum research feedback loops (default: `4`) |
+| `-e, --with-evidence` | `-e` | Append full admitted grounding evidence dossier below answer |
+| `-E, --evidence-only` | `-E` | Output only admitted search evidence, bypassing LLM synthesis (zero token cost) |
+| `--context-window <int>` | `--ctx` | Override model context window in tokens (default: `16384`) |
+| `--headroom <int>` | | Generation runway token buffer (overrides vault config) |
+| `-V, --verbose` | `-V` | Display live agent thought iterations, node evaluations, and queries |
+| `--json` | | Output structured JSON containing query, answer, confidence, sources, and telemetry |
+
+---
+
+### Understanding the Cyclic Reasoning Trace (`--verbose`)
+
+When running with `-V` or `--verbose`, Alcuin displays real-time execution steps:
+
+1. **`[decompose]`**: Splits complex multi-part questions into targeted search sub-goals and sub-questions.
+2. **`[retrieve]`**: Executes hybrid vector + BM25 search, applies System 1 link pruning, and expands sibling headings.
+3. **`[evaluate]`**: An evidence sufficiency auditor checks whether the collected snippets completely answer the inquiry:
+   - For atomic queries: directly verifies if the factual information is satisfied.
+   - For multi-part queries: maintains a **Sub-Question Coverage Matrix** verifying that all sub-questions are covered before proceeding.
+   - Applies **Factual & Biographical Equivalence** (e.g., `Date of Birth` satisfies `birthday`) while strictly respecting legal terms of art.
+   - Clamps follow-up queries strictly to vault entities, rejecting web-search tropes.
+4. **`[synthesize]`**: Transcribes verbatim numbers, citations, and synthesizes a direct answer with full confidence scoring.
+
+---
+
+### Safe Grounding & Evidence Inspection (`-e` and `-E`)
+
+To inspect exactly what evidence the agent admitted into context:
+
+```bash
+# Append the evidentiary dossier below the answer
+alcuin --vault legal -e "What is the penalty for early lease termination?"
+
+# View ONLY the admitted evidence blocks without calling the LLM synthesizer (instant, zero token cost)
+alcuin --vault legal -E "What is the penalty for early lease termination?"
+```
+
+---
+
+## 5. The Modern Web Cockpit (`alcuin serve`)
+
+Alcuin includes a responsive, browser-based operations suite with real-time SSE streaming.
+
+```bash
+alcuin serve --port 8080
+```
+Open **`http://localhost:8080`** in your browser.
+
+The Web Cockpit is divided into 4 operational tabs:
+
+### Tab 1: Overview & Research
+* **Real-Time Streaming**: Watch intermediate agent thoughts stream live via Server-Sent Events.
+* **Model Selector**: Automatically queries `GET /api/tags` on your Ollama daemon to discover and switch between installed models on the fly.
+* **Collapsible Reasoning & Traversal Trace**: Traversal iterations and evaluation steps are positioned directly beneath the synthesized finding and are collapsible-by-default to keep the primary finding prominent.
+* **One-Click Finding Preservation**: Click **Save Finding as Note** to automatically write a timestamped research finding note into `<vault>/findings/` and immediately index it into memory.
+* **High Retrieval Friction Alerts**: When a query requires multi-hop exploration ($\ge 3$ turns), an actionable amber banner surfaces, offering one-click saving to accelerate future queries to $O(1)$.
+
+### Tab 2: Vault Operations
+* Switch active vaults with a single click.
+* Inspect vault paths, total document counts, and configuration settings.
+* Initialize new in-situ vaults directly from the browser.
+* Register existing directories and prune stale or moved vault paths.
+* Set system-wide default vaults.
+
+### Tab 3: Notes & Document Intake
+* **In-Browser Note Drafting**: Quickly compose and save new markdown notes with custom titles and subfolder destinations.
+* **Drag-and-Drop Document Intake**: Drag PDFs, Word documents (`.docx`), text files, or scanned images directly onto the drop zone to stage them into `<vault>/inbox/`.
+* **Process Inbox**: Trigger OCR and text extraction with a single button.
+
+### Tab 4: Maintenance & Diagnostics
+* **Live Vault Linter**: Run a complete integrity check on the active vault to discover broken wikilinks, sync drift, or structural anomalies.
+* **One-Click Repair**: Execute `lint --fix` to generate missing folders and repair heading hygiene.
+* **Knowledge Gap Manager**: Inspect unanswered questions, review ask counts and confidence levels, and resolve gaps with target notes.
+* **Reindex Trigger**: Trigger incremental or forced index rebuilding directly from the UI.
+
+---
+
+## 6. Document Ingestion & Intake (`alcuin ingest`)
+
+Drop physical scans, PDFs, digital receipts, statements, and image files into your vault's `inbox/` folder:
 
 ```bash
 alcuin ingest
 ```
 
-What happens:
-1. Alcuin inspects `inbox/` for supported files (`.pdf`, `.png`, `.jpg`, `.jpeg`, `.tiff`, `.bmp`).
-2. Deduplication check: Computes SHA-256 hash to prevent re-ingesting duplicate files.
-3. OCR / Extraction: Runs Tesseract OCR on images/scans and extracts text layers from PDFs.
-4. Generates a clean Markdown note in the vault with extraction metadata and source headers.
-5. Moves the original raw file from `inbox/` to `archive/`.
+### Ingestion Workflow
+1. **Discovery**: Scans `inbox/` for supported files (`.pdf`, `.docx`, `.png`, `.jpg`, `.jpeg`, `.tiff`, `.bmp`, `.txt`, `.md`).
+2. **Deduplication**: Computes SHA-256 hashes to guarantee duplicate files are never re-ingested.
+3. **Extraction & OCR**: Extracts native PDF/DOCX text layers and runs Tesseract OCR on scanned images and receipts.
+4. **Note Generation**: Produces a clean Markdown note in the vault with document headers, timestamps, and structured text.
+5. **Safe Archival**: Moves original files from `inbox/` to `archive/`.
 
 #### Ingest Options:
-* `--dry-run`: Preview files to be ingested without making changes.
-* `--force`: Re-process files even if previously ingested.
-* `--inbox-dir <path>`: Custom intake directory (default: `<vault>/inbox`).
-* `--archive-dir <path>`: Custom archive directory (default: `<vault>/archive`).
+* `--dry-run`: Preview files to be processed without modifying files.
+* `--force`: Force re-processing of previously ingested files.
+* `--inbox-dir <path>`: Override intake directory.
+* `--archive-dir <path>`: Override archive destination.
 
 ---
 
-### 4.3 Vault Health & Self-Healing (`alcuin lint`)
-Audit vault integrity, sync state, and wikilink connectivity:
+## 7. Vault Health, Maintenance & Self-Healing
+
+### Vault Linting (`alcuin lint`)
+
+Keep your vault clean, connected, and structurally sound:
 
 ```bash
+# Audit vault integrity
 alcuin lint
-```
 
-Fix issues automatically:
-```bash
+# Automatically repair safe issues
 alcuin lint --fix
+
+# Automatically generate placeholder stub notes for dead wikilinks
+alcuin lint --fix --create-stubs
 ```
 
-#### What `lint` Detects and Repairs:
-* **Dead Wikilinks**: Finds `[[Links]]` that reference non-existent notes. Use `--create-stubs` with `--fix` to automatically generate stub notes for missing targets.
-* **Sync Drift**: Identifies notes added, updated, or removed outside Alcuin.
-* **Missing Intake Folders**: Automatically upgrades older vaults by creating `inbox/` and `archive/` and adding them to `.alcuin/config.toml` exclusions.
-* **Heading Hygiene**: Detects notes missing H1 titles and inserts them from filenames.
-
-#### Lint Options:
-* `--fix`: Automatically repair safe issues (scaffolding folders, fixing headers).
-* `--create-stubs`: Generate empty placeholder notes for dead wikilinks during `--fix`.
-* `--strict`: Return non-zero exit code on any warning.
-* `--json`: Output report as JSON for CI or automation.
+#### What `lint` Audits:
+* **Dead Wikilinks**: Identifies `[[Broken Link]]` references pointing to non-existent notes.
+* **Sync Drift**: Detects notes modified, added, or deleted outside Alcuin.
+* **Folder Structure**: Ensures `inbox/`, `archive/`, and `findings/` exist and are properly excluded from search indexes.
+* **Heading Hygiene**: Detects notes lacking an H1 header and provides auto-fixes.
 
 ---
 
-### 4.4 Knowledge Gap Tracking (`alcuin gaps`)
-When Alcuin cannot find an answer to your question, it records a knowledge gap in `.alcuin/gaps.json`:
+### Knowledge Gap Tracking (`alcuin gaps`)
+
+When Alcuin encounters a query that cannot be answered with high confidence, it records an entry in `<vault>/.alcuin/knowledge_gaps.json`:
 
 ```bash
-# List all active gaps
+# List all recorded knowledge gaps
 alcuin gaps list
 
-# Resolve a gap once the information has been added
-alcuin gaps resolve <gap-id> "Pediatrician.md"
+# Resolve a gap once you have created the missing note
+alcuin gaps resolve <gap-id> "Family/Charlie.md"
 
 # Clear all resolved gaps
 alcuin gaps clear
@@ -180,84 +321,93 @@ alcuin gaps clear
 
 ---
 
-### 4.5 Indexing (`alcuin index`)
-Re-indexes and updates vector embeddings for modified documents:
+### Indexing (`alcuin index`)
+
+Alcuin incrementally updates LanceDB vectors and BM25 tables whenever files are added or edited:
 
 ```bash
+# Incremental synchronization (fast: only processes modified files)
 alcuin index
-```
 
-To force a complete re-index of the entire vault:
-```bash
+# Full reconstruction (re-embeds all vault documents from scratch)
 alcuin index --force
 ```
 
 ---
 
-### 4.6 Web UI & Daemon (`alcuin serve`)
-Alcuin includes an embedded web dashboard with real-time SSE streaming for interactive visual research:
+## 8. Effective Prompting & Multi-Clause Research
 
+Because complex knowledge corpuses (municipal codes, commercial leases, construction contracts) distribute conditions across multiple sections, phrasing influences retrieval and synthesis precision:
+
+### 1. Itemize Multi-Part Questions
+When researching complex rules across documents, **enumerate individual questions**:
 ```bash
-alcuin serve --port 8000
+alcuin "Under the commercial lease:
+1. What is the base rent due date?
+2. What is the late payment grace period and penalty percentage?
+3. What written notice is required before an Event of Default?"
 ```
-Open `http://localhost:8000` in your browser.
+*Why this works*: Alcuin's query planner recognizes numbered sub-clauses, executes dedicated multi-pass retrieval passes for each item, and validates coverage using a Sub-Question Coverage Matrix before synthesizing.
+
+### 2. State Requirements Explicitly
+* **Vague**: *"What happens if rent is late?"*
+* **Targeted**: *"What is the exact grace period in days and the fee structure if rent is overdue?"*
+
+### 3. Model Sizing & Register
+* **Local 3B Models** (`llama3.2:3b`): Fast, lightweight, completely offline. Best for direct factual retrieval, single-target inquiries, and biographical lookups.
+* **Local 7B–14B Models** (`qwen2.5:7b`, `qwen2.5:14b`): Excellent balance of local privacy and nuanced reasoning. Superior at distinguishing competing legal clauses and synthesis across multiple sections.
+* **Frontier Models** (Gemini, Claude, GPT-4): Recommended for massive 50+ chunk legal cross-examination or complex municipal zoning analyses.
 
 ---
 
-## 5. Effective Prompting & Multi-Clause Research
+## 9. Configuration Reference
 
-Alcuin's multi-hop engine automatically decomposes queries and traverses cross-document references. Because complex domains (such as municipal codes, technical protocols, and commercial contracts) often distribute requirements across dozens of separate sections, how you phrase your prompt significantly impacts retrieval and synthesis fidelity.
-
-### 5.1 Itemize Multi-Topic Inquiries
-When researching questions that span disparate rules or sections, **enumerate your specific questions**:
-```bash
-alcuin "Under the construction agreement:
-1. Within how many days must notice of differing site conditions be given?
-2. What is the deadline to initiate a claim for delay?
-3. Who acts as the Initial Decision Maker by default?
-4. Is mediation mandatory before binding arbitration?"
-```
-
-*Why this matters*: Alcuin automatically detects numbered or lettered sub-clauses and executes dedicated retrieval passes for each item. This ensures that a prominent topic (such as general contract dispute resolution) does not crowd out smaller, specific requirements (such as 14-day notice deadlines).
-
-### 5.2 State Requirements Explicitly
-While human readers infer implicit requests, language models perform best when expectations are stated directly:
-* **Ambiguous**: *"What happens if the tenant doesn't pay rent?"*
-* **Targeted**: *"Under the lease, what is the base rent due date, the late fee grace period and percentage, the written notice required before an Event of Default, and the overdue interest rate?"*
-
-### 5.3 Model Selection & Cognitive Sizing
-Alcuin guarantees exhaustive evidence delivery into the model's context window. However, downstream synthesis accuracy depends on the model's parameter scale and reasoning capacity:
-* **Local 3B–7B Models** (`llama3.2:3b`, `qwen2.5:7b-instruct`): Fast, fully offline, and private. Excellent for factual extraction, document summaries, and clear-cut rules.
-* **Frontier & Heavy Models (30B+)** (`gemma-4-31b-it`, Gemini, GPT-4): Strongly recommended when resolving subtle competing legal clauses (such as distinguishing a 10-day monetary default cure from a 30-day general cure) or synthesizing across 30+ dense contract chunks.
-
----
-
-## 6. Configuration
-
-Configuration is loaded hierarchically:
-1. **CLI Flags** (highest priority)
-2. **Environment Variables** (`ALCUIN_MODEL`, `ALCUIN_ENDPOINT`, `GEMINI_API_KEY`)
+Alcuin resolves configuration hierarchically:
+1. **CLI Flags** (highest precedence)
+2. **Environment Variables** (`ALCUIN_MODEL`, `ALCUIN_ENDPOINT`, `GEMINI_API_KEY`, `OPENAI_API_KEY`)
 3. **Vault Configuration** (`<vault>/.alcuin/config.toml`)
 4. **Global Configuration** (`~/.config/alcuin/config.toml`)
 
-### Example Configuration (`config.toml`)
+### Annotated `config.toml`
 
 ```toml
 [agent]
+# LLM Endpoint & Model
 model_endpoint = "http://localhost:11434"
 model_name = "llama3.2:3b"
 temperature = 0.2
+
+# Graph Traversal Limits
 max_hops = 3
 max_iterations = 4
-link_pruning = true                # Fast System 1 semantic link gating
-link_pruning_threshold = 0.40      # Cosine similarity cutoff
-link_pruning_max_queue = 10        # Priority queue cap
+
+# Link Pruning (System 1 Semantic Gate)
+link_pruning = true
+link_pruning_threshold = 0.40
+link_pruning_max_queue = 10
+
+# Sibling Heading Expansion
+sibling_traversal = true
+sibling_pruning_threshold = 0.58
+sibling_max_per_hit = 2
+
+# Context Governor Safeguards
+context_governor = true
+context_window = 16384
+context_headroom_tokens = 2048
 
 [storage]
 embedding_model = "nomic-embed-text"
-fts_weight = 0.3
-vector_weight = 0.7
-exclude_dirs = [".alcuin", "archive", "inbox"]
+fts_weight = 0.3                      # BM25 keyword weight
+vector_weight = 0.7                   # Dense vector similarity weight
+exclude_patterns = [
+    ".git/*",
+    "node_modules/*",
+    "tmp/*",
+    ".alcuin/*",
+    "inbox/*",
+    "archive/*"
+]
 
 [ingest]
 ocr_engine = "tesseract"
@@ -265,43 +415,36 @@ inbox_dir = "inbox"
 archive_dir = "archive"
 ```
 
-### Using Cloud Models
-
-#### Google Gemini
-Set your API key:
-```bash
-export GEMINI_API_KEY="your-gemini-key"
-```
-Run with Gemini:
-```bash
-alcuin --model gemini/gemini-2.5-flash "summarize our tax deductions"
-```
-
-#### OpenAI
-Set your API key:
-```bash
-export OPENAI_API_KEY="your-openai-key"
-```
-Run with GPT:
-```bash
-alcuin --model openai/gpt-4o-mini "what is our insurance deductible?"
-```
-
 ---
 
-## 7. Troubleshooting
+## 10. Troubleshooting & Diagnostics
 
-### "Tesseract not installed or not in PATH"
-Ensure Tesseract is installed:
+### Model Not Found Error (`ModelNotFoundError`)
+If you specify a model name that is mistyped or not pulled in Ollama (e.g. `--model llama3`), Alcuin automatically connects to your endpoint, displays an error panel, and lists all available models currently installed:
+```text
+Model 'llama3' not found on endpoint 'http://localhost:11434'.
+Available models on endpoint:
+  • llama3.2:3b
+  • qwen2.5:7b
+  • nomic-embed-text:latest
+```
+Fix: Use the exact model tag: `alcuin --model llama3.2:3b "..."`
+
+### "Tesseract not found in PATH"
+Verify that Tesseract OCR is installed on your operating system:
 * Linux: `sudo apt install tesseract-ocr`
-* Mac: `brew install tesseract`
-* Verify with `tesseract --version`.
+* macOS: `brew install tesseract`
+* Verify with: `tesseract --version`
 
-### "Dead wikilinks detected after renaming a note"
-Run `alcuin lint` to see dead links, or `alcuin lint --fix --create-stubs` to generate placeholder files.
+### Dead Wikilinks After Renaming Files
+If notes were renamed outside Alcuin, run:
+```bash
+alcuin lint --fix --create-stubs
+```
+This generates placeholder notes for all missing link destinations so your graph traversal never stalls.
 
-### "Rebuilding the search index"
-If notes were heavily edited outside Alcuin, synchronize the index:
+### Resetting or Forcing Index Reconstruction
+If notes were heavily edited outside of Alcuin or moved across folders:
 ```bash
 alcuin index --force
 ```

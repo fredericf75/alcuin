@@ -1473,7 +1473,8 @@ class ResearchAgent:
             "You are Alcuin, an autonomous knowledge assistant. Answer the user's question directly and concisely "
             "based strictly on the provided evidence.\n"
             "If multiple questions or core tasks are identified, address each in a separate numbered response.\n"
-            "State the exact numerical deadline, threshold, or entity directly before providing explanatory context.\n"
+            "Factual & Biographical Equivalence: Treat standard factual and biographical equivalents as answering the question (e.g., 'Date of Birth', 'DOB', or 'born on' directly answers 'birthday'; full dates or ISO timestamps satisfy temporal queries).\n"
+            "State the exact answer, key metric, deadline, or entity directly before providing explanatory context.\n"
             "When citing tables, schedules, deadlines, or fine structures, transcribe the row values and numbers verbatim.\n"
             "If the evidence does not contain the answer, state clearly and concisely that the information is not found."
         )
@@ -1487,7 +1488,7 @@ class ResearchAgent:
             user_prompt = (
                 f"Target Questions to Address:\n{questions_text}\n\n"
                 f"Evidence:\n{evidence_text}\n\n"
-                "Instructions: Answer each Target Question individually in numbered order. State exact numbers, deadlines, or requirements directly:\n"
+                "Instructions: Answer each Target Question individually in numbered order. State exact numbers, answers, or requirements directly:\n"
             )
         else:
             user_prompt = (
@@ -1576,6 +1577,7 @@ class ResearchAgent:
         return {
             "final_answer": answer,
             "confidence": confidence,
+            "sources": state.get("sources", []),
             "governor_alert": alert,
             "truncation_alert": truncation_alert,
             "friction_alert": friction_alert,

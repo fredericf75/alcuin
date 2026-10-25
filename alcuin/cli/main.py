@@ -197,8 +197,10 @@ def research_cmd(
             final_state = agent.research(query, **kwargs)
             chunks = final_state.get("evidence", [])
         else:
+            final_state = {}
             with console.status(status_text, spinner="dots") as status:
                 for node_name, state_update in agent.stream_research(query, **kwargs):
+                    final_state.update(state_update)
                     if "evidence" in state_update:
                         chunks = state_update["evidence"]
                     if "thought_history" in state_update and state_update["thought_history"]:
@@ -206,9 +208,8 @@ def research_cmd(
                         if verbose:
                             status.update(f"[dim]{latest_thought}[/dim]")
                             console.print(f"  [dim]• {latest_thought}[/dim]")
-                    final_state = state_update
 
-            if not chunks or (not evidence_only and (not final_state or not final_state.get("final_answer"))):
+            if not chunks or (not evidence_only and not final_state.get("final_answer")):
                 final_state = agent.research(query, **kwargs)
                 chunks = final_state.get("evidence", [])
     except ModelNotFoundError as e:

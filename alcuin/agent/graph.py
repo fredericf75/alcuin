@@ -50,6 +50,7 @@ class AgentState(TypedDict):
     sources: List[str]
     governor_alert: Optional[str]
     truncation_alert: Optional[str]
+    friction_alert: Optional[str]
     evidence_only: bool
     synthesis_clipped: Optional[bool]
     unaddressed_sub_questions: Optional[List[int]]
@@ -1305,14 +1306,15 @@ class ResearchAgent:
 
         context_snippets = "\n---\n".join(eval_snippets)
 
-        if sub_questions:
+        if sub_questions and len(sub_questions) >= 2:
             questions_checklist = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(sub_questions))
             sys_prompt = (
                 "You are an evidence sufficiency evaluator and research auditor. Respond ONLY in valid JSON.\n"
                 "Examine the Collected Evidence against each Sub-Question.\n"
                 "For each sub-question, determine whether the evidence directly answers it (COVERED) or lacks the required details (MISSING).\n"
-                "If MISSING, provide a concise 3-to-6 keyword search query (gap_query) to retrieve the missing information.\n"
-                "Format: {\"coverage\": [{\"id\": 1, \"status\": \"COVERED\"}, {\"id\": 2, \"status\": \"MISSING\", \"gap_query\": \"...\"}], \"all_covered\": true/false, \"thought\": \"...\", \"confidence\": 0.0-1.0}"
+                "Factual & Biographical Equivalence: Treat standard factual and biographical equivalents as COVERED (e.g., 'Date of Birth', 'DOB', or 'born on' directly answers 'birthday'; full dates or ISO timestamps satisfy temporal queries). Do not reject evidence simply because it uses formal record vocabulary.\n"
+                "Query Grounding: If MISSING, provide a concise 3-to-6 keyword search query (gap_query) derived strictly from the sub-question and entities in the vault. Never invent out-of-domain terms or web search phrases.\n"
+                "Format: {\"coverage\": [{\"id\": <sub-question id number>, \"status\": \"COVERED\" | \"MISSING\", \"gap_query\": \"<keywords if missing>\"}], \"all_covered\": true/false, \"thought\": \"...\", \"confidence\": 0.0-1.0}"
             )
             user_prompt = (
                 f"User Inquiry:\n{state['question']}\n\n"
@@ -1323,7 +1325,9 @@ class ResearchAgent:
         else:
             sys_prompt = (
                 "You are an evidence sufficiency evaluator. Respond ONLY in valid JSON.\n"
-                "Analyze whether the collected evidence directly and completely answers the user's question.\n"
+                "Analyze whether the collected evidence directly answers the user's question.\n"
+                "Factual & Biographical Equivalence: Treat standard factual and biographical equivalents as answering the question (e.g., 'Date of Birth', 'DOB', or 'born on' directly answers 'birthday'; full dates or ISO timestamps satisfy temporal queries). Do not reject evidence simply because it uses formal record vocabulary.\n"
+                "Query Grounding: If not sufficient, next_query must be a targeted keyword search derived strictly from the subject matter or named entities in the inquiry. Never invent out-of-domain terms or web search phrases.\n"
                 "Format: {\"sufficient\": true/false, \"thought\": \"...\", \"next_query\": \"...\", \"confidence\": 0.0-1.0}"
             )
             user_prompt = (
@@ -1348,16 +1352,25 @@ class ResearchAgent:
                     confidence = float(parsed.get("confidence", 0.5))
 
                     raw_coverage = parsed.get("coverage", [])
-                    if isinstance(raw_coverage, list) and raw_coverage and sub_questions:
+                    if isinstance(raw_coverage, list) and raw_coverage and sub_questions and len(sub_questions) >= 2:
                         all_items_covered = True
+                        covered_ids = set()
                         for item in raw_coverage:
                             if not isinstance(item, dict):
                                 continue
                             item_id = item.get("id", 0)
-                            q_text = sub_questions[item_id - 1] if 0 < item_id <= len(sub_questions) else ""
+                            if not (1 <= item_id <= len(sub_questions)):
+                                continue
+                            q_text = sub_questions[item_id - 1]
                             status = str(item.get("status", "")).upper()
                             gap = item.get("gap_query", "").strip() if item.get("gap_query") else None
-                            if status != "COVERED":
+                            # Guard: Reject hallucinated out-of-domain web search tropes
+                            banned_web_terms = ("celebrity", "wikipedia", "google", "website", "online", "internet")
+                            if gap and any(w in gap.lower() for w in banned_web_terms):
+                                gap = None
+                            if status == "COVERED":
+                                covered_ids.add(item_id)
+                            else:
                                 all_items_covered = False
                                 if not next_query and gap and gap not in visited_queries:
                                     next_query = gap
@@ -1367,15 +1380,23 @@ class ResearchAgent:
                                 "status": status,
                                 "gap_query": gap,
                             })
+                        if len(covered_ids) < len(sub_questions):
+                            all_items_covered = False
+
                         explicit_all = parsed.get("all_covered")
                         if explicit_all is not None:
                             sufficient = bool(explicit_all) and all_items_covered
                         else:
                             sufficient = all_items_covered
                     else:
-                        sufficient = bool(parsed.get("sufficient", False))
+                        sufficient = bool(parsed.get("sufficient", parsed.get("all_covered", False)))
                         if parsed.get("next_query"):
-                            next_query = parsed["next_query"].strip()
+                            raw_nq = parsed["next_query"].strip()
+                            banned_web_terms = ("celebrity", "wikipedia", "google", "website", "online", "internet")
+                            if any(w in raw_nq.lower() for w in banned_web_terms):
+                                next_query = ""
+                            else:
+                                next_query = raw_nq
             except Exception:
                 pass
 
@@ -1542,11 +1563,22 @@ class ResearchAgent:
         alert = state.get("governor_alert")
         if alert and alert not in answer:
             answer = f"{answer}\n\n{alert}"
+
+        friction_alert = None
+        iteration = state.get("iteration", 0)
+        if iteration >= 2 and confidence >= 0.7 and answer:
+            friction_alert = (
+                f"High retrieval friction detected: inquiry required {iteration + 1} turns to resolve. "
+                "Consider saving finding as a note or adding an alias to accelerate future recall."
+            )
+            thought_history.append(f"[FRICTION ALERT] {friction_alert}")
+
         return {
             "final_answer": answer,
             "confidence": confidence,
             "governor_alert": alert,
             "truncation_alert": truncation_alert,
+            "friction_alert": friction_alert,
             "thought_history": thought_history,
             "synthesis_clipped": bool(unaddressed_indices),
             "unaddressed_sub_questions": unaddressed_indices,
@@ -1575,6 +1607,7 @@ class ResearchAgent:
             "sources": [],
             "governor_alert": None,
             "truncation_alert": None,
+            "friction_alert": None,
             "synthesis_clipped": False,
             "unaddressed_sub_questions": [],
             "evidence_only": evidence_only,
@@ -1606,6 +1639,7 @@ class ResearchAgent:
             "sources": [],
             "governor_alert": None,
             "truncation_alert": None,
+            "friction_alert": None,
             "synthesis_clipped": False,
             "unaddressed_sub_questions": [],
             "evidence_only": evidence_only,

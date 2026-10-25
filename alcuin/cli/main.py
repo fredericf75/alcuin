@@ -239,6 +239,7 @@ def research_cmd(
     answer = final_state.get("final_answer", "") if final_state else ""
     confidence = final_state.get("confidence", 0.0) if final_state else 0.0
     sources = final_state.get("sources", []) if final_state else []
+    friction_alert = final_state.get("friction_alert") if final_state else None
 
     if json_output:
         if evidence_only:
@@ -253,6 +254,7 @@ def research_cmd(
                 "final_answer": answer,
                 "confidence": confidence,
                 "sources": sources,
+                "friction_alert": friction_alert,
             }
             if with_evidence:
                 payload["evidence"] = chunks
@@ -265,6 +267,9 @@ def research_cmd(
 
     console.print("\n")
     console.print(Markdown(answer or "No answer could be synthesized."))
+
+    if friction_alert:
+        console.print(f"\n[bold yellow]⚡ {friction_alert}[/bold yellow]")
 
     if with_evidence:
         console.print("\n")
@@ -338,6 +343,33 @@ def vault_unregister(name: str):
         console.print(f"[bold green]Unregistered vault '[bold]{name}[/bold]'. Local files preserved.[/bold green]")
     else:
         console.print(f"[bold red]Vault '{name}' not found in registry.[/bold red]")
+
+
+@vault.command(name="prune", short_help="Purge missing or invalid vaults from registry")
+def vault_prune():
+    """Remove non-existent or corrupted vault paths from the registry."""
+    count, removed = VaultRegistry.prune()
+    if count == 0:
+        console.print("[green]Registry is clean. No stale vaults found.[/green]")
+    else:
+        console.print(f"[bold green]Pruned {count} stale vaults:[/bold green]")
+        for name in removed:
+            console.print(f"  [dim]• {name}[/dim]")
+
+
+@vault.command(name="default", short_help="Set or show the default vault")
+@click.argument("name", required=False)
+def vault_default(name: Optional[str] = None):
+    """Set the system-wide default vault, or print the active one."""
+    reg = VaultRegistry.load_registry()
+    if not name:
+        current = reg.get("default_vault")
+        console.print(f"Current default vault: [bold cyan]{current or 'None'}[/bold cyan]")
+        return
+    if VaultRegistry.set_default(name):
+        console.print(f"[bold green]Default vault set to '[bold]{name}[/bold]'.[/bold green]")
+    else:
+        console.print(f"[bold red]Vault '{name}' is not in the registry.[/bold red]")
 
 
 @cli.command(short_help="Scan and incrementally index vault documents")

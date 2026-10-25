@@ -338,6 +338,32 @@ class VaultRegistry:
         vaults = cls.list_vaults()
         return vaults.get(name)
 
+    @classmethod
+    def set_default(cls, name: str) -> bool:
+        reg = cls.load_registry()
+        if name in reg.get("vaults", {}):
+            reg["default_vault"] = name
+            cls.save_registry(reg)
+            return True
+        return False
+
+    @classmethod
+    def prune(cls) -> Tuple[int, List[str]]:
+        reg = cls.load_registry()
+        removed: List[str] = []
+        new_vaults: Dict[str, str] = {}
+        for name, path_str in reg.get("vaults", {}).items():
+            p = Path(path_str)
+            if p.exists() and (p / ".alcuin").is_dir():
+                new_vaults[name] = path_str
+            else:
+                removed.append(name)
+        reg["vaults"] = new_vaults
+        if reg.get("default_vault") in removed:
+            reg["default_vault"] = next(iter(new_vaults.keys()), None)
+        cls.save_registry(reg)
+        return len(removed), removed
+
 
 class Vault:
     """Represents a localized in-situ Alcuin document vault."""

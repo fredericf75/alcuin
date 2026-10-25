@@ -96,3 +96,114 @@ def test_research_api_sse(api_test_env, monkeypatch):
     assert "event: step" in text
     assert "event: result" in text
     assert "Sample answer." in text
+
+
+def test_models_endpoint(api_test_env, monkeypatch):
+    client, vault = api_test_env
+    from alcuin.agent.graph import LLMClient
+
+    monkeypatch.setattr(LLMClient, "get_available_models", lambda self: ["llama3.2:3b", "qwen3:8b"])
+
+    resp = client.get("/api/v1/models")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "llama3.2:3b" in data["available_models"]
+    assert "qwen3:8b" in data["available_models"]
+
+
+def test_vault_lifecycle_and_prune_api(api_test_env, tmp_path):
+    client, vault = api_test_env
+
+    # 1. Init new vault via API
+    new_vault_dir = tmp_path / "api_created_vault"
+    init_resp = client.post(
+        "/api/v1/vaults/init",
+        json={"path": str(new_vault_dir), "name": "api-vault", "description": "API created"},
+    )
+    assert init_resp.status_code == 200
+    assert init_resp.json()["name"] == "api-vault"
+
+    # 2. Set default vault
+    def_resp = client.post("/api/v1/vaults/api-vault/default")
+    assert def_resp.status_code == 200
+    assert def_resp.json()["default_vault"] == "api-vault"
+
+    # 3. Register another folder
+    another_dir = tmp_path / "another_folder"
+    Vault.init(another_dir, name="another-vault")
+    reg_resp = client.post(
+        "/api/v1/vaults/register",
+        json={"path": str(another_dir), "name": "another-vault"},
+    )
+    assert reg_resp.status_code == 200
+
+    # 4. Prune stale test entries
+    prune_resp = client.post("/api/v1/vaults/prune")
+    assert prune_resp.status_code == 200
+    assert "removed_count" in prune_resp.json()
+
+    # 5. Delete / unregister
+    del_resp = client.delete("/api/v1/vaults/another-vault")
+    assert del_resp.status_code == 200
+    assert del_resp.json()["status"] == "unregistered"
+
+
+def test_linter_and_gaps_api(api_test_env):
+    client, vault = api_test_env
+
+    # 1. Lint endpoint
+    lint_resp = client.get("/api/v1/vaults/web-vault/lint")
+    assert lint_resp.status_code == 200
+    assert "issues" in lint_resp.json()
+
+    # 2. Fix endpoint
+    fix_resp = client.post("/api/v1/vaults/web-vault/lint/fix")
+    assert fix_resp.status_code == 200
+    assert "fixed_count" in fix_resp.json()
+
+    # 3. Gaps list
+    gaps_resp = client.get("/api/v1/vaults/web-vault/gaps")
+    assert gaps_resp.status_code == 200
+    assert "gaps" in gaps_resp.json()
+
+
+def test_notes_upload_and_save_finding_api(api_test_env):
+    client, vault = api_test_env
+
+    # 1. Create a markdown note directly
+    note_resp = client.post(
+        "/api/v1/vaults/web-vault/notes",
+        json={
+            "title": "Town Regulations",
+            "filename": "town_regs.md",
+            "content": "Section 1: Noise limits are 55 dB.",
+            "subfolder": "regulations",
+        },
+    )
+    assert note_resp.status_code == 200
+    assert "town_regs.md" in note_resp.json()["file_path"]
+
+    # 2. Upload file
+    upload_resp = client.post(
+        "/api/v1/vaults/web-vault/upload?filename=memo.txt&target=inbox",
+        content=b"Staffing rules memo content",
+        headers={"Content-Type": "text/plain"},
+    )
+    assert upload_resp.status_code == 200
+    assert "inbox/memo.txt" in upload_resp.json()["path"]
+
+    # 3. Save finding as note (compounding knowledge)
+    save_resp = client.post(
+        "/api/v1/vaults/web-vault/save-finding",
+        json={
+            "query": "What are the noise limits?",
+            "answer": "Noise limits are 55 dB according to regulations.",
+            "confidence": 0.95,
+            "sources": ["town_regs.md"],
+        },
+    )
+    assert save_resp.status_code == 200
+    assert "findings/" in save_resp.json()["file_path"]
+    created_finding = vault.root_path / save_resp.json()["file_path"]
+    assert created_finding.exists()
+    assert "[[town_regs.md]]" in created_finding.read_text(encoding="utf-8")

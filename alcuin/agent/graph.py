@@ -233,8 +233,14 @@ class LLMClient:
             except Exception:
                 pass
 
-        # 2. If local endpoint (Ollama /api/chat)
-        if is_local:
+        is_openai_explicit = (
+            self.endpoint.rstrip("/").endswith("/v1")
+            or "/v1/" in self.endpoint
+            or self.endpoint.endswith("/chat/completions")
+        )
+
+        # 2. If local endpoint (Ollama /api/chat) - only if endpoint does not explicitly target an OpenAI /v1 route
+        if is_local and not is_openai_explicit:
             try:
                 with httpx.Client(timeout=self.timeout) as client:
                     ollama_options: Dict[str, Any] = {"temperature": self.temperature}
@@ -281,7 +287,7 @@ class LLMClient:
                             err_msg = str(resp.json().get("error", ""))
                         except Exception:
                             pass
-                        if "not found" in err_msg.lower() or not err_msg:
+                        if "model" in err_msg.lower() and "not found" in err_msg.lower():
                             avail = self.get_available_models()
                             raise ModelNotFoundError(self.model, self.endpoint, avail)
             except ModelNotFoundError:

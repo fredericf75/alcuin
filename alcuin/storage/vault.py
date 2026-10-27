@@ -51,8 +51,10 @@ class VaultConfig:
     temperature: float = 0.2
     embedding_model: str = "nomic-embed-text"
     embedding_endpoint: Optional[str] = None
-    fts_weight: float = 0.3
-    vector_weight: float = 0.7
+    # Hybrid candidate generation deliberately defaults to scale-invariant unweighted RRF
+    # (0.5 / 0.5) to protect keyword recall and prevent context-governor flooding.
+    fts_weight: float = 0.5
+    vector_weight: float = 0.5
     periodic_indexing: bool = True
     index_interval_seconds: int = 300
     file_extensions: List[str] = field(

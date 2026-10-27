@@ -4,10 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alcuin"
-version = "0.1.0"
+version = "0.2.0"
 description = "Autonomous, agentic personal knowledge engine"
 authors = [{ name = "Frederic" }]
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
     "langgraph>=0.2.70",

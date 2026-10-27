@@ -232,7 +232,7 @@ def chunk_file_in_memory(file_path: Path) -> Tuple[str, str, List[DocumentChunk]
     ext = file_path.suffix.lower()
     if ext == ".pdf":
         doc_title, raw_text = extract_pdf_content(file_path)
-    elif ext in (".docx", ".doc"):
+    elif ext == ".docx":
         doc_title, raw_text = extract_docx_content(file_path)
     else:
         doc_title, raw_text = extract_text_file(file_path)
@@ -290,7 +290,7 @@ class VaultStorage:
             for f in files:
                 p = Path(root) / f
                 if p.suffix.lower() in extensions:
-                    rel_path = str(p.relative_to(self.vault.root_path))
+                    rel_path = p.relative_to(self.vault.root_path).as_posix()
                     if not self._should_exclude(rel_path):
                         results[rel_path] = p
 
@@ -302,8 +302,8 @@ class VaultStorage:
                 with open(self.vault.manifest_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     if isinstance(data, dict):
-                        data.setdefault("files", {})
-                        data.setdefault("wikilinks", {})
+                        data["files"] = {k.replace("\\", "/"): v for k, v in data.get("files", {}).items()}
+                        data["wikilinks"] = {k.replace("\\", "/"): v for k, v in data.get("wikilinks", {}).items()}
                         return data
             except Exception:
                 pass

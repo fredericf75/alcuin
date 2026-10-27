@@ -140,7 +140,7 @@ class VaultLinter:
             for f in files:
                 p = Path(root) / f
                 try:
-                    rel = str(p.relative_to(self.vault.root_path)).replace("\\", "/")
+                    rel = p.relative_to(self.vault.root_path).as_posix()
                     exact_paths.add(rel)
                     exact_paths.add(rel.lower())
                     stems_lower.add(p.stem.lower())

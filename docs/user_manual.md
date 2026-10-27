@@ -48,7 +48,7 @@ winget install UB-Mannheim.TesseractOCR
 For local operation, pull the embedding model and at least one local reasoning model:
 
 ```bash
-# Recommended embedding model (384-dimensional dense vectors, fast & accurate)
+# Recommended embedding model (768-dimensional dense vectors, fast & accurate)
 ollama pull nomic-embed-text
 
 # Recommended default local reasoning models
@@ -227,7 +227,7 @@ alcuin serve --port 8080
 ```
 Open **`http://localhost:8080`** in your browser.
 
-The Web Cockpit is divided into 4 operational tabs:
+The Web Cockpit is divided into 5 operational tabs:
 
 ### Tab 1: Overview & Research
 * **Real-Time Streaming**: Watch intermediate agent thoughts stream live via Server-Sent Events.
@@ -253,6 +253,9 @@ The Web Cockpit is divided into 4 operational tabs:
 * **One-Click Repair**: Execute `lint --fix` to generate missing folders and repair heading hygiene.
 * **Knowledge Gap Manager**: Inspect unanswered questions, review ask counts and confidence levels, and resolve gaps with target notes.
 * **Reindex Trigger**: Trigger incremental or forced index rebuilding directly from the UI.
+
+### Tab 5: Settings
+* Configure active vault traversal parameters (`max_hops`, `max_iterations`), model endpoint, model name, and periodic indexing interval directly in the browser.
 
 ---
 

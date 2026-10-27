@@ -51,6 +51,10 @@ def resolve_or_prompt_vault(
         )
         sys.exit(1)
 
+    default_vault = VaultRegistry.load_registry().get("default_vault")
+    if default_vault and default_vault in registered:
+        return Vault.resolve(target=default_vault, overrides=overrides)
+
     # If non-interactive shell, cannot prompt
     if not sys.stdin.isatty():
         console.print(

@@ -775,7 +775,7 @@ def process_document(
         ext = src_path.suffix.lower()
         if ext == ".pdf":
             doc_title, raw_text = extract_pdf_content(src_path)
-        elif ext in (".docx", ".doc"):
+        elif ext == ".docx":
             doc_title, raw_text = extract_docx_content(src_path)
         elif ext in (".md", ".txt", ".markdown", ".rfc"):
             doc_title, raw_text = extract_text_file(src_path)
@@ -845,7 +845,7 @@ def process_batch_directory(
     max_size: int = 3000,
 ):
     """Recursively discover and process all supported documents in a folder."""
-    valid_exts = {".pdf", ".docx", ".doc", ".md", ".txt", ".rfc"}
+    valid_exts = {".pdf", ".docx", ".md", ".txt", ".rfc"}
     files = [
         p for p in dir_path.rglob("*")
         if p.is_file()
@@ -899,7 +899,7 @@ def process_batch_directory(
         print(f"\033[92m                  BATCH EXPORT COMPLETED SUCCESSFULLY                 \033[0m")
         print(f"\033[92m======================================================================\033[0m")
         print(f"  • Processed Documents : {len(files)}")
-        print(f"  • Master Combined     : \033[1;36{master_jsonl_path}\033[0m ({len(master_chunks_raw):,} chunks)")
+        print(f"  • Master Combined     : \033[1;36m{master_jsonl_path}\033[0m ({len(master_chunks_raw):,} chunks)")
         print(f"  • Output Directory    : {target_out_dir}\n")
 
 

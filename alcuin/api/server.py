@@ -85,12 +85,12 @@ class SaveFindingRequest(BaseModel):
 
 
 @app.get("/api/v1/health")
-async def health():
+def health():
     return {"status": "ok", "version": "0.2.0"}
 
 
 @app.get("/api/v1/models")
-async def list_models(endpoint: Optional[str] = None):
+def list_models(endpoint: Optional[str] = None):
     client = LLMClient(endpoint=endpoint)
     models = client.get_available_models()
     return {
@@ -101,7 +101,7 @@ async def list_models(endpoint: Optional[str] = None):
 
 
 @app.get("/api/v1/vaults")
-async def list_vaults():
+def list_vaults():
     reg = VaultRegistry.load_registry()
     default_vault = reg.get("default_vault")
     vaults = VaultRegistry.list_vaults()
@@ -129,14 +129,14 @@ async def list_vaults():
 
 
 @app.post("/api/v1/vaults/init")
-async def init_vault(req: VaultInitRequest):
+def init_vault(req: VaultInitRequest):
     target_path = Path(req.path).resolve()
     vault = Vault.init(target_path, name=req.name, description=req.description or "")
     return {"status": "created", "name": vault.name, "path": str(vault.root_path)}
 
 
 @app.post("/api/v1/vaults/register")
-async def register_vault(req: VaultRegisterRequest):
+def register_vault(req: VaultRegisterRequest):
     p = Path(req.path).resolve()
     if not p.exists():
         raise HTTPException(status_code=400, detail=f"Directory '{p}' does not exist.")
@@ -146,27 +146,27 @@ async def register_vault(req: VaultRegisterRequest):
 
 
 @app.delete("/api/v1/vaults/{name}")
-async def unregister_vault(name: str):
+def unregister_vault(name: str):
     if VaultRegistry.unregister(name):
         return {"status": "unregistered", "name": name}
     raise HTTPException(status_code=404, detail=f"Vault '{name}' not found.")
 
 
 @app.post("/api/v1/vaults/prune")
-async def prune_vaults():
+def prune_vaults():
     count, removed = VaultRegistry.prune()
     return {"status": "pruned", "removed_count": count, "removed_vaults": removed}
 
 
 @app.post("/api/v1/vaults/{name}/default")
-async def set_default_vault(name: str):
+def set_default_vault(name: str):
     if VaultRegistry.set_default(name):
         return {"status": "default_updated", "default_vault": name}
     raise HTTPException(status_code=404, detail=f"Vault '{name}' not found in registry.")
 
 
 @app.get("/api/v1/vaults/{name}")
-async def get_vault(name: str):
+def get_vault(name: str):
     path = VaultRegistry.get_vault_path(name)
     if not path or not (path / ".alcuin").is_dir():
         raise HTTPException(status_code=404, detail=f"Vault '{name}' not found.")
@@ -195,7 +195,7 @@ async def get_vault(name: str):
 
 
 @app.put("/api/v1/vaults/{name}/settings")
-async def update_vault_settings(name: str, update: VaultSettingsUpdate):
+def update_vault_settings(name: str, update: VaultSettingsUpdate):
     path = VaultRegistry.get_vault_path(name)
     if not path or not (path / ".alcuin").is_dir():
         raise HTTPException(status_code=404, detail=f"Vault '{name}' not found.")
@@ -211,7 +211,7 @@ async def update_vault_settings(name: str, update: VaultSettingsUpdate):
 
 
 @app.post("/api/v1/vaults/{name}/index")
-async def trigger_vault_index(name: str, force: bool = False):
+def trigger_vault_index(name: str, force: bool = False):
     path = VaultRegistry.get_vault_path(name)
     if not path or not (path / ".alcuin").is_dir():
         raise HTTPException(status_code=404, detail=f"Vault '{name}' not found.")
@@ -232,7 +232,7 @@ async def trigger_vault_index(name: str, force: bool = False):
 
 
 @app.get("/api/v1/vaults/{name}/lint")
-async def lint_vault(name: str):
+def lint_vault(name: str):
     path = VaultRegistry.get_vault_path(name)
     if not path or not (path / ".alcuin").is_dir():
         raise HTTPException(status_code=404, detail=f"Vault '{name}' not found.")
@@ -243,7 +243,7 @@ async def lint_vault(name: str):
 
 
 @app.post("/api/v1/vaults/{name}/lint/fix")
-async def fix_vault_lint(name: str):
+def fix_vault_lint(name: str):
     path = VaultRegistry.get_vault_path(name)
     if not path or not (path / ".alcuin").is_dir():
         raise HTTPException(status_code=404, detail=f"Vault '{name}' not found.")
@@ -256,7 +256,7 @@ async def fix_vault_lint(name: str):
 
 
 @app.get("/api/v1/vaults/{name}/gaps")
-async def get_gaps(name: str, include_resolved: bool = True):
+def get_gaps(name: str, include_resolved: bool = True):
     path = VaultRegistry.get_vault_path(name)
     if not path or not (path / ".alcuin").is_dir():
         raise HTTPException(status_code=404, detail=f"Vault '{name}' not found.")
@@ -267,7 +267,7 @@ async def get_gaps(name: str, include_resolved: bool = True):
 
 
 @app.post("/api/v1/vaults/{name}/gaps/{gap_id}/resolve")
-async def resolve_gap(name: str, gap_id: str):
+def resolve_gap(name: str, gap_id: str):
     path = VaultRegistry.get_vault_path(name)
     if not path or not (path / ".alcuin").is_dir():
         raise HTTPException(status_code=404, detail=f"Vault '{name}' not found.")
@@ -279,7 +279,7 @@ async def resolve_gap(name: str, gap_id: str):
 
 
 @app.post("/api/v1/vaults/{name}/notes")
-async def create_note(name: str, req: CreateNoteRequest):
+def create_note(name: str, req: CreateNoteRequest):
     path = VaultRegistry.get_vault_path(name)
     if not path or not (path / ".alcuin").is_dir():
         raise HTTPException(status_code=404, detail=f"Vault '{name}' not found.")
@@ -294,7 +294,7 @@ async def create_note(name: str, req: CreateNoteRequest):
         fname += ".md"
 
     note_path = (target_dir / fname).resolve()
-    if not str(note_path).startswith(str(vault.root_path)):
+    if not note_path.is_relative_to(vault.root_path.resolve()):
         raise HTTPException(status_code=400, detail="Invalid path traversal outside vault root.")
 
     content = req.content
@@ -354,7 +354,7 @@ async def upload_file(
 
 
 @app.post("/api/v1/vaults/{name}/ingest")
-async def ingest_inbox(name: str):
+def ingest_inbox(name: str):
     path = VaultRegistry.get_vault_path(name)
     if not path or not (path / ".alcuin").is_dir():
         raise HTTPException(status_code=404, detail=f"Vault '{name}' not found.")
@@ -373,7 +373,7 @@ async def ingest_inbox(name: str):
 
 
 @app.post("/api/v1/vaults/{name}/save-finding")
-async def save_finding(name: str, req: SaveFindingRequest):
+def save_finding(name: str, req: SaveFindingRequest):
     path = VaultRegistry.get_vault_path(name)
     if not path or not (path / ".alcuin").is_dir():
         raise HTTPException(status_code=404, detail=f"Vault '{name}' not found.")
@@ -396,7 +396,7 @@ async def save_finding(name: str, req: SaveFindingRequest):
 
     content = (
         f"---\n"
-        f"title: \"{req.query}\"\n"
+        f"title: {json.dumps(req.query)}\n"
         f"type: research-finding\n"
         f"date: {date_str}\n"
         f"confidence: {req.confidence:.2f}\n"
@@ -425,7 +425,8 @@ async def research(req: ResearchRequest):
         vaults = VaultRegistry.list_vaults()
         if not vaults:
             raise HTTPException(status_code=400, detail="No registered vaults found.")
-        vault_name = next(iter(vaults.keys()))
+        default_v = VaultRegistry.load_registry().get("default_vault")
+        vault_name = default_v if (default_v and default_v in vaults) else next(iter(vaults.keys()))
 
     path = VaultRegistry.get_vault_path(vault_name)
     if not path or not (path / ".alcuin").is_dir():
@@ -841,6 +842,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <script>
     let activeVault = '';
     let latestFinding = null;
+    function escapeHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+    let latestFinding = null;
 
     async function loadModels() {
       try {
@@ -919,7 +922,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           const tr = document.createElement('tr');
           const date = info.mtime ? new Date(info.mtime * 1000).toLocaleString() : '-';
           tr.innerHTML = `
-            <td class="py-2.5 px-3 text-cyan-300">${fp}</td>
+            <td class="py-2.5 px-3 text-cyan-300">${escapeHtml(fp)}</td>
             <td class="py-2.5 px-3">${info.chunks || 0}</td>
             <td class="py-2.5 px-3 text-slate-400">${info.size || 0}</td>
             <td class="py-2.5 px-3 text-slate-500">${date}</td>
@@ -960,7 +963,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         const st = g.resolved ? '<span class="text-emerald-400">Resolved</span>' : '<span class="text-amber-400">Open</span>';
         const act = g.resolved ? '-' : `<button onclick="resolveGap('${g.id}')" class="text-cyan-400 hover:underline">Resolve</button>`;
         tr.innerHTML = `
-          <td class="py-2.5 px-3 text-slate-200">${g.question}</td>
+          <td class="py-2.5 px-3 text-slate-200">${escapeHtml(g.question)}</td>
           <td class="py-2.5 px-3 text-slate-400">${Math.round(g.confidence * 100)}%</td>
           <td class="py-2.5 px-3 font-semibold">${st}</td>
           <td class="py-2.5 px-3">${act}</td>
@@ -986,7 +989,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         const li = document.createElement('li');
         const color = iss.severity === 'error' ? 'text-red-400' : 'text-amber-400';
         li.className = `${color} flex items-start gap-2`;
-        li.innerHTML = `<span>•</span> <span><strong>[${iss.category}]</strong> ${iss.message} (${iss.file_path || 'vault'})</span>`;
+        li.innerHTML = `<span>•</span> <span><strong>[${escapeHtml(iss.category)}]</strong> ${escapeHtml(iss.message)} (${escapeHtml(iss.file_path || 'vault')})</span>`;
         list.appendChild(li);
       });
     }
@@ -1013,10 +1016,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
         card.innerHTML = `
           <div class="flex justify-between items-start">
-            <h4 class="font-bold text-sm text-white">${v.name} ${v.is_default ? '<span class="text-amber-400">★</span>' : ''}</h4>
+            <h4 class="font-bold text-sm text-white">${escapeHtml(v.name)} ${v.is_default ? '<span class="text-amber-400">★</span>' : ''}</h4>
             ${validBadge}
           </div>
-          <div class="text-[11px] font-mono text-slate-400 truncate" title="${v.path}">${v.path}</div>
+          <div class="text-[11px] font-mono text-slate-400 truncate" title="${escapeHtml(v.path)}">${escapeHtml(v.path)}</div>
           <div class="text-xs text-slate-400">${v.chunks} chunks indexed</div>
           <div class="flex gap-2 pt-2 border-t border-slate-800/60 text-xs">
             <button onclick="setDefaultVault('${v.name}')" class="text-cyan-400 hover:underline">Set Default</button>
@@ -1298,7 +1301,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
               document.getElementById('traversalCounter').innerText = `[${data.node}]`;
               const li = document.createElement('li');
               li.className = 'flex items-start gap-2';
-              li.innerHTML = `<span class="text-cyan-400 font-bold">[${data.node}]</span> <span>${data.thought}</span>`;
+              li.innerHTML = `<span class="text-cyan-400 font-bold">[${escapeHtml(data.node)}]</span> <span>${escapeHtml(data.thought)}</span>`;
               stepsList.appendChild(li);
             } else if (ev === 'error') {
               if (pulse) {

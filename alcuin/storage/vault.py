@@ -8,17 +8,19 @@ across Linux, macOS, and Windows.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import platformdirs
 
 
 VAULT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
+logger = logging.getLogger(__name__)
 
 
 def get_global_config_path() -> Path:
@@ -33,8 +35,8 @@ def load_global_config() -> Dict[str, Any]:
         try:
             with open(cfg_file, "rb") as f:
                 return tomllib.load(f)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to parse global config %s: %s", cfg_file, exc)
     return {}
 
 
@@ -201,8 +203,8 @@ class VaultConfig:
         return self
 
     def to_toml(self) -> str:
-        exts = ", ".join(f'"{ext}"' for ext in self.file_extensions)
-        excludes = ", ".join(f'"{pat}"' for pat in self.exclude_patterns)
+        exts = ", ".join(json.dumps(ext) for ext in self.file_extensions)
+        excludes = ", ".join(json.dumps(pat) for pat in self.exclude_patterns)
         
         agent_lines = [
             f"max_hops = {self.max_hops}",
@@ -224,16 +226,16 @@ class VaultConfig:
         if self.context_window != 16384:
             agent_lines.append(f"context_window = {self.context_window}")
         if self.model_name:
-            agent_lines.append(f'model_name = "{self.model_name}"')
+            agent_lines.append(f"model_name = {json.dumps(self.model_name)}")
         if self.model_endpoint:
-            agent_lines.append(f'model_endpoint = "{self.model_endpoint}"')
+            agent_lines.append(f"model_endpoint = {json.dumps(self.model_endpoint)}")
         agent_block = "\n".join(agent_lines)
 
         storage_lines = [
-            f'embedding_model = "{self.embedding_model}"',
+            f"embedding_model = {json.dumps(self.embedding_model)}",
         ]
         if self.embedding_endpoint:
-            storage_lines.append(f'embedding_endpoint = "{self.embedding_endpoint}"')
+            storage_lines.append(f"embedding_endpoint = {json.dumps(self.embedding_endpoint)}")
         storage_lines.extend([
             f"fts_weight = {self.fts_weight}",
             f"vector_weight = {self.vector_weight}",
@@ -243,8 +245,8 @@ class VaultConfig:
         return f"""# Alcuin Vault Configuration
 
 [vault]
-name = "{self.name}"
-description = "{self.description}"
+name = {json.dumps(self.name)}
+description = {json.dumps(self.description)}
 
 [agent]
 {agent_block}
@@ -257,8 +259,8 @@ periodic_indexing = {"true" if self.periodic_indexing else "false"}
 index_interval_seconds = {self.index_interval_seconds}
 file_extensions = [{exts}]
 exclude_patterns = [{excludes}]
-inbox_dir = "{self.inbox_dir}"
-archive_dir = "{self.archive_dir}"
+inbox_dir = {json.dumps(self.inbox_dir)}
+archive_dir = {json.dumps(self.archive_dir)}
 """
 
 

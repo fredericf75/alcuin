@@ -28,7 +28,7 @@ from alcuin.storage.engine import VaultStorage, compute_file_sha256
 from alcuin.storage.vault import Vault
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"}
-DOC_EXTENSIONS = {".pdf", ".docx", ".doc", ".md", ".txt"}
+DOC_EXTENSIONS = {".pdf", ".docx", ".md", ".txt"}
 SUPPORTED_INBOX_EXTENSIONS = IMAGE_EXTENSIONS | DOC_EXTENSIONS
 
 
@@ -192,7 +192,7 @@ class InboxIngestionEngine:
                 return title, f"PDF extraction error: {e}"
 
         # 2. Word documents
-        elif ext in (".docx", ".doc"):
+        elif ext == ".docx":
             try:
                 docx_title, docx_text = extract_docx_content(file_path)
                 return docx_title or title, docx_text
@@ -282,7 +282,7 @@ class InboxIngestionEngine:
             target_archive = self.archive_dir / f"{file_path.stem}_{a_counter}{file_path.suffix}"
             a_counter += 1
 
-        rel_archive = str(target_archive.relative_to(self.vault.root_path)).replace("\\", "/")
+        rel_archive = target_archive.relative_to(self.vault.root_path).as_posix()
 
         note_content = (
             f"# {title}\n\n"
@@ -303,7 +303,7 @@ class InboxIngestionEngine:
         shutil.move(str(file_path), str(target_archive))
 
         # 3. Update history
-        rel_note = str(target_note.relative_to(self.vault.root_path)).replace("\\", "/")
+        rel_note = target_note.relative_to(self.vault.root_path).as_posix()
         history[sha] = IngestRecord(
             sha256=sha,
             original_name=file_path.name,

@@ -1,5 +1,9 @@
 # Alcuin
 
+[![CI](https://github.com/fredericf75/alcuin/actions/workflows/ci.yml/badge.svg)](https://github.com/fredericf75/alcuin/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+
 **Alcuin** is an autonomous, agentic personal knowledge engine. Designed for local-first personal dossiers, family records, technical specifications, and legal documents, it unites hierarchical clause-aware chunking, hybrid vector search (LanceDB + FTS), bidirectional markdown wikilink traversal, and cyclic LangGraph agent research.
 
 ---

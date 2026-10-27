@@ -308,7 +308,7 @@ async def create_note(name: str, req: CreateNoteRequest):
     rep = storage.index()
     return {
         "status": "created",
-        "file_path": str(note_path.relative_to(vault.root_path)),
+        "file_path": note_path.relative_to(vault.root_path).as_posix(),
         "chunks_indexed": rep.total_chunks_indexed,
     }
 
@@ -348,7 +348,7 @@ async def upload_file(
     return {
         "status": "uploaded",
         "filename": dest.name,
-        "path": str(dest.relative_to(vault.root_path)),
+        "path": dest.relative_to(vault.root_path).as_posix(),
         "chunks_indexed": chunks,
     }
 
@@ -413,7 +413,7 @@ async def save_finding(name: str, req: SaveFindingRequest):
     rep = storage.index()
     return {
         "status": "saved",
-        "file_path": str(dest.relative_to(vault.root_path)),
+        "file_path": dest.relative_to(vault.root_path).as_posix(),
         "chunks_indexed": rep.total_chunks_indexed,
     }
 

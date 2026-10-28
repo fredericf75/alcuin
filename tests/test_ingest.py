@@ -202,3 +202,129 @@ def test_cli_ingest(ingest_vault):
 
     assert (v_dir / "lab_results.md").is_file()
     assert (v_dir / "archive" / "lab_results.txt").is_file()
+
+
+def test_ingest_quarantines_rejected_files_and_writes_reason(ingest_vault):
+    vault, storage, v_dir = ingest_vault
+    engine = InboxIngestionEngine(vault)
+
+    # Place rejected formats in inbox
+    sheet = v_dir / "inbox" / "finances.xlsx"
+    sheet.write_bytes(b"PK fake excel binary content")
+    csv_file = v_dir / "inbox" / "data.csv"
+    csv_file.write_text("a,b,c\n1,2,3", encoding="utf-8")
+    archive_zip = v_dir / "inbox" / "bundle.zip"
+    archive_zip.write_bytes(b"PK fake zip content")
+
+    res = engine.ingest_inbox(dry_run=False)
+
+    assert len(res.rejected_files) == 3
+    assert len(res.ingested_notes) == 0
+
+    # Verify original files removed from inbox root
+    assert not sheet.exists()
+    assert not csv_file.exists()
+    assert not archive_zip.exists()
+
+    # Verify quarantined to _rejected/ with companion .reason.txt
+    rejected_dir = v_dir / "inbox" / "_rejected"
+    assert (rejected_dir / "finances.xlsx").is_file()
+    assert (rejected_dir / "finances.xlsx.reason.txt").is_file()
+    assert "Spreadsheet" in (rejected_dir / "finances.xlsx.reason.txt").read_text(encoding="utf-8")
+
+    assert (rejected_dir / "data.csv").is_file()
+    assert (rejected_dir / "data.csv.reason.txt").is_file()
+    assert "Spreadsheet" in (rejected_dir / "data.csv.reason.txt").read_text(encoding="utf-8")
+
+    assert (rejected_dir / "bundle.zip").is_file()
+    assert (rejected_dir / "bundle.zip.reason.txt").is_file()
+    assert "Unsupported format (.zip)" in (rejected_dir / "bundle.zip.reason.txt").read_text(encoding="utf-8")
+
+    # Vault root has no unwanted notes
+    assert not (v_dir / "finances.md").exists()
+    assert not (v_dir / "data.md").exists()
+    assert not (v_dir / "bundle.md").exists()
+
+
+def test_ingest_quarantine_dry_run(ingest_vault):
+    vault, storage, v_dir = ingest_vault
+    engine = InboxIngestionEngine(vault)
+
+    ppt = v_dir / "inbox" / "presentation.pptx"
+    ppt.write_bytes(b"PK fake pptx content")
+
+    res = engine.ingest_inbox(dry_run=True)
+    assert len(res.rejected_files) == 1
+    assert "[Dry Run] Would reject 'presentation.pptx'" in res.rejected_files[0]
+
+    # File remains untouched in inbox
+    assert ppt.is_file()
+    assert not (v_dir / "inbox" / "_rejected").exists()
+
+
+def test_image_gating_sparse_text_creates_clean_asset_note(ingest_vault, monkeypatch):
+    vault, storage, v_dir = ingest_vault
+    engine = InboxIngestionEngine(vault)
+
+    # Mock Tesseract to return sparse noise (< 20 alnum chars)
+    monkeypatch.setattr(engine, "extract_image_with_tesseract", lambda p: "... 123 !")
+    monkeypatch.setattr(engine, "find_local_vision_model", lambda: None)
+
+    img = v_dir / "inbox" / "icon.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n fake image bytes")
+
+    res = engine.ingest_inbox(dry_run=False)
+    assert len(res.ingested_notes) == 1
+
+    note_path = v_dir / "icon.md"
+    assert note_path.is_file()
+    content = note_path.read_text(encoding="utf-8")
+    assert "Visual asset ingested: `icon.png`" in content
+    assert "No legible document text detected" in content
+    assert "## Document Text (OCR" not in content
+
+
+def test_image_gating_sufficient_text_creates_ocr_transcription(ingest_vault, monkeypatch):
+    vault, storage, v_dir = ingest_vault
+    engine = InboxIngestionEngine(vault)
+
+    # Mock Tesseract returning substantive document text (>= 20 alnum chars)
+    ocr_sample = "INVOICE #4092 Date: 2026-10-25 Total Amount Due: $1,420.00"
+    monkeypatch.setattr(engine, "extract_image_with_tesseract", lambda p: ocr_sample)
+
+    img = v_dir / "inbox" / "bill.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n fake image bytes")
+
+    res = engine.ingest_inbox(dry_run=False)
+    assert len(res.ingested_notes) == 1
+
+    note_path = v_dir / "bill.md"
+    assert note_path.is_file()
+    content = note_path.read_text(encoding="utf-8")
+    assert "## Transcribed Text (OCR)" in content
+    assert ocr_sample in content
+
+
+def test_periodic_indexer_inbox_stabilization(ingest_vault):
+    import asyncio
+    from alcuin.api.daemon import PeriodicIndexer
+
+    vault, storage, v_dir = ingest_vault
+    indexer = PeriodicIndexer(check_interval=1.0)
+
+    # Place file in inbox
+    sample = v_dir / "inbox" / "streamed_note.txt"
+    sample.write_text("Work in progress content", encoding="utf-8")
+
+    # Poll cycle 1: Observes file and records stat, should NOT ingest yet
+    asyncio.run(indexer._process_vault_inbox("intake_vault", vault))
+    assert sample.exists()
+    assert not (v_dir / "streamed_note.md").exists()
+    assert str(sample) in indexer._file_stats
+
+    # Poll cycle 2: Stat is unchanged -> stable -> ingests!
+    asyncio.run(indexer._process_vault_inbox("intake_vault", vault))
+    assert not sample.exists()
+    assert (v_dir / "streamed_note.md").is_file()
+    assert str(sample) not in indexer._file_stats
+

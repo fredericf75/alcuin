@@ -31,6 +31,15 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"}
 DOC_EXTENSIONS = {".pdf", ".docx", ".md", ".txt"}
 SUPPORTED_INBOX_EXTENSIONS = IMAGE_EXTENSIONS | DOC_EXTENSIONS
 
+# Explicitly excluded/rejected formats (destructive to semantic chunking or non-document binaries)
+REJECTED_EXTENSIONS = {
+    ".xlsx", ".xls", ".csv",
+    ".pptx", ".ppt",
+    ".mp3", ".mp4", ".mov", ".wav", ".avi", ".mkv",
+    ".zip", ".tar", ".gz", ".7z",
+    ".exe", ".bin", ".sh", ".py", ".json",
+}
+
 
 @dataclass
 class IngestRecord:
@@ -52,15 +61,18 @@ class IngestRecord:
 class IngestResult:
     ingested_notes: List[str] = field(default_factory=list)
     skipped_duplicates: List[str] = field(default_factory=list)
+    rejected_files: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "ingested_notes": self.ingested_notes,
             "skipped_duplicates": self.skipped_duplicates,
+            "rejected_files": self.rejected_files,
             "errors": self.errors,
             "ingested_count": len(self.ingested_notes),
             "skipped_count": len(self.skipped_duplicates),
+            "rejected_count": len(self.rejected_files),
             "error_count": len(self.errors),
         }
 
@@ -72,6 +84,7 @@ class InboxIngestionEngine:
         self.vault = vault
         self.inbox_dir = vault.root_path / vault.config.inbox_dir
         self.archive_dir = vault.root_path / vault.config.archive_dir
+        self.rejected_dir = self.inbox_dir / "_rejected"
         self.history_file = vault.alcuin_dir / "ingest_history.json"
 
     def validate_folders(self) -> Tuple[bool, str]:
@@ -208,25 +221,22 @@ class InboxIngestionEngine:
         elif ext in IMAGE_EXTENSIONS:
             # Priority A: Tesseract OCR (fastest local path)
             ocr_text = self.extract_image_with_tesseract(file_path)
-            if ocr_text and len(ocr_text) > 30:
+            alnum_count = len(re.findall(r"[A-Za-z0-9]", ocr_text)) if ocr_text else 0
+            if ocr_text and alnum_count >= 20:
                 return title, f"## Transcribed Text (OCR)\n\n{ocr_text}"
 
             # Priority B: Local Ollama Vision Model
             vlm_model = self.find_local_vision_model()
             if vlm_model:
                 vlm_text = self.extract_image_with_vlm(file_path, vlm_model)
-                if vlm_text:
+                vlm_alnum = len(re.findall(r"[A-Za-z0-9]", vlm_text)) if vlm_text else 0
+                if vlm_text and vlm_alnum >= 20:
                     return title, f"## Visual Document Transcription ({vlm_model})\n\n{vlm_text}"
 
-            # If Tesseract returned short text, keep it
-            if ocr_text:
-                return title, f"## Transcribed Text (OCR)\n\n{ocr_text}"
-
-            # Priority C: Offline Metadata Stub
+            # Priority C: Non-document image or unreadable asset (prevent noisy OCR tokens)
             return title, (
-                f"*Image file ingested: `{file_path.name}`.*\n\n"
-                "*No local OCR (Tesseract) or Vision LLM was reachable during ingestion. "
-                "You may edit this note by hand to add transcriptions.*"
+                f"*Visual asset ingested: `{file_path.name}`.*\n\n"
+                "*No legible document text detected via local OCR or Vision model.*"
             )
 
         return title, f"Unsupported file format: {ext}"
@@ -320,7 +330,7 @@ class InboxIngestionEngine:
         dry_run: bool = False,
         force: bool = False,
     ) -> IngestResult:
-        """Process all eligible files in the vault inbox directory."""
+        """Process all eligible files in the vault inbox directory and quarantine unsupported files."""
         result = IngestResult()
 
         valid, msg = self.validate_folders()
@@ -328,16 +338,47 @@ class InboxIngestionEngine:
             result.errors.append(msg)
             return result
 
-        inbox_files = [
+        raw_inbox_items = [
             p
             for p in self.inbox_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in SUPPORTED_INBOX_EXTENSIONS
+            if p.is_file() and not p.name.startswith(".")
         ]
 
-        if not inbox_files:
+        if not raw_inbox_items:
             return result
 
-        for f in sorted(inbox_files, key=lambda x: x.name.lower()):
+        eligible_files = []
+        for f in raw_inbox_items:
+            ext = f.suffix.lower()
+            if ext in SUPPORTED_INBOX_EXTENSIONS:
+                eligible_files.append(f)
+            else:
+                # Quarantined / Rejected format (e.g. spreadsheets, media, binaries)
+                reason = "Spreadsheet files destroy chunk cohesion" if ext in (".xlsx", ".xls", ".csv") else f"Unsupported format ({ext})"
+                if dry_run:
+                    result.rejected_files.append(f"[Dry Run] Would reject '{f.name}': {reason}")
+                else:
+                    try:
+                        self.rejected_dir.mkdir(parents=True, exist_ok=True)
+                        dest = self.rejected_dir / f.name
+                        counter = 1
+                        while dest.exists():
+                            dest = self.rejected_dir / f"{f.stem}_{counter}{f.suffix}"
+                            counter += 1
+                        shutil.move(str(f), str(dest))
+                        reason_file = self.rejected_dir / f"{dest.name}.reason.txt"
+                        reason_file.write_text(
+                            f"File: {f.name}\n"
+                            f"Rejected: {datetime.now(timezone.utc).isoformat()}\n"
+                            f"Reason: {reason}\n"
+                            f"Supported formats: {', '.join(sorted(SUPPORTED_INBOX_EXTENSIONS))}\n",
+                            encoding="utf-8",
+                        )
+                        result.rejected_files.append(f"Rejected '{f.name}': {reason}")
+                    except Exception as e:
+                        result.errors.append(f"Failed to quarantine '{f.name}': {e}")
+
+        for f in sorted(eligible_files, key=lambda x: x.name.lower()):
             note_path, status = self.ingest_file(f, dry_run=dry_run, force=force)
             if note_path:
                 result.ingested_notes.append(status)

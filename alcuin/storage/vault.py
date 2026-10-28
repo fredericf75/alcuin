@@ -57,6 +57,8 @@ class VaultConfig:
     vector_weight: float = 0.5
     periodic_indexing: bool = True
     index_interval_seconds: int = 300
+    auto_ingest_inbox: bool = True
+    inbox_check_interval_seconds: float = 5.0
     file_extensions: List[str] = field(
         default_factory=lambda: [".pdf", ".docx", ".md", ".txt"]
     )

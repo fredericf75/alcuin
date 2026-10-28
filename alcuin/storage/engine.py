@@ -24,6 +24,7 @@ import pyarrow as pa
 from alcuin.chunker.chunker import (
     DocumentChunk,
     chunk_document_text,
+    enrich_wikilinks_appositive,
     extract_docx_content,
     extract_pdf_content,
     extract_text_file,
@@ -374,8 +375,11 @@ class VaultStorage:
             try:
                 doc_title, raw_text, chunks = chunk_file_in_memory(full_path)
                 file_links = extract_wikilinks(raw_text)
-                # Batch embed and prepare records
-                chunk_texts = [f"{c.breadcrumbs}\n{c.content}" for c in chunks]
+                # Batch embed and prepare records with Arm C appositive prose enrichment
+                chunk_texts = [
+                    f"{c.breadcrumbs}\n{enrich_wikilinks_appositive(c.content)}"
+                    for c in chunks
+                ]
                 embeddings = self.embedder.get_embeddings_batch(chunk_texts)
 
                 wikilinks_map[rel_path] = file_links
@@ -391,7 +395,8 @@ class VaultStorage:
 
                 for chunk, vec in zip(chunks, embeddings):
                     chunk_links = extract_wikilinks(chunk.content)
-                    enriched_content = f"> **Context**: {chunk.breadcrumbs}\n\n{chunk.content}"
+                    enriched_text = enrich_wikilinks_appositive(chunk.content)
+                    enriched_content = f"> **Context**: {chunk.breadcrumbs}\n\n{enriched_text}"
                     all_new_records.append(
                         {
                             "id": f"{rel_path}#{chunk.chunk_id}",

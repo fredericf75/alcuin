@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import pytest
 from alcuin.storage.vault import Vault
-from alcuin.storage.engine import VaultStorage, extract_wikilinks
+from alcuin.storage.engine import VaultStorage, extract_wikilinks, enrich_wikilinks_appositive
 
 
 @pytest.fixture
@@ -23,6 +23,20 @@ def test_extract_wikilinks():
     links = extract_wikilinks(text)
     assert "pediatrician" in links
     assert "Charlie's School" in links
+
+
+def test_enrich_wikilinks_appositive():
+    # Piped link -> Alias (Target)
+    text1 = "Notice under [[Section 3.7.4|differing site conditions]]."
+    assert enrich_wikilinks_appositive(text1) == "Notice under differing site conditions (Section 3.7.4)."
+
+    # Unpiped link -> Target
+    text2 = "Consult [[Dr. Sarah Miller Pediatrics]] for records."
+    assert enrich_wikilinks_appositive(text2) == "Consult Dr. Sarah Miller Pediatrics for records."
+
+    # Identical target and alias -> Target
+    text3 = "See [[RFC 9110|RFC 9110]] specification."
+    assert enrich_wikilinks_appositive(text3) == "See RFC 9110 specification."
 
 
 def test_incremental_indexing_lifecycle(temp_vault):

@@ -451,6 +451,22 @@ def identify_heading(line: str) -> Optional[Tuple[int, str]]:
 # Clause-Aware Chunking Engine & Tabular Serialization
 # =====================================================================
 
+def enrich_wikilinks_appositive(text: str) -> str:
+    """Enrich piped wikilinks [[Target|Alias]] into appositive prose 'Alias (Target)', and [[Target]] into 'Target'."""
+    def repl(m: re.Match) -> str:
+        inner = m.group(1).strip()
+        if "|" in inner:
+            target, alias = inner.split("|", 1)
+            target = target.strip()
+            alias = alias.strip()
+            if target and alias and target.lower() != alias.lower():
+                return f"{alias} ({target})"
+            return alias or target
+        return inner
+
+    return re.sub(r"\[\[([^\]]+)\]\]", repl, text)
+
+
 def serialize_tabular_data(text: str) -> str:
     """Detect Markdown pipe tables and plain text schedules, appending machine-readable key-value blocks."""
     if "<!-- TABLE_DATA:" in text:

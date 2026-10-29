@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import time
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, TypedDict
 
 import logging
@@ -54,6 +55,7 @@ class AgentState(TypedDict):
     evidence_only: bool
     synthesis_clipped: Optional[bool]
     unaddressed_sub_questions: Optional[List[int]]
+    synthesis_evidence: Optional[List[Dict[str, Any]]]
 
 
 def _extract_and_clean_thinking(raw_text: str) -> Tuple[str, str]:
@@ -986,6 +988,7 @@ class ResearchAgent:
 
         current_turn_primary: List[SearchResult] = []
         new_candidates: List[Tuple[str, str]] = []
+        per_target_results: List[List[SearchResult]] = []
 
         for target_query in search_targets:
             if target_query in visited_queries:
@@ -994,23 +997,34 @@ class ResearchAgent:
             search_depth = getattr(self.vault.config, "retrieval_candidates", 20)
             raw_results = self.storage.search(target_query, top_k=search_depth)
             qualified = self.prune_by_score_cliff(raw_results, query=target_query)
-            for r in qualified:
-                if r.id not in visited_ids and all(p.id != r.id for p in current_turn_primary):
-                    current_turn_primary.append(r)
-                    # Extract candidate cross-references if in broad inquiry scope
-                    for link in r.wikilinks:
-                        link_clean = " ".join(link.split()).strip()
-                        if re.match(r"^§\s*\d+(?:\.\d+)?$", link_clean):
-                            continue
-                        if self._is_in_inquiry_scope(link_clean, state["question"]):
-                            if link_clean not in visited_links and link_clean not in pending_links:
-                                snippet = r.breadcrumbs or ""
-                                for sentence in r.content.split(". "):
-                                    if link in sentence or link_clean in sentence:
-                                        snippet = sentence[:200].strip()
-                                        break
-                                new_candidates.append((link_clean, snippet))
+            per_target_results.append(qualified)
 
+            for r in qualified:
+                # Extract candidate cross-references if in broad inquiry scope
+                for link in r.wikilinks:
+                    link_clean = " ".join(link.split()).strip()
+                    if re.match(r"^[§A]\s*\d+(?:\.\d+)?$", link_clean):
+                        continue
+                    if self._is_in_inquiry_scope(link_clean, state["question"]):
+                        if link_clean not in visited_links and link_clean not in pending_links:
+                            snippet = r.breadcrumbs or ""
+                            for sentence in r.content.split(". "):
+                                if link in sentence or link_clean in sentence:
+                                    snippet = sentence[:200].strip()
+                                    break
+                            new_candidates.append((link_clean, snippet))
+
+        # Round-Robin Fair-Share Interleaving of primary search hits across sub-goals
+        if per_target_results:
+            max_depth = max(len(q) for q in per_target_results)
+            seen_in_turn = set()
+            for rank_idx in range(max_depth):
+                for q_list in per_target_results:
+                    if rank_idx < len(q_list):
+                        r = q_list[rank_idx]
+                        if r.id not in visited_ids and r.id not in seen_in_turn:
+                            seen_in_turn.add(r.id)
+                            current_turn_primary.append(r)
         # Intra-Document AST Sibling Expansion (SPEC-006 with Spatial Distance Attenuation)
         sibling_candidates: List[SearchResult] = []
         sibling_scores: Dict[str, float] = {}
@@ -1130,9 +1144,20 @@ class ResearchAgent:
         new_chunks_count = 0
         governor_alert = state.get("governor_alert")
 
-        # 1. Pack primary chunks
+        # 1. Pack primary chunks (Fair-share round-robin ordered across sub-goals)
         for r in current_turn_primary:
             tok = int(len(r.content) / 4)
+
+            # Quality-preserving displacement: If budget is full, allow high-scoring incoming
+            # chunks to displace significantly lower-scoring tail chunks from earlier turns
+            if current_tokens + tok > budget_tokens and evidence_list and r.score >= 0.60:
+                min_idx = min(range(len(evidence_list)), key=lambda i: evidence_list[i].get("score", 0.0))
+                min_score = evidence_list[min_idx].get("score", 0.0)
+                min_tok = int(len(evidence_list[min_idx]["content"]) / 4)
+                if r.score >= min_score + 0.15 and (current_tokens - min_tok + tok) <= budget_tokens:
+                    evidence_list.pop(min_idx)
+                    current_tokens -= min_tok
+
             if current_tokens + tok <= budget_tokens:
                 visited_ids.add(r.id)
                 new_sources.add(r.file_path)
@@ -1149,14 +1174,15 @@ class ResearchAgent:
                 )
                 current_tokens += tok
             else:
-                pruned_high_rel.append(
-                    {
-                        "id": r.id,
-                        "title": r.section_title or r.breadcrumbs,
-                        "score": 1.0,
-                        "tokens": tok,
-                    }
-                )
+                if r.score >= 0.50:
+                    pruned_high_rel.append(
+                        {
+                            "id": r.id,
+                            "title": r.section_title or r.breadcrumbs,
+                            "score": r.score,
+                            "tokens": tok,
+                        }
+                    )
 
         # 2. Pack sibling chunks (sorted descending by score)
         sibling_candidates.sort(key=lambda s: sibling_scores.get(s.id, 0.0), reverse=True)
@@ -1462,16 +1488,87 @@ class ResearchAgent:
                 "confidence": confidence,
             }
 
+        # Pre-Synthesis Re-Ranking: Re-score evidence against question & sub-questions
+        evidence_pool = list(state["evidence"])
+        thought_history = list(state.get("thought_history", []))
+        if getattr(self.vault.config, "pre_synthesis_rerank", True) and len(evidence_pool) > 1:
+            t_rerank_start = time.perf_counter()
+            sub_questions = state.get("sub_questions", [])
+            scoring_queries = [state["question"]] + [q for q in sub_questions if q != state["question"]]
+            try:
+                query_vecs = self.storage.embedder.get_embeddings_batch(scoring_queries)
+                chunk_ids_set = {e["id"] for e in evidence_pool}
+                try:
+                    where_clause = f"id IN {tuple(chunk_ids_set)}" if len(chunk_ids_set) > 1 else f"id = '{next(iter(chunk_ids_set))}'"
+                    rows = self.storage.table.search().where(where_clause).to_list()
+                except Exception:
+                    rows = self.storage.table.search().to_list()
+                vectors = {r["id"]: r["vector"] for r in rows if r["id"] in chunk_ids_set}
+
+                q_norms = [math.sqrt(sum(x * x for x in q_vec)) or 1.0 for q_vec in query_vecs]
+                chunk_scores_per_query = []
+                for e in evidence_pool:
+                    c_vec = vectors.get(e["id"])
+                    if c_vec is None:
+                        chunk_scores_per_query.append((e, {qi: 0.0 for qi in range(len(scoring_queries))}))
+                        continue
+                    c_norm = math.sqrt(sum(x * x for x in c_vec)) or 1.0
+                    scores = {}
+                    for qi, q_vec in enumerate(query_vecs):
+                        cos = sum(a * b for a, b in zip(c_vec, q_vec)) / (c_norm * q_norms[qi])
+                        scores[qi] = cos
+                    chunk_scores_per_query.append((e, scores))
+
+                top_k = getattr(self.vault.config, "pre_synthesis_top_k", 8)
+
+                # Fair-share selection across discrete sub-questions
+                target_sub_queries = [q for q in sub_questions if q != state["question"]]
+                if len(target_sub_queries) > 1:
+                    sub_q_indices = list(range(1, len(scoring_queries)))
+                    selected_chunks = []
+                    selected_ids = set()
+                    for _ in range(top_k):
+                        if len(selected_chunks) >= top_k:
+                            break
+                        for qi in sub_q_indices:
+                            if len(selected_chunks) >= top_k:
+                                break
+                            best_cand = None
+                            best_score = -1.0
+                            for e, scores in chunk_scores_per_query:
+                                if e["id"] not in selected_ids and scores[qi] > best_score:
+                                    best_score = scores[qi]
+                                    best_cand = e
+                            if best_cand:
+                                selected_ids.add(best_cand["id"])
+                                selected_chunks.append(best_cand)
+                    evidence_pool = selected_chunks
+                else:
+                    scored_evidence = [
+                        (max(scores.values()), e) for e, scores in chunk_scores_per_query
+                    ]
+                    scored_evidence.sort(key=lambda x: x[0], reverse=True)
+                    evidence_pool = [e for sc, e in scored_evidence[:top_k]]
+
+                rerank_ms = (time.perf_counter() - t_rerank_start) * 1000.0
+                thought_history.append(
+                    f"[PRE_SYNTHESIS_RERANK] Fair-share re-ranked {len(state['evidence'])} -> {len(evidence_pool)} chunks ({rerank_ms:.1f}ms)"
+                )
+            except Exception:
+                pass
+
         # Budget evidence to fit model context window (coupled to calibrated Context Governor)
         max_evidence_chars = self.get_context_governor_budget() * 4
         budgeted_chunks = []
+        synthesis_evidence = []
         total_chars = 0
 
-        for e in state["evidence"]:
+        for e in evidence_pool:
             chunk_repr = f"[{e['breadcrumbs']} ({e['file_path']})]\n{e['content'].strip()}"
             if total_chars + len(chunk_repr) > max_evidence_chars and budgeted_chunks:
                 break
             budgeted_chunks.append(chunk_repr)
+            synthesis_evidence.append(e)
             total_chars += len(chunk_repr) + 2
 
         evidence_text = "\n\n---\n\n".join(budgeted_chunks)
@@ -1569,8 +1666,6 @@ class ResearchAgent:
 
         self._record_gap_if_needed(state["question"], confidence, len(state["evidence"]), answer)
         alert = state.get("governor_alert")
-        if alert and alert not in answer:
-            answer = f"{answer}\n\n{alert}"
 
         friction_alert = None
         iteration = state.get("iteration", 0)
@@ -1591,6 +1686,7 @@ class ResearchAgent:
             "thought_history": thought_history,
             "synthesis_clipped": bool(unaddressed_indices),
             "unaddressed_sub_questions": unaddressed_indices,
+            "synthesis_evidence": synthesis_evidence,
         }
 
     def research(self, question: str, evidence_only: bool = False) -> AgentState:
@@ -1619,6 +1715,7 @@ class ResearchAgent:
             "friction_alert": None,
             "synthesis_clipped": False,
             "unaddressed_sub_questions": [],
+            "synthesis_evidence": [],
             "evidence_only": evidence_only,
         }
 
@@ -1651,6 +1748,7 @@ class ResearchAgent:
             "friction_alert": None,
             "synthesis_clipped": False,
             "unaddressed_sub_questions": [],
+            "synthesis_evidence": [],
             "evidence_only": evidence_only,
         }
 

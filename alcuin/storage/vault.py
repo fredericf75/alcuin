@@ -85,6 +85,10 @@ class VaultConfig:
     sibling_pruning_threshold: float = 0.58
     sibling_max_per_hit: int = 2
     ast_sibling_attenuation: float = 0.72
+    pre_synthesis_rerank: bool = True
+    pre_synthesis_top_k: int = 8
+    glossary_expansion: bool = True
+    glossary: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         inbox_pattern = f"{self.inbox_dir}/*"
@@ -188,6 +192,16 @@ class VaultConfig:
                     g_agent.get("ast_sibling_attenuation", 0.72),
                 )
             ),
+            pre_synthesis_rerank=bool(
+                agent_sec.get("pre_synthesis_rerank", g_agent.get("pre_synthesis_rerank", True))
+            ),
+            pre_synthesis_top_k=int(
+                agent_sec.get("pre_synthesis_top_k", g_agent.get("pre_synthesis_top_k", 8))
+            ),
+            glossary_expansion=bool(
+                agent_sec.get("glossary_expansion", g_agent.get("glossary_expansion", True))
+            ),
+            glossary=dict(data.get("glossary", vault_sec.get("glossary", {}))),
         )
 
     def apply_overrides(self, overrides: Dict[str, Any]) -> VaultConfig:
@@ -222,6 +236,9 @@ class VaultConfig:
             f"sibling_pruning_threshold = {self.sibling_pruning_threshold}",
             f"sibling_max_per_hit = {self.sibling_max_per_hit}",
             f"ast_sibling_attenuation = {self.ast_sibling_attenuation}",
+            f"pre_synthesis_rerank = {'true' if self.pre_synthesis_rerank else 'false'}",
+            f"pre_synthesis_top_k = {self.pre_synthesis_top_k}",
+            f"glossary_expansion = {'true' if self.glossary_expansion else 'false'}",
         ]
         if self.context_headroom_tokens is not None:
             agent_lines.append(f"context_headroom_tokens = {self.context_headroom_tokens}")

@@ -260,6 +260,38 @@ class VaultStorage:
             model=vault.config.embedding_model,
         )
         self.table = self._get_or_create_table()
+        self.glossary = self.load_glossary()
+
+    def load_glossary(self) -> Dict[str, str]:
+        glossary = dict(getattr(self.vault.config, "glossary", {}))
+        glossary_file = self.vault.alcuin_dir / "glossary.json"
+        if glossary_file.exists():
+            try:
+                with open(glossary_file, "r", encoding="utf-8") as f:
+                    file_glossary = json.load(f)
+                    if isinstance(file_glossary, dict):
+                        file_glossary.update(glossary)
+                        return file_glossary
+            except Exception:
+                pass
+        return glossary
+
+    def expand_query(self, query: str) -> Tuple[str, float]:
+        """Deterministically expands known acronyms and domain terms bi-directionally."""
+        if not getattr(self.vault.config, "glossary_expansion", True) or not getattr(self, "glossary", None):
+            return query, 0.0
+        t0 = time.perf_counter()
+        tokens = set(re.findall(r"\b[A-Za-z0-9\-]+\b", query))
+        expansions = []
+        for tok in tokens:
+            if tok in self.glossary and self.glossary[tok].lower() not in query.lower():
+                expansions.append(self.glossary[tok])
+        for acr, phrase in self.glossary.items():
+            if phrase.lower() in query.lower() and acr not in tokens:
+                expansions.append(acr)
+        expanded = f"{query} ({' '.join(expansions)})" if expansions else query
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        return expanded, latency_ms
 
     def _get_or_create_table(self):
         try:
@@ -435,7 +467,8 @@ class VaultStorage:
         if self.table.count_rows() == 0:
             return []
 
-        query_vec = self.embedder.get_embedding(query)
+        search_query, _ = self.expand_query(query)
+        query_vec = self.embedder.get_embedding(search_query)
         try:
             # NOTE on RRF Weighting (Cormack et al., 2009):
             # Native hybrid search deliberately uses unweighted RRF (0.5 vector / 0.5 FTS).
@@ -446,7 +479,7 @@ class VaultStorage:
             res = (
                 self.table.search(query_type="hybrid")
                 .vector(query_vec)
-                .text(query)
+                .text(search_query)
                 .limit(top_k)
                 .to_list()
             )
@@ -462,16 +495,15 @@ class VaultStorage:
         top_rrf = max((float(r.get("_relevance_score", 0.0)) for r in res), default=1.0) or 1.0
 
         for r in res:
-            if has_relevance_score and top_rrf > 0:
+            v = r.get("vector")
+            if is_live_vector and v is not None and len(v) == len(query_vec):
+                v_norm = math.sqrt(sum(x * x for x in v)) or 1.0
+                dot = sum(a * b for a, b in zip(query_vec, v))
+                score = float(dot / (q_norm * v_norm))
+            elif has_relevance_score and top_rrf > 0:
                 score = float(r.get("_relevance_score", 0.0)) / top_rrf
             else:
-                v = r.get("vector")
-                if is_live_vector and v is not None and len(v) == len(query_vec):
-                    v_norm = math.sqrt(sum(x * x for x in v)) or 1.0
-                    dot = sum(a * b for a, b in zip(query_vec, v))
-                    score = float(dot / (q_norm * v_norm))
-                else:
-                    score = float(r.get("_score", 1.0))
+                score = float(r.get("_score", 1.0))
 
             results.append(
                 SearchResult(

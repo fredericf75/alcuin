@@ -483,18 +483,69 @@ class ResearchAgent:
 
         return workflow.compile()
 
+    def _extract_subgoals_from_items(self, cleaned_items: List[str], question: str) -> Tuple[List[str], List[str]]:
+        """Harvest statutory anchors and build dense keyword search targets for decomposed questions."""
+        sub_questions = cleaned_items
+        sub_goals: List[str] = []
+
+        global_identifiers = re.findall(
+            r"\b(?:§\s*\d+|[A-Z]{2,}(?:[\-\/][A-Z0-9]+)*|\b[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+\b|\d+[\-\w]+)\b",
+            question,
+        )
+
+        filler = {
+            "within", "how", "many", "days", "after", "must", "the", "a", "an", "for",
+            "is", "under", "what", "which", "of", "are", "in", "to", "at", "by", "on",
+            "shall", "may", "can", "could", "be", "do", "does", "specifically", "rule",
+            "section", "both", "either", "or", "and", "if", "there", "has", "have", "with",
+        }
+
+        for q in cleaned_items:
+            q_clean = re.sub(r"\([a-zA-Z0-9]+\)\s*", "", q).rstrip("?.:;!")
+            sub_clauses = re.split(
+                r",?\s+(?:and|while|as well as)\s+(?=(?:under what|what|how|when|where|who|which|can|may|must)\b)",
+                q_clean,
+                flags=re.IGNORECASE,
+            )
+            parent_anchors = [g for g in global_identifiers if g.lower() in q.lower()]
+
+            for clause in sub_clauses:
+                clause_identifiers = re.findall(
+                    r"\b(?:§\s*\d+|[A-Z]{2,}(?:[\-\/][A-Z0-9]+)*|\b[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+\b|\d+[\-\w]+)\b",
+                    clause,
+                )
+                body = re.sub(
+                    r"^(?:in|under|pursuant to|according to|for|with respect to|regarding)\s+[^,;:\n]+[,\-:]\s*",
+                    "",
+                    clause.strip(),
+                    flags=re.IGNORECASE,
+                )
+                words = re.findall(r"\b[\w\-\.]+\b", body)
+                meaningful = [
+                    w for w in words
+                    if w.lower() not in filler and (len(w) > 1 or w.isdigit() or w.upper() in ("I", "V", "X"))
+                ]
+                anchors = list(dict.fromkeys(clause_identifiers + parent_anchors))
+                content_terms = [w for w in meaningful if w not in anchors]
+                selected = content_terms[:16]
+
+                search_query = " ".join(dict.fromkeys(anchors + selected))
+                if not search_query.strip():
+                    search_query = clause.strip()
+                if search_query.strip() and search_query not in sub_goals:
+                    sub_goals.append(search_query)
+
+        return sub_goals, sub_questions
+
     def decompose_query(self, question: str) -> Tuple[List[str], List[str]]:
-        """Decompose a complex or multi-part query into:
-        1. sub_goals: targeted keyword queries for document search.
-        2. sub_questions: full grammatical questions for answer synthesis.
-        """
+        """Decompose a complex or multi-part inquiry into discrete search targets and synthesis sub-questions."""
         has_subparts = bool(re.search(r"(?:[A-Z]\.|\b\d+[\.\)])", question))
         is_long = len(question.split()) > 25
 
         if not (has_subparts or is_long):
             return [question], [question]
 
-        # 1. Deterministic extraction: Full numbered or lettered items
+        # 1. Deterministic extraction: Numbered or lettered items already present
         matches = re.findall(r"(?:^|\n)\s*(?:[A-Z]\.|\d+[\.\)])\s*([^\n]+)", question)
         cleaned_items = [
             re.sub(r"^\s*(?:[A-Z]\.|\d+[\.\)])\s*", "", m).strip()
@@ -503,153 +554,41 @@ class ResearchAgent:
         ]
 
         if len(cleaned_items) >= 2:
-            sub_questions = cleaned_items
-            sub_goals: List[str] = []
+            return self._extract_subgoals_from_items(cleaned_items, question)
 
-            # Harvest domain-agnostic technical codes, citations, numbers, and identifiers across question
-            global_identifiers = re.findall(
-                r"\b(?:§\s*\d+|[A-Z]{2,}(?:[\-\/][A-Z0-9]+)*|\b[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+\b|\d+[\-\w]+)\b",
-                question,
-            )
-
-            filler = {
-                "within", "how", "many", "days", "after", "must", "the", "a", "an", "for",
-                "is", "under", "what", "which", "of", "are", "in", "to", "at", "by", "on",
-                "shall", "may", "can", "could", "be", "do", "does", "specifically", "rule",
-                "section", "both", "either", "or", "and", "if", "there", "has", "have", "with",
-            }
-
-            for q in cleaned_items:
-                # 1. Clean parenthetical enumeration markers (e.g. '(a)', '(b)', '(1)') without corrupting word lists
-                q_clean = re.sub(r"\([a-zA-Z0-9]+\)\s*", "", q).rstrip("?.:;!")
-                
-                # 2. Split compound questions at coordinating conjunctions followed by interrogatives
-                sub_clauses = re.split(
-                    r",?\s+(?:and|while|as well as)\s+(?=(?:under what|what|how|when|where|who|which|can|may|must)\b)",
-                    q_clean,
-                    flags=re.IGNORECASE,
-                )
-                parent_anchors = [g for g in global_identifiers if g.lower() in q.lower()]
-
-                for clause in sub_clauses:
-                    clause_identifiers = re.findall(
-                        r"\b(?:§\s*\d+|[A-Z]{2,}(?:[\-\/][A-Z0-9]+)*|\b[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+\b|\d+[\-\w]+)\b",
-                        clause,
-                    )
-                    body = re.sub(
-                        r"^(?:in|under|pursuant to|according to|for|with respect to|regarding)\s+[^,;:\n]+[,\-:]\s*",
-                        "",
-                        clause.strip(),
-                        flags=re.IGNORECASE,
-                    )
-                    words = re.findall(r"\b[\w\-\.]+\b", body)
-                    meaningful = [
-                        w for w in words
-                        if w.lower() not in filler and (len(w) > 1 or w.isdigit() or w.upper() in ("I", "V", "X"))
-                    ]
-                    anchors = list(dict.fromkeys(clause_identifiers + parent_anchors))
-                    content_terms = [w for w in meaningful if w not in anchors]
-
-                    # Retain terms without arbitrary middle truncation
-                    selected = content_terms[:16]
-
-                    search_query = " ".join(dict.fromkeys(anchors + selected))
-                    if not search_query.strip():
-                        search_query = clause.strip()
-                    if search_query.strip() and search_query not in sub_goals:
-                        sub_goals.append(search_query)
-
-            return sub_goals, sub_questions
-
-        # 2. Dual-field LLM decomposition for unstructured inquiries
+        # 2. Numbered decomposition for unstructured inquiries (bypasses brittle JSON serialization)
         sys_prompt = (
             "You are a research query planner.\n"
-            "Identify every distinct question, condition, metric, exception, or consequence raised in the user's inquiry.\n"
+            "Deconstruct the user's inquiry into a numbered list of standalone, specific questions.\n"
+            "Identify every distinct topic, condition, ratio, requirement, deadline, rule, or exception asked.\n"
             "CRITICAL RULES:\n"
-            "1. Each sub-goal must be strictly ATOMIC. Never combine multiple questions, rules, or conditions into one query.\n"
-            "2. PRESERVE SPECIFICITY: Always retain numbers, measurements, thresholds, entity names, and citations (e.g., '30-bed', '72 hours', 'SPICE'). Do NOT abstract them into generic words.\n"
-            "3. SEARCH QUERIES: Write dense, entity-preserving retrieval queries (5 to 10 terms) that include the target subject, specific action, and key constraint.\n"
-            "Respond with a JSON object adhering strictly to this schema:\n"
-            "{\n"
-            '  "sub_goals": [\n'
-            '    {\n'
-            '      "question": "Full grammatical question addressing one specific issue",\n'
-            '      "search_query": "Dense, entity-preserving search query including key metrics and constraints"\n'
-            '    }\n'
-            '  ]\n'
-            "}\n"
-            "Output ONLY valid JSON."
+            "1. Output each question as a numbered item (e.g. 1. [Question], 2. [Question]).\n"
+            "2. Each question must be strictly ATOMIC. Never combine multiple topics, requirements, or conditions into one question.\n"
+            "3. PRESERVE SPECIFICITY: Retain all numbers, measurements, thresholds, entity names, and statutory citations (e.g. '30-bed', '10A NCAC 13F', '14 days').\n"
+            "4. Do NOT output JSON, preamble, or conversational filler. Output ONLY the numbered questions."
         )
         llm_resp = self.planner_llm.chat(sys_prompt, question[:2000])
         llm_resp, _ = _extract_and_clean_thinking(llm_resp)
-        sub_goals: List[str] = []
-        sub_questions: List[str] = []
-
-        def _is_valid_q(val: str) -> bool:
-            v = val.lower()
-            return not any(b in v for b in ("full grammatical question", "addressing one specific", "<extracted question")) and len(val.strip()) > 5
 
         if llm_resp:
-            try:
-                m = re.search(r"\{.*\}", llm_resp, re.DOTALL)
-                if m:
-                    data = json.loads(m.group(0))
-                    items = data.get("sub_goals", [])
-                    for it in items:
-                        if isinstance(it, dict):
-                            q = str(it.get("question", "")).strip()
-                            s_raw = it.get("search_query", "")
-                            s = " ".join([str(x) for x in s_raw]) if isinstance(s_raw, list) else str(s_raw).strip()
-                            if s.endswith("?") and not q.endswith("?"):
-                                q, s = s, q
-                            if q and s and _is_valid_q(q):
-                                sub_questions.append(q)
-                                sub_goals.append(s)
-                        elif isinstance(it, str) and it.strip() and _is_valid_q(it):
-                            sub_questions.append(it.strip())
-                            sub_goals.append(it.strip())
-            except Exception:
-                pass
+            unstr_matches = re.findall(r"(?:^|\n)\s*(?:[A-Z]\.|\d+[\.\)])\s*([^\n]+)", llm_resp)
+            unstr_items = [
+                re.sub(r"^\s*(?:[A-Z]\.|\d+[\.\)])\s*", "", m).strip()
+                for m in unstr_matches
+                if len(m.strip()) >= 8
+            ]
+            if len(unstr_items) >= 2:
+                return self._extract_subgoals_from_items(unstr_items, question)
 
-            if not sub_goals:
-                try:
-                    m = re.search(r"\[.*\]", llm_resp, re.DOTALL)
-                    if m:
-                        items = json.loads(m.group(0))
-                        if isinstance(items, list):
-                            for it in items:
-                                if isinstance(it, dict):
-                                    q = str(it.get("question", "")).strip()
-                                    s_raw = it.get("search_query", "")
-                                    s = " ".join([str(x) for x in s_raw]) if isinstance(s_raw, list) else str(s_raw).strip()
-                                    if s.endswith("?") and not q.endswith("?"):
-                                        q, s = s, q
-                                    if q and s and _is_valid_q(q):
-                                        sub_questions.append(q)
-                                        sub_goals.append(s)
-                                elif isinstance(it, str) and it.strip() and _is_valid_q(it):
-                                    sub_questions.append(it.strip())
-                                    sub_goals.append(it.strip())
-                except Exception:
-                    pass
+            # Resilient line-by-line fallback if numbering was omitted
+            raw_lines = [
+                re.sub(r"^[\d\.\-\?\*\•\s]+", "", line).strip()
+                for line in llm_resp.strip().splitlines()
+                if len(line.strip()) >= 12 and not line.strip().endswith(":")
+            ]
+            if len(raw_lines) >= 2:
+                return self._extract_subgoals_from_items(raw_lines, question)
 
-            # Resilient fallback if non-JSON lines
-            if not sub_goals:
-                for line in llm_resp.strip().splitlines():
-                    l_clean = line.strip()
-                    l_lower = l_clean.lower()
-                    if any(l_lower.startswith(p) for p in ("here are", "here is", "to locate", "based on", "the following")):
-                        continue
-                    if l_clean.endswith(":"):
-                        continue
-                    cleaned = re.sub(r"^[\d\.\-\*\•\s]+", "", l_clean).strip()
-                    cleaned = re.sub(r'^(?:(?:search\s+)?query:\s*)+', '', cleaned, flags=re.IGNORECASE).strip(' "\'')
-                    if cleaned and len(cleaned.split()) >= 2 and cleaned not in sub_goals:
-                        sub_goals.append(cleaned)
-                        sub_questions.append(cleaned)
-
-        if sub_goals:
-            return sub_goals, sub_questions
         return [question], [question]
 
     @staticmethod

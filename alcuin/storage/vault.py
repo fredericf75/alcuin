@@ -86,7 +86,9 @@ class VaultConfig:
     sibling_max_per_hit: int = 2
     ast_sibling_attenuation: float = 0.72
     pre_synthesis_rerank: bool = True
-    pre_synthesis_top_k: int = 8
+    pre_synthesis_top_k: Optional[int] = None
+    subquery_synthesis: bool = True
+    subquery_top_k: int = 6
     glossary_expansion: bool = True
     glossary: Dict[str, str] = field(default_factory=dict)
 
@@ -195,8 +197,16 @@ class VaultConfig:
             pre_synthesis_rerank=bool(
                 agent_sec.get("pre_synthesis_rerank", g_agent.get("pre_synthesis_rerank", True))
             ),
-            pre_synthesis_top_k=int(
-                agent_sec.get("pre_synthesis_top_k", g_agent.get("pre_synthesis_top_k", 8))
+            pre_synthesis_top_k=(
+                int(agent_sec["pre_synthesis_top_k"])
+                if "pre_synthesis_top_k" in agent_sec
+                else (int(g_agent["pre_synthesis_top_k"]) if "pre_synthesis_top_k" in g_agent else None)
+            ),
+            subquery_synthesis=bool(
+                agent_sec.get("subquery_synthesis", g_agent.get("subquery_synthesis", True))
+            ),
+            subquery_top_k=int(
+                agent_sec.get("subquery_top_k", g_agent.get("subquery_top_k", 6))
             ),
             glossary_expansion=bool(
                 agent_sec.get("glossary_expansion", g_agent.get("glossary_expansion", True))
@@ -237,7 +247,9 @@ class VaultConfig:
             f"sibling_max_per_hit = {self.sibling_max_per_hit}",
             f"ast_sibling_attenuation = {self.ast_sibling_attenuation}",
             f"pre_synthesis_rerank = {'true' if self.pre_synthesis_rerank else 'false'}",
-            f"pre_synthesis_top_k = {self.pre_synthesis_top_k}",
+            *( [f"pre_synthesis_top_k = {self.pre_synthesis_top_k}"] if self.pre_synthesis_top_k is not None else [] ),
+            f"subquery_synthesis = {str(self.subquery_synthesis).lower()}",
+            f"subquery_top_k = {self.subquery_top_k}",
             f"glossary_expansion = {'true' if self.glossary_expansion else 'false'}",
         ]
         if self.context_headroom_tokens is not None:

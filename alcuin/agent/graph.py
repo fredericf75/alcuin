@@ -1139,6 +1139,9 @@ class ResearchAgent:
         # Context Governor & Greedy Token Budget Packing
         governor_enabled = getattr(self.vault.config, "context_governor", True)
         budget_tokens = self.get_context_governor_budget() if governor_enabled else 999999
+        # Decoupled Retrieval Budget: Allow expanded pool for multi-goal coverage when synthesis is isolated
+        if getattr(self.vault.config, "subquery_synthesis", True) and len(sub_goals) >= 2:
+            budget_tokens = max(budget_tokens, 8000)
         current_tokens = sum(int(len(e["content"]) / 4) for e in evidence_list)
         pruned_high_rel: List[Dict[str, Any]] = []
         new_chunks_count = 0
@@ -1488,12 +1491,19 @@ class ResearchAgent:
                 "confidence": confidence,
             }
 
-        # Pre-Synthesis Re-Ranking: Re-score evidence against question & sub-questions
-        evidence_pool = list(state["evidence"])
+        sub_questions = state.get("sub_questions", [])
         thought_history = list(state.get("thought_history", []))
-        if getattr(self.vault.config, "pre_synthesis_rerank", True) and len(evidence_pool) > 1:
+        use_subquery_synthesis = (
+            getattr(self.vault.config, "subquery_synthesis", True)
+            and bool(sub_questions)
+            and len(sub_questions) >= 2
+        )
+
+        evidence_pool = list(state["evidence"])
+
+        # Pre-Synthesis Re-Ranking: Active only for monolithic fallback synthesis
+        if not use_subquery_synthesis and getattr(self.vault.config, "pre_synthesis_rerank", True) and len(evidence_pool) > 1:
             t_rerank_start = time.perf_counter()
-            sub_questions = state.get("sub_questions", [])
             scoring_queries = [state["question"]] + [q for q in sub_questions if q != state["question"]]
             try:
                 query_vecs = self.storage.embedder.get_embeddings_batch(scoring_queries)
@@ -1519,7 +1529,8 @@ class ResearchAgent:
                         scores[qi] = cos
                     chunk_scores_per_query.append((e, scores))
 
-                top_k = getattr(self.vault.config, "pre_synthesis_top_k", 8)
+                cfg_top_k = getattr(self.vault.config, "pre_synthesis_top_k", None)
+                top_k = int(cfg_top_k) if cfg_top_k is not None else len(evidence_pool)
 
                 # Fair-share selection across discrete sub-questions
                 target_sub_queries = [q for q in sub_questions if q != state["question"]]
@@ -1557,83 +1568,217 @@ class ResearchAgent:
             except Exception:
                 pass
 
-        # Budget evidence to fit model context window (coupled to calibrated Context Governor)
-        max_evidence_chars = self.get_context_governor_budget() * 4
-        budgeted_chunks = []
-        synthesis_evidence = []
-        total_chars = 0
+        if use_subquery_synthesis:
+            # Sub-query isolated synthesis partitions directly from the FULL admitted evidence pool,
+            # unconstrained by monolithic single-prompt top-K caps.
+            full_admitted_pool = list(state["evidence"])
+            subquery_top_k = getattr(self.vault.config, "subquery_top_k", 6)
+            sub_q_embeddings = {}
+            try:
+                sub_q_vecs = self.storage.embedder.get_embeddings_batch(sub_questions)
+                for q, vec in zip(sub_questions, sub_q_vecs):
+                    sub_q_embeddings[q] = vec
+            except Exception:
+                pass
 
-        for e in evidence_pool:
-            chunk_repr = f"[{e['breadcrumbs']} ({e['file_path']})]\n{e['content'].strip()}"
-            if total_chars + len(chunk_repr) > max_evidence_chars and budgeted_chunks:
-                break
-            budgeted_chunks.append(chunk_repr)
-            synthesis_evidence.append(e)
-            total_chars += len(chunk_repr) + 2
+            chunk_ids_set = {e["id"] for e in full_admitted_pool if "id" in e}
+            chunk_vectors = {}
+            if chunk_ids_set:
+                try:
+                    where_clause = f"id IN {tuple(chunk_ids_set)}" if len(chunk_ids_set) > 1 else f"id = '{next(iter(chunk_ids_set))}'"
+                    rows = self.storage.table.search().where(where_clause).to_list()
+                    chunk_vectors = {r["id"]: r["vector"] for r in rows if r["id"] in chunk_ids_set}
+                except Exception:
+                    pass
 
-        evidence_text = "\n\n---\n\n".join(budgeted_chunks)
+            sub_answers = []
+            accumulator = []
+            all_used_chunks = []
+            truncation_alert = None
+            max_evidence_chars = self.get_context_governor_budget() * 4
 
-        sys_prompt = (
-            "You are Alcuin, an autonomous knowledge assistant. Answer the user's question directly and concisely "
-            "based strictly on the provided evidence.\n"
-            "If multiple questions or core tasks are identified, address each in a separate numbered response.\n"
-            "Factual & Biographical Equivalence: Treat standard factual and biographical equivalents as answering the question (e.g., 'Date of Birth', 'DOB', or 'born on' directly answers 'birthday'; full dates or ISO timestamps satisfy temporal queries).\n"
-            "State the exact answer, key metric, deadline, or entity directly before providing explanatory context.\n"
-            "When citing tables, schedules, deadlines, or fine structures, transcribe the row values and numbers verbatim.\n"
-            "If the evidence does not contain the answer, state clearly and concisely that the information is not found."
-        )
+            sub_sys_prompt = (
+                "You are Alcuin, an autonomous knowledge assistant. Answer the user's specific target question directly and concisely "
+                "based strictly on the provided evidence.\n"
+                "Factual & Biographical Equivalence: Treat standard factual and biographical equivalents as answering the question.\n"
+                "State the exact finding, number, rule, or prohibition directly in the first sentence. 2-3 sentences max. Zero conversational filler.\n"
+                "When citing tables, schedules, deadlines, or fine structures, transcribe the row values and numbers verbatim.\n"
+                "If the evidence does not contain the answer, state clearly and concisely that the information is not found."
+            )
 
-        sub_questions = state.get("sub_questions", [])
-        thought_history = list(state.get("thought_history", []))
-        truncation_alert = None
+            for i, sub_q in enumerate(sub_questions):
+                q_num = i + 1
+                q_vec = sub_q_embeddings.get(sub_q)
+                if q_vec and chunk_vectors:
+                    q_norm = math.sqrt(sum(x * x for x in q_vec)) or 1.0
+                    def _score(e, _qv=q_vec, _qn=q_norm):
+                        cv = chunk_vectors.get(e.get("id"))
+                        if cv is None:
+                            return 0.0
+                        cn = math.sqrt(sum(x * x for x in cv)) or 1.0
+                        return sum(a * b for a, b in zip(cv, _qv)) / (cn * _qn)
+                    dedicated = sorted(full_admitted_pool, key=_score, reverse=True)[:subquery_top_k]
+                else:
+                    q_tokens = set(re.findall(r"\w+", sub_q.lower()))
+                    def _lex_score(e, _qt=q_tokens):
+                        ct = set(re.findall(r"\w+", e.get("content", "").lower()))
+                        return len(_qt & ct)
+                    dedicated = sorted(full_admitted_pool, key=_lex_score, reverse=True)[:subquery_top_k]
 
-        if sub_questions and len(sub_questions) >= 2:
-            questions_text = "\n".join([f"{i+1}. {q}" for i, q in enumerate(sub_questions)])
-            user_prompt = (
-                f"Target Questions to Address:\n{questions_text}\n\n"
-                f"Evidence:\n{evidence_text}\n\n"
-                "Instructions: Answer each Target Question individually in numbered order. State exact numbers, answers, or requirements directly:\n"
+                if len(dedicated) < 2 and len(full_admitted_pool) >= 2:
+                    dedicated = list(full_admitted_pool)[:2]
+
+                sub_budgeted_chunks = []
+                sub_chars = 0
+                for e in dedicated:
+                    chunk_repr = f"[{e.get('breadcrumbs', '')} ({e.get('file_path', '')})]\n{e.get('content', '').strip()}"
+                    if sub_chars + len(chunk_repr) > max_evidence_chars and sub_budgeted_chunks:
+                        break
+                    sub_budgeted_chunks.append(chunk_repr)
+                    sub_chars += len(chunk_repr) + 2
+                sub_evidence_text = "\n\n---\n\n".join(sub_budgeted_chunks)
+
+                prompt_parts = []
+                if accumulator:
+                    prompt_parts.append("Prior Findings in this Inquiry:\n" + "\n".join(f"- {f}" for f in accumulator))
+                prompt_parts.append(f"Target Question to Address:\n{sub_q}")
+                prompt_parts.append(f"Evidence:\n{sub_evidence_text}")
+                prompt_parts.append("Instructions: State the exact finding or requirement directly:")
+                sub_user_prompt = "\n\n".join(prompt_parts)
+
+                try:
+                    try:
+                        res = self.llm.chat(sub_sys_prompt, sub_user_prompt, return_metadata=True)
+                    except TypeError:
+                        res = self.llm.chat(sub_sys_prompt, sub_user_prompt)
+                except Exception as e:
+                    logger.warning(f"[SUBQUERY SYNTHESIS] Sub-question {q_num} failed: {e}")
+                    res = ("Information not found in evidence.", {})
+
+                if isinstance(res, tuple):
+                    sub_ans, meta = res
+                else:
+                    sub_ans, meta = res, {}
+
+                if meta.get("thinking"):
+                    thought_history.append(f"[SUBQUERY_{q_num}_LATENT_THOUGHT]\n{meta['thinking']}")
+
+                if meta.get("truncated"):
+                    finish_reason = meta.get("finish_reason") or "length"
+                    truncation_alert = (
+                        "[GENERATION_TRUNCATION_ALERT]\n"
+                        f"Warning: Answer generation for sub-question {q_num} was halted because the model reached its context token ceiling (finish_reason: {finish_reason})."
+                    )
+                    thought_history.append(truncation_alert)
+
+                sub_ans_clean = (sub_ans or "").strip()
+
+                if sub_ans_clean:
+                    accumulator.append(f"{sub_q} -> {sub_ans_clean}")
+                sub_answers.append((q_num, sub_q, sub_ans_clean))
+                all_used_chunks.extend(dedicated)
+
+            assembled_items = []
+            for q_num, sq, s_ans in sub_answers:
+                clean = s_ans.strip()
+                if not clean:
+                    continue
+                prefix_match = re.match(rf"^(?:[#*]*\s*)?(?:Question\s*)?{q_num}[\.\):]\s*", clean, re.IGNORECASE)
+                if prefix_match:
+                    clean = clean[prefix_match.end():].strip()
+                if clean:
+                    assembled_items.append(f"{q_num}. {clean}")
+
+            answer = "\n\n".join(assembled_items)
+
+            seen_cids = set()
+            synthesis_evidence = []
+            for c in all_used_chunks:
+                cid = c.get("id") or c.get("content")
+                if cid not in seen_cids:
+                    seen_cids.add(cid)
+                    synthesis_evidence.append(c)
+
+            thought_history.append(
+                f"[SUBQUERY_SYNTHESIS] Successfully synthesized {len(sub_questions)} sub-questions with accumulator chaining."
             )
         else:
-            user_prompt = (
-                f"Question: {state['question']}\n\n"
-                f"Evidence:\n{evidence_text}\n\n"
-                "Direct Answer:"
+            # Monolithic fallback path for single questions or when subquery synthesis is disabled
+            max_evidence_chars = self.get_context_governor_budget() * 4
+            budgeted_chunks = []
+            synthesis_evidence = []
+            total_chars = 0
+
+            for e in evidence_pool:
+                chunk_repr = f"[{e['breadcrumbs']} ({e['file_path']})]\n{e['content'].strip()}"
+                if total_chars + len(chunk_repr) > max_evidence_chars and budgeted_chunks:
+                    break
+                budgeted_chunks.append(chunk_repr)
+                synthesis_evidence.append(e)
+                total_chars += len(chunk_repr) + 2
+
+            evidence_text = "\n\n---\n\n".join(budgeted_chunks)
+
+            sys_prompt = (
+                "You are Alcuin, an autonomous knowledge assistant. Answer the user's question directly and concisely "
+                "based strictly on the provided evidence.\n"
+                "If multiple questions or core tasks are identified, address each in a separate numbered response.\n"
+                "Factual & Biographical Equivalence: Treat standard factual and biographical equivalents as answering the question (e.g., 'Date of Birth', 'DOB', or 'born on' directly answers 'birthday'; full dates or ISO timestamps satisfy temporal queries).\n"
+                "State the exact answer, key metric, deadline, or entity directly before providing explanatory context.\n"
+                "When citing tables, schedules, deadlines, or fine structures, transcribe the row values and numbers verbatim.\n"
+                "If the evidence does not contain the answer, state clearly and concisely that the information is not found."
             )
 
-        try:
-            res = self.llm.chat(sys_prompt, user_prompt, return_metadata=True)
-        except TypeError:
-            res = self.llm.chat(sys_prompt, user_prompt)
-        if isinstance(res, tuple):
-            answer, meta = res
-        else:
-            answer, meta = res, {}
+            truncation_alert = None
 
-        if meta.get("thinking"):
-            thought_history.append(f"[LATENT_THOUGHT_TRACE]\n{meta['thinking']}")
-
-        if meta.get("truncated"):
-            finish_reason = meta.get("finish_reason") or "length"
-            truncation_alert = (
-                "[GENERATION_TRUNCATION_ALERT]\n"
-                f"Warning: Answer generation was halted because the model reached its context token ceiling (finish_reason: {finish_reason}).\n"
-                "The synthesized answer is incomplete.\n"
-                "Actionable Guidance: Sizing up the model context window or increasing context headroom is empirically justified."
-            )
-            thought_history.append(truncation_alert)
-            if answer:
-                answer = f"{answer}\n\n{truncation_alert}"
+            if sub_questions and len(sub_questions) >= 2:
+                questions_text = "\n".join([f"{i+1}. {q}" for i, q in enumerate(sub_questions)])
+                user_prompt = (
+                    f"Target Questions to Address:\n{questions_text}\n\n"
+                    f"Evidence:\n{evidence_text}\n\n"
+                    "Instructions: Answer each Target Question individually in numbered order. State exact numbers, answers, or requirements directly:\n"
+                )
             else:
-                answer = f"The model ran out of tokens before generating an answer.\n\n{truncation_alert}"
+                user_prompt = (
+                    f"Question: {state['question']}\n\n"
+                    f"Evidence:\n{evidence_text}\n\n"
+                    "Direct Answer:"
+                )
 
-        if not answer:
-            # Concise fallback if model endpoint is unreachable
-            top_evidence = state["evidence"][0]["content"].strip()[:400] if state["evidence"] else "No evidence."
-            answer = (
-                "Could not reach LLM for synthesis. Relevant excerpt:\n\n"
-                f"> {top_evidence}..."
-            )
+            try:
+                res = self.llm.chat(sys_prompt, user_prompt, return_metadata=True)
+            except TypeError:
+                res = self.llm.chat(sys_prompt, user_prompt)
+            if isinstance(res, tuple):
+                answer, meta = res
+            else:
+                answer, meta = res, {}
+
+            if meta.get("thinking"):
+                thought_history.append(f"[LATENT_THOUGHT_TRACE]\n{meta['thinking']}")
+
+            if meta.get("truncated"):
+                finish_reason = meta.get("finish_reason") or "length"
+                truncation_alert = (
+                    "[GENERATION_TRUNCATION_ALERT]\n"
+                    f"Warning: Answer generation was halted because the model reached its context token ceiling (finish_reason: {finish_reason}).\n"
+                    "The synthesized answer is incomplete.\n"
+                    "Actionable Guidance: Sizing up the model context window or increasing context headroom is empirically justified."
+                )
+                thought_history.append(truncation_alert)
+                if answer:
+                    answer = f"{answer}\n\n{truncation_alert}"
+                else:
+                    answer = f"The model ran out of tokens before generating an answer.\n\n{truncation_alert}"
+
+            if not answer:
+                # Concise fallback if model endpoint is unreachable
+                top_evidence = state["evidence"][0]["content"].strip()[:400] if state["evidence"] else "No evidence."
+                answer = (
+                    "Could not reach LLM for synthesis. Relevant excerpt:\n\n"
+                    f"> {top_evidence}..."
+                )
+
 
         # Output Governor (SPEC-017): Clipped Output Completeness Audit
         unaddressed_indices = []

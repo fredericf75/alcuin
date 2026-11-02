@@ -1545,23 +1545,45 @@ class ResearchAgent:
                 "If the evidence does not contain the answer, state clearly and concisely that the information is not found."
             )
 
+            stop_words = {
+                "the", "a", "an", "is", "are", "was", "were", "what", "which", "who", "whom",
+                "how", "many", "much", "when", "where", "why", "in", "on", "at", "to", "for",
+                "of", "with", "by", "from", "and", "or", "not", "does", "do", "did", "can",
+                "could", "should", "would", "be", "been", "being", "have", "has", "had",
+                "under", "per", "their", "our", "its", "any", "all", "each", "both"
+            }
+
             for i, sub_q in enumerate(sub_questions):
                 q_num = i + 1
+                q_tokens = set(re.findall(r"\w+", sub_q.lower()))
+                sub_content_tokens = q_tokens - stop_words
                 q_vec = sub_q_embeddings.get(sub_q)
                 if q_vec and chunk_vectors:
                     q_norm = math.sqrt(sum(x * x for x in q_vec)) or 1.0
-                    def _score(e, _qv=q_vec, _qn=q_norm):
+                    def _score(e, _qv=q_vec, _qn=q_norm, _st=sub_content_tokens):
+                        doc_title = (e.get("document_title") or "").lower()
+                        if not doc_title:
+                            doc_title = os.path.splitext(os.path.basename(e.get("file_path") or ""))[0].replace("_", " ").lower()
+                        doc_tokens = set(re.findall(r"\w+", doc_title)) - stop_words
+                        overlap = len(_st & doc_tokens)
+                        affinity = min(0.25, 0.08 * overlap)
+
                         cv = chunk_vectors.get(e.get("id"))
                         if cv is None:
-                            return 0.0
+                            return affinity
                         cn = math.sqrt(sum(x * x for x in cv)) or 1.0
-                        return sum(a * b for a, b in zip(cv, _qv)) / (cn * _qn)
+                        cosine = sum(a * b for a, b in zip(cv, _qv)) / (cn * _qn)
+                        return cosine + affinity
                     dedicated = sorted(full_admitted_pool, key=_score, reverse=True)[:subquery_top_k]
                 else:
-                    q_tokens = set(re.findall(r"\w+", sub_q.lower()))
-                    def _lex_score(e, _qt=q_tokens):
+                    def _lex_score(e, _qt=q_tokens, _st=sub_content_tokens):
                         ct = set(re.findall(r"\w+", e.get("content", "").lower()))
-                        return len(_qt & ct)
+                        doc_title = (e.get("document_title") or "").lower()
+                        if not doc_title:
+                            doc_title = os.path.splitext(os.path.basename(e.get("file_path") or ""))[0].replace("_", " ").lower()
+                        doc_tokens = set(re.findall(r"\w+", doc_title)) - stop_words
+                        overlap = len(_st & doc_tokens)
+                        return len(_qt & ct) + (2 * overlap)
                     dedicated = sorted(full_admitted_pool, key=_lex_score, reverse=True)[:subquery_top_k]
 
                 if len(dedicated) < 2 and len(full_admitted_pool) >= 2:

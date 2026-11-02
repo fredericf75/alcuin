@@ -137,3 +137,57 @@ def test_cli_evidence_flags_and_json(cli_env, monkeypatch):
     assert "final_answer" in data_both
     assert "evidence" in data_both
     assert len(data_both["evidence"]) == 1
+
+
+def test_cli_aliases_and_status(cli_env, monkeypatch):
+    runner, tmp_path = cli_env
+    vault_path = tmp_path / "test_vault"
+    vault_path.mkdir()
+
+    # Add doc
+    doc = vault_path / "statute.md"
+    doc.write_text("# Chapter 10\n\nOvernight staff must remain awake.", encoding="utf-8")
+
+    # Init vault
+    runner.invoke(cli, ["init", str(vault_path), "--name", "statutes"])
+
+    # Mock ResearchAgent.stream_research
+    mock_evidence = [{
+        "chunk_id": "statute.md#0",
+        "file_path": "statute.md",
+        "section_heading": "Chapter 10",
+        "text": "Overnight staff must remain awake.",
+    }]
+
+    def mock_stream(self, question, evidence_only=False):
+        yield "retrieve", {"evidence": mock_evidence, "thought_history": ["Found 1 doc"]}
+        if not evidence_only:
+            yield "synthesize", {
+                "final_answer": "Staff must be awake.",
+                "confidence": 0.95,
+                "sources": ["statute.md"],
+                "evidence": mock_evidence,
+            }
+
+    monkeypatch.setattr(ResearchAgent, "stream_research", mock_stream)
+
+    # 1. Test 'ask' alias
+    res_ask = runner.invoke(cli, ["ask", "-v", "statutes", "can staff sleep"])
+    assert res_ask.exit_code == 0
+    assert "Staff must be awake." in res_ask.output
+
+    # 2. Test 'query' alias
+    res_query = runner.invoke(cli, ["query", "-v", "statutes", "can staff sleep"])
+    assert res_query.exit_code == 0
+    assert "Staff must be awake." in res_query.output
+
+    # 3. Test 'status' command
+    res_status = runner.invoke(cli, ["status", "-v", "statutes"])
+    assert res_status.exit_code == 0
+    assert "Alcuin System Status" in res_status.output
+    assert "statutes" in res_status.output
+
+    # 4. Test 'doctor' alias
+    res_doctor = runner.invoke(cli, ["doctor", "-v", "statutes"])
+    assert res_doctor.exit_code == 0
+    assert "Alcuin System Status" in res_doctor.output

@@ -19,7 +19,8 @@ Alcuin is built on four core architectural principles:
 
 ### System Requirements
 * **Python**: 3.11 or higher
-* **Local LLM Engine**: [Ollama](https://ollama.com/) (recommended for local offline operation)
+* **Local LLM Engine**: [Ollama](https://ollama.com/) or any OpenAI-compatible inference server ([OpenVINO GenAI](https://github.com/openvinotoolkit/openvino.genai), [vLLM](https://github.com/vllm-project/vllm), [llama.cpp](https://github.com/ggerganov/llama.cpp), or [LM Studio](https://lmstudio.ai/))
+* **Remote Fallback (Optional)**: [OpenRouter](https://openrouter.ai/) or Google AI Studio
 * **OCR Support (Optional)**: [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) for extracting scanned PDFs, images, and physical documents
 
 ### Installing Dependencies
@@ -43,17 +44,27 @@ winget install UB-Mannheim.TesseractOCR
 
 ---
 
-### Pulling Recommended Ollama Models
+### Local Inference Engines & Model Setup
 
-For local operation, pull the embedding model and at least one local reasoning model:
+Alcuin is backend-agnostic and connects to any local or hosted LLM server.
 
+#### Option A: Ollama (Default, Zero-Config)
 ```bash
-# Recommended embedding model (768-dimensional dense vectors, fast & accurate)
+# Recommended embedding model (768-dimensional dense vectors)
 ollama pull nomic-embed-text
 
-# Recommended default local reasoning models
-ollama pull llama3.2:3b     # Ultra-fast, lightweight (requires ~2GB VRAM)
-ollama pull qwen2.5:7b      # High-reasoning local model (requires ~5GB VRAM)
+# Recommended reasoning models
+ollama pull llama3.2:3b     # Ultra-fast, lightweight (~2GB VRAM)
+ollama pull llama3.1:8b      # Robust general reasoning (~5.5GB VRAM)
+ollama pull deepseek-r1:14b  # Deep regulatory & statutory synthesis (~10GB VRAM)
+```
+
+#### Option B: OpenVINO GenAI / vLLM / OpenAI-Compatible Endpoints
+Alcuin natively talks to local OpenAI-compatible endpoints:
+```bash
+# Set environment variables or configure vault config.toml
+export ALCUIN_ENDPOINT="http://127.0.0.1:8000/v1"
+export ALCUIN_MODEL="deepseek-r1:14b"
 ```
 
 ---
@@ -160,15 +171,26 @@ alcuin index --vault aia_vault
 
 ## 4. Autonomous Research Engine
 
-Alcuin's core capability is multi-hop agentic research across your notes.
+Alcuin's core capability is multi-hop agentic research across your notes. You can invoke research using `alcuin ask`, `alcuin query`, `alcuin research`, or bare arguments:
 
 ```bash
-# Direct natural language question
+# Direct inquiry with 'ask' or 'query'
+alcuin ask "What are the decibel noise limits between 9 PM and 2 AM?"
+
+# Bare natural language question
 alcuin "What are the decibel noise limits between 9 PM and 2 AM?"
 
-# Multi-clause or multi-part inquiry
-alcuin "Under the construction agreement, what is the notice deadline for differing site conditions and who acts as the initial decision maker?"
+# Multi-clause statutory or contract inquiry
+alcuin query "Under the construction agreement, what is the notice deadline for differing site conditions and who acts as the initial decision maker?"
 ```
+
+### Subquery-Isolated Synthesis (Anti-Contamination)
+When presented with a multi-part question (e.g., asking about roosters, coop setbacks, and fine amounts in a single prompt), naive RAG architectures suffer from *context contamination*—the LLM conflates clauses from different sections.
+
+Alcuin eliminates this via **Subquery-Isolated Synthesis**:
+1. **Syntactic Decomposition**: Automatically extracts atomic sub-goals (e.g. Sub-question 1: Hen count; Sub-question 2: Coop setback; Sub-question 3: Civil penalty).
+2. **Targeted Evidence Admission**: Gathers and isolates evidentiary chunks strictly relevant to each sub-question.
+3. **Harmonized Synthesis**: Synthesizes accurate, cited answers for each sub-question independently before assembling the final coherent brief.
 
 ### Research Options & CLI Flags
 
@@ -420,7 +442,44 @@ archive_dir = "archive"
 
 ---
 
-## 10. Troubleshooting & Diagnostics
+## 9. System Health & Diagnostics (`alcuin status` / `alcuin doctor`)
+
+Before or during research, you can verify your vault integrity and model connectivity with a single command:
+
+```bash
+alcuin status
+# or alias
+alcuin doctor
+```
+
+This audits and outputs an immediate diagnostic panel:
+* **Vault Status**: Path, registered status, and total tracked markdown notes.
+* **Vector Store**: LanceDB table health and active chunk count.
+* **Embedding Model**: Active embedding model and endpoint reachability.
+* **Model Endpoint**: Real-time roundtrip latency (ping in milliseconds) to your Ollama or OpenVINO daemon.
+* **Reasoning Model**: Verifies whether your configured model is loaded and ready, and lists other models available on the endpoint.
+* **Context Budget**: Active context window and generation headroom token limits.
+
+Target any specific vault with `-v`:
+```bash
+alcuin status -v /path/to/vault
+```
+
+---
+
+## 10. Hardware Sizing & Local Model Selection Guide
+
+Selecting the right local model depends on your hardware and reasoning requirements:
+
+| Model Class | Parameters | Typical VRAM | Strengths & Best Use Cases |
+| :--- | :--- | :--- | :--- |
+| **Lightweight** | 3B (e.g. `Llama-3.2-3B`) | ~2 GB | Ultra-fast factual lookups, single-document entity search, low-power edge machines. |
+| **Balanced** | 8B (e.g. `llama3.1:8b`, `qwen3:8b`, `deepseek-r1:8b`) | ~5–8 GB | Multi-hop graph traversal, cross-document comparison, everyday technical research. |
+| **Frontier Reasoning** | 14B (e.g. `deepseek-r1:14b`, `qwen3-14b`) | ~10–14 GB | Complex statutory reconciliation, conflicting regulatory fee schedules, multi-party contract disputes. |
+
+---
+
+## 11. Troubleshooting & Diagnostics
 
 ### Model Not Found Error (`ModelNotFoundError`)
 If you specify a model name that is mistyped or not pulled in Ollama (e.g. `--model llama3`), Alcuin automatically connects to your endpoint, displays an error panel, and lists all available models currently installed:

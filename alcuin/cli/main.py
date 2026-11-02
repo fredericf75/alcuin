@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import click
+import requests
+import time
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -132,6 +134,57 @@ def format_evidence_dossier(chunks: List[Dict[str, Any]]) -> str:
     lines.append("=" * 80)
     return "\n".join(lines)
 
+
+
+def check_endpoint_health(endpoint: str, expected_model: str = "") -> Dict[str, Any]:
+    """Test model endpoint connectivity, measure latency, and list available models."""
+    ep_clean = endpoint.rstrip("/")
+    if "/v1" in ep_clean or ep_clean.endswith("/v1"):
+        url = f"{ep_clean}/models"
+    else:
+        url = f"{ep_clean}/api/tags"
+
+    start_t = time.perf_counter()
+    try:
+        resp = requests.get(url, timeout=3.0)
+        elapsed_ms = (time.perf_counter() - start_t) * 1000
+        if resp.status_code == 200:
+            data = resp.json()
+            models: List[str] = []
+            if "data" in data and isinstance(data["data"], list):
+                models = [m.get("id", "") for m in data["data"] if isinstance(m, dict)]
+            elif "models" in data and isinstance(data["models"], list):
+                models = [m.get("name", "") for m in data["models"] if isinstance(m, dict)]
+
+            model_found = False
+            if expected_model:
+                exp_lower = expected_model.lower()
+                model_found = any(exp_lower in m.lower() for m in models)
+
+            return {
+                "status": "online",
+                "latency_ms": elapsed_ms,
+                "models": models,
+                "model_found": model_found,
+                "error": None,
+            }
+        else:
+            return {
+                "status": "error",
+                "latency_ms": elapsed_ms,
+                "models": [],
+                "model_found": False,
+                "error": f"HTTP {resp.status_code}",
+            }
+    except Exception as e:
+        elapsed_ms = (time.perf_counter() - start_t) * 1000
+        return {
+            "status": "offline",
+            "latency_ms": elapsed_ms,
+            "models": [],
+            "model_found": False,
+            "error": str(e),
+        }
 
 @cli.command(
     name="research",
@@ -280,12 +333,16 @@ def research_cmd(
         console.print("\n")
         console.print(format_evidence_dossier(chunks))
 
-    if verbose:
-        footer = f"\n[dim]Confidence: {int(confidence * 100)}%"
-        if sources:
-            footer += f" | Sources: {', '.join(sources)}"
-        footer += "[/dim]"
-        console.print(footer)
+    footer_elements = []
+    if chunks:
+        footer_elements.append(f"Evidence: {len(chunks)} chunks")
+    if sources:
+        footer_elements.append(f"Sources: {', '.join(sources)}")
+    if confidence:
+        footer_elements.append(f"Confidence: {int(confidence * 100)}%")
+
+    if footer_elements:
+        console.print(f"\n[dim]{' • '.join(footer_elements)}[/dim]")
 
 
 @cli.command(short_help="Initialize a new in-situ vault in target directory")
@@ -668,6 +725,76 @@ def serve(host: str, port: int):
     console.print(f"[bold green]Starting Alcuin Server at http://{host}:{port}[/bold green]")
     console.print("[dim]Background periodic indexing daemon active. Press Ctrl+C to stop.[/dim]")
     uvicorn.run("alcuin.api.server:app", host=host, port=port, reload=False)
+
+
+
+
+@cli.command(
+    name="status",
+    short_help="Display vault statistics, vector index health, and model endpoint status",
+)
+@click.option("-v", "--vault", "vault_target", help="Vault name or directory path")
+def status_cmd(vault_target: Optional[str]):
+    """Audit and display active vault health, index statistics, and LLM endpoint reachability."""
+    vault = resolve_or_prompt_vault(target=vault_target)
+    storage = VaultStorage(vault)
+
+    manifest = storage.load_manifest()
+    tracked_files = manifest.get("files", {})
+    file_count = len(tracked_files)
+
+    try:
+        tbl = storage._get_or_create_table()
+        chunk_count = len(tbl)
+        index_status = f"[bold green]Healthy[/bold green] ({chunk_count:,} chunks in LanceDB)"
+    except Exception as e:
+        index_status = f"[bold red]Index Error:[/bold red] {e}"
+
+    ep = vault.config.model_endpoint or "http://127.0.0.1:8000/v1"
+    model_name = vault.config.model_name or "default"
+    health = check_endpoint_health(ep, model_name)
+
+    if health["status"] == "online":
+        latency_str = f"{health['latency_ms']:.1f}ms"
+        ep_disp = f"[bold green]Online[/bold green] [dim]({latency_str})[/dim] at [cyan]{ep}[/cyan]"
+        if health["model_found"]:
+            model_disp = f"[bold green]Available[/bold green] ([bold]{model_name}[/bold])"
+        else:
+            model_disp = f"[bold yellow]Not Loaded[/bold yellow] ([dim]configured:[/dim] {model_name})"
+    else:
+        err = health["error"] or "Connection refused"
+        ep_disp = f"[bold red]Offline / Unreachable[/bold red] [dim]({err})[/dim] at {ep}"
+        model_disp = "[dim]Unknown (endpoint offline)[/dim]"
+
+    table = Table(title=f"Alcuin System Status — Vault: [bold]{vault.name}[/bold]", show_header=False, box=None)
+    table.add_column("Category", style="bold cyan", width=20)
+    table.add_column("Details")
+
+    table.add_row("Vault Path", str(vault.root_path))
+    table.add_row("Vault Status", "[bold green]Registered[/bold green]" if vault.name in VaultRegistry.list_vaults() else "[yellow]Unregistered Directory[/yellow]")
+    table.add_row("Tracked Documents", f"{file_count:,} markdown notes")
+    table.add_row("Vector Store", index_status)
+    table.add_row("Embedding Model", f"{storage.embedder.model} ([dim]{storage.embedder.endpoint}[/dim])")
+    table.add_row("Model Endpoint", ep_disp)
+    table.add_row("Reasoning Model", model_disp)
+    ctx_win = vault.config.context_window or 16384
+    headroom = vault.config.context_headroom_tokens or 2000
+    table.add_row("Context Window", f"{ctx_win:,} tokens (Headroom: {headroom:,})")
+
+    console.print(Panel(table, border_style="cyan"))
+
+    if health["status"] == "online" and health["models"]:
+        model_sample = health["models"][:6]
+        disp_sample = ", ".join(f"[bold]{m}[/bold]" if m.lower() == model_name.lower() else m for m in model_sample)
+        if len(health["models"]) > 6:
+            disp_sample += f" [dim](+{len(health['models']) - 6} more)[/dim]"
+        console.print(f"[dim]Available on endpoint:[/dim] {disp_sample}\n")
+
+
+# Register first-class subcommands & aliases
+cli.add_command(research_cmd, name="ask")
+cli.add_command(research_cmd, name="query")
+cli.add_command(status_cmd, name="doctor")
 
 
 if __name__ == "__main__":

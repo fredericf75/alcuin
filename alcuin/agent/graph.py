@@ -1514,11 +1514,11 @@ class ResearchAgent:
             subquery_top_k = getattr(self.vault.config, "subquery_top_k", 6)
             sub_q_embeddings = {}
             try:
-                sub_q_vecs = self.storage.embedder.get_embeddings_batch(sub_questions)
+                sub_q_vecs = self.storage.embedder.get_embeddings_batch(sub_questions, is_query=True)
                 for q, vec in zip(sub_questions, sub_q_vecs):
                     sub_q_embeddings[q] = vec
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[SUBQUERY SYNTHESIS] Failed to embed sub-questions: {e}")
 
             chunk_ids_set = {e["id"] for e in full_admitted_pool if "id" in e}
             chunk_vectors = {}
@@ -1527,8 +1527,8 @@ class ResearchAgent:
                     where_clause = f"id IN {tuple(chunk_ids_set)}" if len(chunk_ids_set) > 1 else f"id = '{next(iter(chunk_ids_set))}'"
                     rows = self.storage.table.search().where(where_clause).to_list()
                     chunk_vectors = {r["id"]: r["vector"] for r in rows if r["id"] in chunk_ids_set}
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"[SUBQUERY SYNTHESIS] Failed to load chunk vectors: {e}")
 
             sub_answers = []
             accumulator = []
@@ -1566,14 +1566,17 @@ class ResearchAgent:
                             doc_title = os.path.splitext(os.path.basename(e.get("file_path") or ""))[0].replace("_", " ").lower()
                         doc_tokens = set(re.findall(r"\w+", doc_title)) - stop_words
                         overlap = len(_st & doc_tokens)
-                        affinity = min(0.25, 0.08 * overlap)
+                        affinity = min(0.15, 0.05 * overlap)
+
+                        c_tokens = set(re.findall(r"\w+", e.get("content", "").lower()))
+                        kw_overlap = (len(_st & c_tokens) / max(len(_st), 1)) if _st else 0.0
 
                         cv = chunk_vectors.get(e.get("id"))
                         if cv is None:
-                            return affinity
+                            return kw_overlap + affinity
                         cn = math.sqrt(sum(x * x for x in cv)) or 1.0
                         cosine = sum(a * b for a, b in zip(cv, _qv)) / (cn * _qn)
-                        return cosine + affinity
+                        return (0.5 * cosine) + (0.5 * kw_overlap) + affinity
                     dedicated = sorted(full_admitted_pool, key=_score, reverse=True)[:subquery_top_k]
                 else:
                     def _lex_score(e, _qt=q_tokens, _st=sub_content_tokens):
@@ -1620,7 +1623,6 @@ class ResearchAgent:
                     sub_ans, meta = res
                 else:
                     sub_ans, meta = res, {}
-
                 if meta.get("thinking"):
                     thought_history.append(f"[SUBQUERY_{q_num}_LATENT_THOUGHT]\n{meta['thinking']}")
 
@@ -1634,7 +1636,13 @@ class ResearchAgent:
 
                 sub_ans_clean = (sub_ans or "").strip()
 
-                if sub_ans_clean:
+                negative_refusal_patterns = [
+                    "not found", "not present", "not disclosed", "not provided",
+                    "no information", "cannot be found", "not mention"
+                ]
+                is_refusal = any(neg in sub_ans_clean.lower() for neg in negative_refusal_patterns)
+
+                if sub_ans_clean and not is_refusal:
                     accumulator.append(f"{sub_q} -> {sub_ans_clean}")
                 sub_answers.append((q_num, sub_q, sub_ans_clean))
                 all_used_chunks.extend(dedicated)

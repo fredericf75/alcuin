@@ -239,6 +239,12 @@ def research_cmd(
         console.print(f"\n[dim]Using vault '[bold]{vault.name}[/bold]' ({vault.root_path})[/dim]")
         model_name_disp = vault.config.model_name or "default"
         console.print(f"[dim]Model: [bold]{model_name_disp}[/bold] | Endpoint: {vault.config.model_endpoint}[/dim]")
+        top_k = getattr(vault.config, "subquery_top_k", 6)
+        m_name = model_name_disp.lower()
+        if any(tag in m_name for tag in ["3b", "1b", "2b", "0.5b", "mini", "small", "tiny"]) and top_k > 3:
+            console.print(
+                f"[dim yellow]Advisory: '{model_name_disp}' running with subquery_top_k={top_k}. Small models may benefit from subquery_top_k=2 or 3.[/dim yellow]"
+            )
         console.print(f"[bold cyan]Researching:[/bold cyan] {query}\n")
 
     agent = ResearchAgent(vault)
@@ -789,6 +795,16 @@ def status_cmd(vault_target: Optional[str]):
         if len(health["models"]) > 6:
             disp_sample += f" [dim](+{len(health['models']) - 6} more)[/dim]"
         console.print(f"[dim]Available on endpoint:[/dim] {disp_sample}\n")
+
+    top_k = getattr(vault.config, "subquery_top_k", 6)
+    m_name = (vault.config.model_name or "").lower()
+    is_small_model = any(tag in m_name for tag in ["3b", "1b", "2b", "0.5b", "mini", "small", "tiny"])
+    if is_small_model and top_k > 3:
+        console.print(
+            f"[bold yellow]Diagnostic Advisory:[/bold yellow] Configured model '[bold]{vault.config.model_name}[/bold]' operates with 'subquery_top_k = {top_k}'.\n"
+            f"  Empirical benchmarks (SPEC-024/025) indicate <=3B models are sensitive to context noise in targeted single-clause queries.\n"
+            f"  Consider setting 'subquery_top_k = 2' or '3' in .alcuin/config.toml for noise-sensitive workloads.\n"
+        )
 
 
 # Register first-class subcommands & aliases

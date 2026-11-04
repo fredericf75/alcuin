@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import httpx
 import lancedb
 from lancedb.index import FTS
+import numpy as np
 import pyarrow as pa
 
 from alcuin.chunker.chunker import (
@@ -78,50 +79,115 @@ class IndexReport:
 
 
 class EmbeddingClient:
-    """Provides vector embeddings using OpenAI-compatible /v1/embeddings, Ollama, or deterministic fallback."""
+    """Provides vector embeddings using in-process SentenceTransformer, OpenAI-compatible /v1/embeddings, Ollama, or deterministic fallback."""
 
     def __init__(self, endpoint: str = "http://localhost:11434", model: str = "nomic-embed-text"):
         self.endpoint = endpoint.rstrip("/") if endpoint else "http://localhost:11434"
         self.model = model or "nomic-embed-text"
         self._available: Optional[bool] = None
+        self._st_model = None
+
+    def _is_inprocess(self) -> bool:
+        if os.environ.get("ALCUIN_EMBEDDING_INPROCESS", "").strip().lower() in ("1", "true", "yes"):
+            return True
+        ep = self.endpoint.lower()
+        return ep in ("local", "in-process", "inprocess")
+
+    def _get_st_model(self):
+        if self._st_model is None:
+            from sentence_transformers import SentenceTransformer
+            st_name = self.model
+            if "nomic" in st_name.lower():
+                st_name = "all-MiniLM-L6-v2"
+            self._st_model = SentenceTransformer(st_name)
+        return self._st_model
 
     def _is_openai(self) -> bool:
         ep = self.endpoint.lower()
         return ep.endswith("/v1") or ep.endswith("/embeddings") or "/v1/" in ep or ":8000" in ep
 
-    def get_embedding(self, text: str) -> List[float]:
-        res = self.get_embeddings_batch([text], batch_size=1)
+    def _format_input(self, text: str, is_query: bool = False) -> str:
+        if "nomic" in self.model.lower():
+            if text.startswith("search_query: ") or text.startswith("search_document: "):
+                return text
+            prefix = "search_query: " if is_query else "search_document: "
+            return f"{prefix}{text}"
+        return text
+
+    def get_embedding(self, text: str, is_query: bool = True) -> List[float]:
+        res = self.get_embeddings_batch([text], batch_size=1, is_query=is_query)
         if res:
             return res[0]
         return self._fallback_embedding(text)
 
     def get_embeddings_batch(
-        self, texts: List[str], batch_size: int = 16, max_retries: int = 3
+        self, texts: List[str], batch_size: int = 64, max_retries: int = 3, is_query: bool = False
     ) -> List[List[float]]:
         if not texts:
             return []
+
+        if self._is_inprocess():
+            try:
+                st = self._get_st_model()
+                self._available = True
+                results: List[List[float]] = []
+                total = len(texts)
+                t0 = time.time()
+                for i in range(0, total, batch_size):
+                    raw_batch = texts[i : i + batch_size]
+                    batch_arr = st.encode(raw_batch, batch_size=batch_size, show_progress_bar=False, normalize_embeddings=True)
+                    if batch_arr.ndim == 1:
+                        batch_arr = np.expand_dims(batch_arr, axis=0)
+                    if batch_arr.shape[1] < EMBEDDING_DIM:
+                        batch_arr = np.pad(
+                            batch_arr,
+                            ((0, 0), (0, EMBEDDING_DIM - batch_arr.shape[1])),
+                            mode="constant",
+                            constant_values=0.0,
+                        )
+                    results.extend(batch_arr.tolist())
+                    done = len(results)
+                    elapsed = time.time() - t0
+                    if total > batch_size and (done == total or (i // batch_size) % 4 == 0):
+                        rate = done / (elapsed + 1e-6)
+                        eta = (total - done) / (rate + 1e-6)
+                        print(
+                            f"  [alcuin index] {done}/{total} chunks ({done/total*100:.1f}%) | {rate:.1f} ch/s | ETA: {eta:.0f}s",
+                            flush=True,
+                        )
+                return results
+            except Exception as e:
+                raise RuntimeError(f"In-process SentenceTransformer failed: {e}") from e
+
         if self._available is False:
             return [self._fallback_embedding(t) for t in texts]
 
         results: List[List[float]] = []
         is_openai = self._is_openai()
 
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            batch_embs = None
-            last_error: Optional[Exception] = None
+        if is_openai:
+            base = self.endpoint
+            if base.endswith("/embeddings"):
+                url = base
+            elif base.endswith("/v1"):
+                url = f"{base}/embeddings"
+            else:
+                url = f"{base}/v1/embeddings"
+        else:
+            url = f"{self.endpoint}/api/embed"
 
-            for attempt in range(max_retries):
-                try:
-                    with httpx.Client(timeout=120.0) as client:
+        with httpx.Client(timeout=120.0) as client:
+            t0 = time.time()
+            total = len(texts)
+            for i in range(0, total, batch_size):
+                raw_batch = texts[i : i + batch_size]
+                batch = [self._format_input(t, is_query=is_query) for t in raw_batch] if is_openai else raw_batch
+                batch_embs = None
+                last_error: Optional[Exception] = None
+
+                for attempt in range(max_retries):
+                    try:
                         if is_openai:
-                            base = self.endpoint
-                            if base.endswith("/embeddings"):
-                                url = base
-                            elif base.endswith("/v1"):
-                                url = f"{base}/embeddings"
-                            else:
-                                url = f"{base}/v1/embeddings"
                             resp = client.post(
                                 url,
                                 json={"model": self.model, "input": batch},
@@ -140,7 +206,7 @@ class EmbeddingClient:
                                 last_error = RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
                         else:
                             resp = client.post(
-                                f"{self.endpoint}/api/embed",
+                                url,
                                 json={"model": self.model, "input": batch},
                             )
                             if resp.status_code == 200:
@@ -151,35 +217,44 @@ class EmbeddingClient:
                             else:
                                 last_error = RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
 
-                    if batch_embs and len(batch_embs) == len(batch):
-                        self._available = True
-                        break
-                    else:
-                        batch_embs = None
-                except (httpx.ConnectError, ConnectionRefusedError) as e:
-                    # Initial probe failure: mark unavailable for offline unit tests
-                    if self._available is None:
-                        self._available = False
-                        return [self._fallback_embedding(t) for t in texts]
-                    last_error = e
-                    if attempt < max_retries - 1:
-                        time.sleep(1.0 * (attempt + 1))
-                except Exception as e:
-                    last_error = e
-                    if attempt < max_retries - 1:
-                        time.sleep(1.0 * (attempt + 1))
+                        if batch_embs and len(batch_embs) == len(batch):
+                            self._available = True
+                            break
+                        else:
+                            batch_embs = None
+                    except (httpx.ConnectError, ConnectionRefusedError) as e:
+                        # Initial probe failure: mark unavailable for offline unit tests
+                        if self._available is None:
+                            self._available = False
+                            return [self._fallback_embedding(t) for t in texts]
+                        last_error = e
+                        if attempt < max_retries - 1:
+                            time.sleep(1.0 * (attempt + 1))
+                    except Exception as e:
+                        last_error = e
+                        if attempt < max_retries - 1:
+                            time.sleep(1.0 * (attempt + 1))
 
-            if batch_embs is not None:
-                results.extend(batch_embs)
-            else:
-                # If we were previously connected to a live neural model, fail loudly!
-                if self._available is True:
-                    raise RuntimeError(
-                        f"Embedding server at {self.endpoint} failed for batch of {len(batch)} chunks "
-                        f"after {max_retries} attempts: {last_error}"
-                    )
-                self._available = False
-                results.extend([self._fallback_embedding(t) for t in batch])
+                if batch_embs is not None:
+                    results.extend(batch_embs)
+                    done = len(results)
+                    elapsed = time.time() - t0
+                    if total > batch_size and (done == total or (i // batch_size) % 4 == 0):
+                        rate = done / (elapsed + 1e-6)
+                        eta = (total - done) / (rate + 1e-6)
+                        print(
+                            f"  [alcuin index] {done}/{total} chunks ({done/total*100:.1f}%) | {rate:.1f} ch/s | ETA: {eta:.0f}s",
+                            flush=True,
+                        )
+                else:
+                    # If we were previously connected to a live neural model, fail loudly!
+                    if self._available is True:
+                        raise RuntimeError(
+                            f"Embedding server at {self.endpoint} failed for batch of {len(batch)} chunks "
+                            f"after {max_retries} attempts: {last_error}"
+                        )
+                    self._available = False
+                    results.extend([self._fallback_embedding(t) for t in batch])
 
         return results
 
@@ -261,6 +336,10 @@ class VaultStorage:
         )
         self.table = self._get_or_create_table()
         self.glossary = self.load_glossary()
+
+    def embed_text(self, text: str) -> List[float]:
+        """Compute vector embedding for a single text query or sub-question."""
+        return self.embedder.get_embedding(text)
 
     def load_glossary(self) -> Dict[str, str]:
         glossary = dict(getattr(self.vault.config, "glossary", {}))

@@ -358,6 +358,10 @@ def extract_text_file(txt_path: Path) -> Tuple[str, str]:
 # Clause & Structural Boundary Parser
 # =====================================================================
 
+RE_CHAPTER = re.compile(
+    r"^(?:#+\s*)?(?:CHAPTER|Chapter)\s+([0-9IVXLCDM]+)(?:[:.\s\-\–\—]+([A-Z][A-Za-z0-9\s,'\*\-]+))?$",
+    re.IGNORECASE,
+)
 RE_ARTICLE = re.compile(
     r"^(?:#+\s*)?(?:ARTICLE|Article)\s+([0-9IVXLCDM]+)[:.\s\-–—]*(.*)$",
     re.IGNORECASE,
@@ -395,12 +399,19 @@ def identify_heading(line: str) -> Optional[Tuple[int, str]]:
         title = m_md.group(2).strip()
         return min(level, 3), title
 
+    m_chap = RE_CHAPTER.match(stripped)
+    if m_chap:
+        chap_num = m_chap.group(1).strip()
+        chap_title = (m_chap.group(2) or "").strip()
+        title = f"Chapter {chap_num}" + (f": {chap_title.title()}" if chap_title else "")
+        return 1, title
+
     m_art = RE_ARTICLE.match(stripped)
     if m_art:
         art_num = m_art.group(1).strip()
         art_title = m_art.group(2).strip()
         title = f"Article {art_num}" + (f": {art_title}" if art_title else "")
-        return 1, title
+        return 2, title
 
     m_sch = RE_SCHEDULE.match(stripped)
     if m_sch:
@@ -467,8 +478,66 @@ def enrich_wikilinks_appositive(text: str) -> str:
     return re.sub(r"\[\[([^\]]+)\]\]", repl, text)
 
 
+def is_pipe_table_row(line: str) -> bool:
+    """Return True if line is a Markdown pipe table row."""
+    s = line.strip()
+    return bool(s.startswith("|") and s.endswith("|") and len(s) > 1)
+
+
+def detect_table_block(lines: List[str], start_idx: int) -> Optional[Tuple[int, List[str]]]:
+    """Detect if lines[start_idx] begins a Markdown pipe table or plaintext tabular schedule.
+
+    Returns (end_idx, table_lines) if detected, or None.
+    """
+    if start_idx >= len(lines):
+        return None
+    line = lines[start_idx]
+    stripped = line.strip()
+
+    # 1. Check for Markdown Pipe Table
+    if is_pipe_table_row(line):
+        table_lines = [line]
+        j = start_idx + 1
+        while j < len(lines) and is_pipe_table_row(lines[j]):
+            table_lines.append(lines[j])
+            j += 1
+        if len(table_lines) >= 3 and re.match(r"^\s*\|[\s:\-\|]+\|\s*$", table_lines[1]):
+            return (j, table_lines)
+
+    # 2. Check for Plaintext Schedule (e.g. Offense Penalty)
+    if re.match(
+        r"^\s*(?:Offense|Violation|Item|Tier|Category|Class|Level|Step|Service|Permit|Fee)\s+(?:Penalty|Fine|Fee|Amount|Sanction|Charge|Rate|Cost|Deposit|Bond|Days)\s*$",
+        stripped,
+        re.IGNORECASE,
+    ):
+        sched_lines = [line]
+        j = start_idx + 1
+        entries_count = 0
+        while j < len(lines):
+            row = lines[j].strip()
+            if not row:
+                if j + 1 < len(lines):
+                    next_row = lines[j + 1].strip()
+                    if re.match(r"^([0-9]+(?:st|nd|rd|th)|[A-Za-z0-9\.\-]+)\s{2,}(\$[\s0-9\.,]+.*)$", next_row):
+                        sched_lines.append(lines[j])
+                        j += 1
+                        continue
+                break
+            m = re.match(r"^([0-9]+(?:st|nd|rd|th)|[A-Za-z0-9\.\-]+)\s{2,}(\$[\s0-9\.,]+.*)$", row)
+            if m:
+                entries_count += 1
+                sched_lines.append(lines[j])
+                j += 1
+            else:
+                break
+        if entries_count >= 2:
+            return (j, sched_lines)
+
+    return None
+
+
 def serialize_tabular_data(text: str) -> str:
-    """Detect Markdown pipe tables and plain text schedules, appending machine-readable key-value blocks."""
+    """Detect Markdown pipe tables and plain text schedules, appending machine-readable and linearized key-value blocks."""
     if "<!-- TABLE_DATA:" in text:
         return text
 
@@ -476,69 +545,139 @@ def serialize_tabular_data(text: str) -> str:
     output_lines: List[str] = []
     i = 0
     while i < len(lines):
-        line = lines[i]
+        tbl_info = detect_table_block(lines, i)
+        if tbl_info:
+            end_idx, table_lines = tbl_info
 
-        # 1. Check for Markdown Pipe Table
-        if re.match(r"^\s*\|.*\|\s*$", line):
-            table_lines = [line]
-            j = i + 1
-            while j < len(lines) and re.match(r"^\s*\|.*\|\s*$", lines[j]):
-                table_lines.append(lines[j])
-                j += 1
-            if len(table_lines) >= 3 and re.match(r"^\s*\|[\s:\-\|]+\|\s*$", table_lines[1]):
+            # Check if Markdown Pipe Table
+            if is_pipe_table_row(table_lines[0]):
                 raw_headers = [c.strip() for c in table_lines[0].strip().strip("|").split("|")]
                 data_rows = []
                 for row_str in table_lines[2:]:
                     cells = [c.strip() for c in row_str.strip().strip("|").split("|")]
                     data_rows.append(cells)
 
+                num_rows = len(data_rows)
+                num_cols = len(raw_headers)
+                dim_badge = f"> **Table**: {num_rows} rows × {num_cols} columns"
+
                 table_data = None
                 if len(raw_headers) == 2:
                     table_data = {r[0]: (r[1] if len(r) > 1 else "") for r in data_rows if r}
-                elif len(raw_headers) > 2:
-                    table_data = [
-                        {raw_headers[idx]: (r[idx] if idx < len(r) else "") for idx in range(len(raw_headers))}
-                        for r in data_rows if r
-                    ]
-
-                output_lines.extend(table_lines)
-                if table_data:
-                    json_str = json.dumps(table_data, indent=2)
-                    output_lines.append(f"<!-- TABLE_DATA:\n{json_str}\n-->")
-                i = j
-                continue
-
-        # 2. Check for plain text fee/penalty schedule (e.g. Offense Penalty / 1st $20.00 fine)
-        if re.match(r"^\s*(?:Offense|Violation|Item|Tier)\s+(?:Penalty|Fine|Fee|Amount|Sanction)\s*$", line, re.IGNORECASE):
-            sched_lines = [line]
-            j = i + 1
-            entries: Dict[str, str] = {}
-            while j < len(lines):
-                row = lines[j].strip()
-                if not row:
-                    j += 1
-                    continue
-                m = re.match(r"^([0-9]+(?:st|nd|rd|th)|[A-Za-z0-9\.\-]+)\s{2,}(\$[\s0-9\.,]+.*)$", row)
-                if m:
-                    entries[m.group(1).strip()] = m.group(2).strip()
-                    sched_lines.append(lines[j])
-                    j += 1
+                    if not (output_lines and output_lines[-1].strip().startswith("> **Table")):
+                        output_lines.append(dim_badge)
+                    output_lines.extend(table_lines)
+                    if table_data:
+                        output_lines.append("\nKey-Value Schedule:")
+                        for k, v in table_data.items():
+                            if k and v:
+                                output_lines.append(f"- **{k}**: {v}")
+                        json_str = json.dumps(table_data, indent=2)
+                        output_lines.append(f"<!-- TABLE_DATA:\n{json_str}\n-->")
                 else:
-                    break
-            if entries:
-                output_lines.extend(sched_lines)
-                json_str = json.dumps(entries, indent=2)
-                output_lines.append(f"<!-- TABLE_DATA:\n{json_str}\n-->")
-                i = j
+                    # Multi-column grids (> 2 columns) remain pure, unsliced,
+                    # grid-padded Markdown pipe tables without row-level card and JSON bloat.
+                    if not (output_lines and output_lines[-1].strip().startswith("> **Table")):
+                        output_lines.append(dim_badge)
+                    output_lines.extend(table_lines)
+                i = end_idx
+                continue
+            else:
+                # Plain text schedule
+                entries: Dict[str, str] = {}
+                data_rows_count = 0
+                for row in table_lines[1:]:
+                    m = re.match(r"^([0-9]+(?:st|nd|rd|th)|[A-Za-z0-9\.\-]+)\s{2,}(\$[\s0-9\.,]+.*)$", row.strip())
+                    if m:
+                        entries[m.group(1).strip()] = m.group(2).strip()
+                        data_rows_count += 1
+
+                dim_badge = f"> **Schedule**: {data_rows_count} rows × 2 columns"
+                if not (output_lines and output_lines[-1].strip().startswith("> **Schedule") or (output_lines and output_lines[-1].strip().startswith("> **Table"))):
+                    output_lines.append(dim_badge)
+                output_lines.extend(table_lines)
+                if entries:
+                    output_lines.append("\nKey-Value Schedule:")
+                    for k, v in entries.items():
+                        output_lines.append(f"- **{k}**: {v}")
+
+                    json_str = json.dumps(entries, indent=2)
+                    output_lines.append(f"<!-- TABLE_DATA:\n{json_str}\n-->")
+                i = end_idx
                 continue
 
-        output_lines.append(line)
+        output_lines.append(lines[i])
         i += 1
 
     res = "\n".join(output_lines)
     if text.endswith("\n"):
         res += "\n"
     return res
+
+
+def slice_massive_table(table_lines: List[str], max_chars: int) -> List[str]:
+    """Slice a massive table that exceeds max_chars by complete rows, duplicating the column header and dimension context."""
+    badge_overhead = 120
+    effective_max = max(max_chars - badge_overhead, 200)
+
+    if is_pipe_table_row(table_lines[0]) and len(table_lines) >= 3:
+        header_lines = table_lines[:2]
+        header_text = "\n".join(header_lines) + "\n"
+        data_rows = table_lines[2:]
+        raw_headers = [c.strip() for c in header_lines[0].strip().strip("|").split("|")]
+        num_cols = len(raw_headers)
+        total_rows = len(data_rows)
+
+        slices = []
+        curr_slice_rows = []
+        start_row_idx = 1
+        curr_len = len(header_text)
+
+        for idx, row in enumerate(data_rows, 1):
+            row_len = len(row) + 1
+            if curr_len + row_len > effective_max and curr_slice_rows:
+                end_row_idx = idx - 1
+                badge = f"> **Table Context**: [Table: {total_rows} rows × {num_cols} columns | Showing rows {start_row_idx}–{end_row_idx} of {total_rows}]\n\n"
+                slices.append(badge + header_text + "\n".join(curr_slice_rows))
+                curr_slice_rows = [row]
+                curr_len = len(header_text) + row_len
+                start_row_idx = idx
+            else:
+                curr_slice_rows.append(row)
+                curr_len += row_len
+
+        if curr_slice_rows:
+            end_row_idx = total_rows
+            badge = f"> **Table Context**: [Table: {total_rows} rows × {num_cols} columns | Showing rows {start_row_idx}–{end_row_idx} of {total_rows}]\n\n"
+            slices.append(badge + header_text + "\n".join(curr_slice_rows))
+        return slices
+    else:
+        header_line = table_lines[0]
+        data_rows = table_lines[1:]
+        total_rows = len(data_rows)
+        slices = []
+        curr_slice_rows = []
+        start_row_idx = 1
+        curr_len = len(header_line) + 1
+
+        for idx, row in enumerate(data_rows, 1):
+            row_len = len(row) + 1
+            if curr_len + row_len > effective_max and curr_slice_rows:
+                end_row_idx = idx - 1
+                badge = f"> **Schedule Context**: [Schedule: {total_rows} rows × 2 columns | Showing entries {start_row_idx}–{end_row_idx} of {total_rows}]\n\n"
+                slices.append(badge + header_line + "\n" + "\n".join(curr_slice_rows))
+                curr_slice_rows = [row]
+                curr_len = len(header_line) + 1 + row_len
+                start_row_idx = idx
+            else:
+                curr_slice_rows.append(row)
+                curr_len += row_len
+
+        if curr_slice_rows:
+            end_row_idx = total_rows
+            badge = f"> **Schedule Context**: [Schedule: {total_rows} rows × 2 columns | Showing entries {start_row_idx}–{end_row_idx} of {total_rows}]\n\n"
+            slices.append(badge + header_line + "\n" + "\n".join(curr_slice_rows))
+        return slices
 
 
 def chunk_document_text(
@@ -555,7 +694,6 @@ def chunk_document_text(
     current_section_title: str = "Preamble / General"
 
     current_block_lines: List[str] = []
-    in_table = False
     in_code = False
 
     def build_breadcrumbs() -> str:
@@ -569,7 +707,7 @@ def chunk_document_text(
 
         def add_chunk(raw_text: str, title: str):
             serialized = serialize_tabular_data(raw_text)
-            c_type = "table" if "<!-- TABLE_DATA:" in serialized else chunk_type
+            c_type = "table" if ("<!-- TABLE_DATA:" in serialized or chunk_type == "table" or any(is_pipe_table_row(l) for l in raw_text.splitlines())) else chunk_type
             chunks.append(
                 DocumentChunk(
                     chunk_id=len(chunks) + 1,
@@ -584,9 +722,51 @@ def chunk_document_text(
                 )
             )
 
+        if chunk_type == "table" or "Showing rows" in clean_content or "Showing entries" in clean_content:
+            add_chunk(clean_content, current_section_title)
+            return
+
         if len(clean_content) > max_size:
-            splitter = "\n\n" if "\n\n" in clean_content else "\n"
-            sub_paragraphs = clean_content.split(splitter)
+            # Table-aware paragraph splitting: never split inside atomic tables
+            c_lines = clean_content.splitlines()
+            sub_paragraphs: List[str] = []
+            pj = 0
+            curr_prose_lines: List[str] = []
+
+            while pj < len(c_lines):
+                tbl = detect_table_block(c_lines, pj)
+                if tbl:
+                    t_end, t_lines = tbl
+                    if curr_prose_lines:
+                        p_txt = "\n".join(curr_prose_lines).strip()
+                        if p_txt:
+                            sub_paragraphs.append(p_txt)
+                        curr_prose_lines = []
+                    t_txt = "\n".join(t_lines).strip()
+                    if t_txt:
+                        if len(t_txt) > max_size:
+                            sub_paragraphs.extend(slice_massive_table(t_lines, max_size))
+                        else:
+                            sub_paragraphs.append(t_txt)
+                    pj = t_end
+                    continue
+
+                line_j = c_lines[pj]
+                if not line_j.strip():
+                    if curr_prose_lines:
+                        p_txt = "\n".join(curr_prose_lines).strip()
+                        if p_txt:
+                            sub_paragraphs.append(p_txt)
+                        curr_prose_lines = []
+                else:
+                    curr_prose_lines.append(line_j)
+                pj += 1
+
+            if curr_prose_lines:
+                p_txt = "\n".join(curr_prose_lines).strip()
+                if p_txt:
+                    sub_paragraphs.append(p_txt)
+
             buffer_paras = []
             curr_len = 0
             part_idx = 1
@@ -602,7 +782,7 @@ def chunk_document_text(
                     continue
 
                 if curr_len + p_len > max_size and buffer_paras:
-                    part_content = splitter.join(buffer_paras)
+                    part_content = "\n\n".join(buffer_paras)
                     sub_title = f"{current_section_title} (Part {part_idx})"
                     add_chunk(part_content, sub_title)
                     buffer_paras = [p]
@@ -610,10 +790,10 @@ def chunk_document_text(
                     part_idx += 1
                 else:
                     buffer_paras.append(p)
-                    curr_len += p_len + len(splitter)
+                    curr_len += p_len + 2
 
             if buffer_paras:
-                part_content = splitter.join(buffer_paras)
+                part_content = "\n\n".join(buffer_paras)
                 sub_title = f"{current_section_title} (Part {part_idx})" if part_idx > 1 else current_section_title
                 add_chunk(part_content, sub_title)
         else:
@@ -634,14 +814,6 @@ def chunk_document_text(
             current_block_lines.append(line)
             i += 1
             continue
-
-        if stripped.startswith("|") and stripped.endswith("|"):
-            in_table = True
-            current_block_lines.append(line)
-            i += 1
-            continue
-        elif in_table:
-            in_table = False
 
         # Prevent false structural breaks on wrapped lines within paragraphs
         is_continuation = False
@@ -688,10 +860,54 @@ def chunk_document_text(
             i += 1
             continue
 
+        # Atomic table & schedule ingestion: keep entire table together in the current block
+        tbl_info = detect_table_block(lines, i)
+        if tbl_info:
+            end_idx, table_lines = tbl_info
+            tbl_len = sum(len(l) for l in table_lines) + len(table_lines)
+            curr_len = sum(len(l) for l in current_block_lines) + len(current_block_lines)
+
+            # Pre-table flush: only flush if accumulated lines + table exceeds max_size
+            if current_block_lines and (curr_len + tbl_len > max_size):
+                # Preserve introductory lead-in sentence/paragraph with the table
+                k = len(current_block_lines) - 1
+                while k >= 0 and not current_block_lines[k].strip():
+                    k -= 1
+                lead_end = k + 1
+                while k >= 0 and current_block_lines[k].strip():
+                    k -= 1
+                candidate_lead_in = current_block_lines[k + 1 : lead_end]
+                candidate_text = "\n".join(candidate_lead_in).strip()
+                if candidate_text and len(candidate_text) <= 500 and (candidate_text.endswith(":") or k >= 0):
+                    prose_lines = current_block_lines[: k + 1]
+                    lead_in_lines = candidate_lead_in
+                else:
+                    prose_lines = current_block_lines
+                    lead_in_lines = []
+
+                if prose_lines:
+                    finalize_chunk("\n".join(prose_lines))
+                current_block_lines = list(lead_in_lines)
+
+            if tbl_len > max_size:
+                # Massive table: slice across chunks
+                for s in slice_massive_table(table_lines, max_size):
+                    finalize_chunk(s, chunk_type="table")
+                i = end_idx
+                continue
+            else:
+                current_block_lines.extend(table_lines)
+                i = end_idx
+                # Finalize table chunk if target size reached
+                if sum(len(l) for l in current_block_lines) >= target_size:
+                    finalize_chunk("\n".join(current_block_lines), chunk_type="table")
+                    current_block_lines = []
+                continue
+
         current_block_lines.append(line)
 
         current_len = sum(len(l) for l in current_block_lines)
-        if current_len >= target_size and not in_table and not in_code:
+        if current_len >= target_size and not in_code:
             if not stripped and len(current_block_lines) > 2:
                 finalize_chunk("\n".join(current_block_lines))
                 current_block_lines = []

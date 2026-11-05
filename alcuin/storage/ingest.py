@@ -188,7 +188,7 @@ class InboxIngestionEngine:
             pass
         return None
 
-    def extract_content(self, file_path: Path) -> Tuple[str, str]:
+    def extract_content(self, file_path: Path, pdf_engine: str = "auto") -> Tuple[str, str]:
         """
         Extract title and markdown text from an incoming document or image.
         Returns: (doc_title, markdown_content)
@@ -199,7 +199,7 @@ class InboxIngestionEngine:
         # 1. Digital PDF
         if ext == ".pdf":
             try:
-                pdf_title, pdf_text = extract_pdf_content(file_path)
+                pdf_title, pdf_text = extract_pdf_content(file_path, engine=pdf_engine)
                 return pdf_title or title, pdf_text
             except Exception as e:
                 return title, f"PDF extraction error: {e}"
@@ -246,6 +246,7 @@ class InboxIngestionEngine:
         file_path: Path,
         dry_run: bool = False,
         force: bool = False,
+        pdf_engine: str = "auto",
     ) -> Tuple[Optional[Path], str]:
         """
         Ingest a single raw file into the vault:
@@ -267,7 +268,7 @@ class InboxIngestionEngine:
                 f"Skipped: Already ingested as '{prev.vault_note_path}' on {prev.ingested_at[:10]} (SHA-256 match)",
             )
 
-        title, extracted_body = self.extract_content(file_path)
+        title, extracted_body = self.extract_content(file_path, pdf_engine=pdf_engine)
         now_iso = datetime.now(timezone.utc).isoformat()
         date_short = now_iso[:10]
 
@@ -329,6 +330,7 @@ class InboxIngestionEngine:
         self,
         dry_run: bool = False,
         force: bool = False,
+        pdf_engine: str = "auto",
     ) -> IngestResult:
         """Process all eligible files in the vault inbox directory and quarantine unsupported files."""
         result = IngestResult()
@@ -379,7 +381,7 @@ class InboxIngestionEngine:
                         result.errors.append(f"Failed to quarantine '{f.name}': {e}")
 
         for f in sorted(eligible_files, key=lambda x: x.name.lower()):
-            note_path, status = self.ingest_file(f, dry_run=dry_run, force=force)
+            note_path, status = self.ingest_file(f, dry_run=dry_run, force=force, pdf_engine=pdf_engine)
             if note_path:
                 result.ingested_notes.append(status)
             elif "Skipped:" in status:

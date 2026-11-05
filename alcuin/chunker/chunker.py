@@ -246,8 +246,23 @@ def fetch_url_content(url: str) -> Tuple[str, str]:
     return title, full_markdown
 
 
-def extract_pdf_content(pdf_path: Path) -> Tuple[str, str]:
-    """Extract structured text and tables from PDF, with auto-OCR for scanned pages."""
+def extract_pdf_content(pdf_path: Path, engine: str = "auto") -> Tuple[str, str]:
+    """Extract structured text and tables from PDF, with auto-OCR for scanned pages (SPEC-026)."""
+    if engine.lower() == "docling":
+        try:
+            from docling.document_converter import DocumentConverter
+            converter = DocumentConverter()
+            result = converter.convert(str(pdf_path))
+            markdown_text = result.document.export_to_markdown()
+            title = pdf_path.stem.replace("_", " ").replace("-", " ").title()
+            return title, markdown_text
+        except ImportError:
+            raise RuntimeError(
+                "PDF extraction engine 'docling' requested but not installed.\n"
+                "To enable vision-based document layout parsing, install the docling extra:\n"
+                "  pip install \"alcuin[docling]\""
+            )
+
     try:
         import pymupdf as fitz
     except ImportError:
@@ -274,10 +289,10 @@ def extract_pdf_content(pdf_path: Path) -> Tuple[str, str]:
 
     for page_idx in range(len(doc)):
         page = doc[page_idx]
-        text = page.get_text("text").strip()
+        raw_text = page.get_text("text").strip()
 
         # Detect scanned page (less than 40 chars of selectable text with images/drawings)
-        if len(text) < 40 and (len(page.get_images()) > 0 or len(page.get_drawings()) > 0):
+        if len(raw_text) < 40 and (len(page.get_images()) > 0 or len(page.get_drawings()) > 0):
             scanned_pages.append(page_idx + 1)
             if tess_exe:
                 try:
@@ -288,14 +303,61 @@ def extract_pdf_content(pdf_path: Path) -> Tuple[str, str]:
                     ocr_text = pytesseract.image_to_string(img).strip()
                     if ocr_text:
                         print(f"  \033[92m[OCR]\033[0m Page {page_idx + 1}: Scanned image recognized ({len(ocr_text):,} characters)")
-                        text = ocr_text
+                        pages_text.append(ocr_text)
                     else:
                         print(f"  \033[90m[OCR]\033[0m Page {page_idx + 1}: No text detected via OCR")
                 except Exception as e:
                     print(f"  \033[91m[OCR Error]\033[0m Page {page_idx + 1}: {e}")
+            continue
 
-        if text:
-            pages_text.append(text)
+        # Native layout-aware table extraction (SPEC-026)
+        tabs = None
+        try:
+            tabs = page.find_tables()
+        except Exception:
+            tabs = None
+
+        tables = tabs.tables if (tabs and hasattr(tabs, "tables")) else []
+
+        if not tables:
+            if raw_text:
+                pages_text.append(raw_text)
+        else:
+            # Interleave text blocks and tables in vertical visual reading order
+            page_items = []
+            for t in tables:
+                try:
+                    md_t = t.to_markdown()
+                    if md_t and md_t.strip():
+                        page_items.append((t.bbox[1], t.bbox[3], "table", md_t.strip()))
+                except Exception:
+                    pass
+
+            # Extract text blocks outside table bounding boxes to prevent cell duplication
+            blocks = page.get_text("blocks")
+            for b in blocks:
+                if len(b) > 6 and b[6] != 0:
+                    continue  # skip non-text blocks
+                b_text = b[4].strip()
+                if not b_text:
+                    continue
+
+                b_rect = fitz.Rect(b[:4])
+                inside_table = False
+                for t in tables:
+                    t_rect = fitz.Rect(t.bbox)
+                    inter = b_rect & t_rect
+                    if not inter.is_empty and (inter.get_area() > 0.4 * b_rect.get_area()):
+                        inside_table = True
+                        break
+
+                if not inside_table:
+                    page_items.append((b[1], b[3], "text", b_text))
+
+            page_items.sort(key=lambda item: item[0])
+            assembled_page = "\n\n".join(item[3] for item in page_items)
+            if assembled_page.strip():
+                pages_text.append(assembled_page.strip())
 
     if scanned_pages and not tess_exe:
         print(f"\n  \033[93m[WARN]: Scanned PDF detected!\033[0m Pages {scanned_pages} appear to be image-based scans.")

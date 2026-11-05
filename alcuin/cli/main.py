@@ -671,11 +671,13 @@ def gaps_clear(vault_target: Optional[str], clear_all: bool):
 @cli.command(short_help="Ingest raw files from inbox/ into vault markdown notes and archive")
 @click.argument("file_path", required=False, type=click.Path(exists=True))
 @click.option("-v", "--vault", "vault_target", help="Vault name or directory path")
+@click.option("--engine", type=click.Choice(["auto", "pymupdf", "docling"], case_sensitive=False), default="auto", help="PDF extraction engine (auto, pymupdf, or docling)")
 @click.option("--dry-run", is_flag=True, help="Preview intake conversion without writing notes or moving files")
 @click.option("--force", is_flag=True, help="Force re-ingestion of duplicate files (bypassing SHA-256 match)")
 def ingest(
     file_path: Optional[str],
     vault_target: Optional[str],
+    engine: str,
     dry_run: bool,
     force: bool,
 ):
@@ -683,17 +685,17 @@ def ingest(
     from alcuin.storage.ingest import InboxIngestionEngine
 
     vault_obj = resolve_or_prompt_vault(target=vault_target)
-    engine = InboxIngestionEngine(vault_obj)
+    engine_obj = InboxIngestionEngine(vault_obj)
 
     # Validate folders exist
-    valid, msg = engine.validate_folders()
+    valid, msg = engine_obj.validate_folders()
     if not valid:
         console.print(f"[bold red]Warning:[/] {msg}")
         sys.exit(1)
 
     if file_path:
         p = Path(file_path).resolve()
-        note, status = engine.ingest_file(p, dry_run=dry_run, force=force)
+        note, status = engine_obj.ingest_file(p, dry_run=dry_run, force=force, pdf_engine=engine)
         if note:
             console.print(f"[bold green]✓[/bold green] {status}")
         elif "Skipped:" in status:
@@ -704,7 +706,7 @@ def ingest(
         return
 
     # Ingest entire inbox
-    res = engine.ingest_inbox(dry_run=dry_run, force=force)
+    res = engine_obj.ingest_inbox(dry_run=dry_run, force=force, pdf_engine=engine)
     if dry_run:
         console.print(f"\n[bold yellow]Ingest Plan (Dry Run) for '{vault_obj.name}':[/bold yellow]")
     else:

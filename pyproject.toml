@@ -28,6 +28,9 @@ dependencies = [
     "python-dotenv>=1.0.0",
 ]
 
+[project.optional-dependencies]
+docling = ["docling>=2.0.0"]
+
 [project.scripts]
 alcuin = "alcuin.cli.main:cli"
 

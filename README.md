@@ -18,6 +18,8 @@
 * **Multimodal Inbox Ingestion (`alcuin ingest`)**: Drop raw PDFs, scans, receipts, or photos into `<vault>/inbox/`. Alcuin extracts clean Markdown notes via Tesseract OCR or local vision models, archives the originals to `<vault>/archive/`, and keeps the active vault 100% Markdown.
 * **Vault Health & Self-Healing (`alcuin lint --fix`)**: Detects dead wikilinks, sync drift, orphan database records, and missing headers. Automatically scaffolds missing folders, repairs headers, and generates stub notes.
 * **Knowledge Gap Tracking (`alcuin gaps`)**: Automatically logs unanswered or low-confidence queries, tracks recurring blind spots in your knowledge base, and resolves them when answers are found.
+* **Atomic Tabular Chunking & Schedule Preservation**: Complex financial statements (SEC 10-K), municipal fee schedules, and Markdown pipe-tables are preserved atomically without row splitting. Ragged rows are auto-padded, and key-values are linearized (`<!-- TABLE_DATA: ... -->`) to maximize dense vector retrieval and eliminate tabular hallucinations.
+* **Subquery-Isolated Synthesis**: Automatically decomposes multi-part inquiries into atomic search sub-goals and assigns dedicated evidence pools via hybrid scoring (cosine + BM25 + document title affinity). Prevents prompt context contamination and context-cliff collapse on edge models.
 * **Context Safety Governor & Sizing Telemetry**: Dynamically calculates evidence token ceilings based on the active model's context runway (60% evidence, 40% headroom for answer generation). When high-relevance candidate clauses exceed your model's window, Alcuin emits in-band sizing telemetry, empirically justifying when and why to upgrade to larger context models rather than using them as a lazy crutch.
 * **Local-First & Multi-Provider**: Powered locally by [Ollama](https://ollama.ai) (`llama3.2`, `qwen2.5`, `nomic-embed-text`) or cloud endpoints (Google Gemini, OpenAI).
 * **Dual Interface**: Direct CLI with clean Markdown output, plus an embedded FastAPI Web UI with real-time research streaming via Server-Sent Events (SSE).
@@ -70,12 +72,13 @@ alcuin who is Charlie's pediatrician and what is the clinic phone number
 
 | Command | Description |
 | :--- | :--- |
-| `alcuin <question>` | Autonomous multi-hop research across vault documents (Default command) |
+| `alcuin <question>` | Autonomous multi-hop research across vault documents (Default; aliases: `ask`, `query`, `research`) |
 | `alcuin init [path]` | Initialize target directory as an in-situ Alcuin vault |
 | `alcuin index` | Incrementally sync and vector-embed modified vault documents |
 | `alcuin ingest` | Convert raw files from `inbox/` into vault markdown notes and archive originals |
 | `alcuin lint` | Audit vault integrity (dead wikilinks, sync drift, hygiene). Pass `--fix` to repair |
 | `alcuin gaps` | Inspect and manage unanswered knowledge gaps |
+| `alcuin status` / `doctor` | Audit vault statistics, vector index health, and model endpoint connectivity |
 | `alcuin vault list` | List registered vaults across the system |
 | `alcuin serve` | Launch the FastAPI Web UI dashboard and background indexing daemon |
 
@@ -100,6 +103,8 @@ temperature = 0.2
 max_hops = 3
 max_iterations = 4
 link_pruning = true
+subquery_synthesis = true
+subquery_top_k = 6
 
 [storage]
 embedding_model = "nomic-embed-text"

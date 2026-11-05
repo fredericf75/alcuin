@@ -15,7 +15,7 @@
   ```bash
   alcuin what is the address for Charlie's pediatrician
   ```
-* **Multimodal Inbox Ingestion (`alcuin ingest`)**: Drop raw PDFs, scans, receipts, or photos into `<vault>/inbox/`. Alcuin extracts clean Markdown notes via Tesseract OCR or local vision models, archives the originals to `<vault>/archive/`, and keeps the active vault 100% Markdown.
+* **Multimodal Inbox Ingestion (`alcuin ingest`)**: Drop raw PDFs, scans, receipts, or photos into `<vault>/inbox/`. Alcuin reconstructs vector-graphic tables natively from digital PDFs (SEC 10-K filings, municipal rate sheets), deduplicates cell text to eliminate noise, extracts clean Markdown notes via auto-OCR or local vision models, archives originals to `<vault>/archive/`, and keeps the active vault 100% Markdown.
 * **Vault Health & Self-Healing (`alcuin lint --fix`)**: Detects dead wikilinks, sync drift, orphan database records, and missing headers. Automatically scaffolds missing folders, repairs headers, and generates stub notes.
 * **Knowledge Gap Tracking (`alcuin gaps`)**: Automatically logs unanswered or low-confidence queries, tracks recurring blind spots in your knowledge base, and resolves them when answers are found.
 * **Atomic Tabular Chunking & Schedule Preservation**: Complex financial statements (SEC 10-K), municipal fee schedules, and Markdown pipe-tables are preserved atomically without row splitting. Ragged rows are auto-padded, and key-values are linearized (`<!-- TABLE_DATA: ... -->`) to maximize dense vector retrieval and eliminate tabular hallucinations.
@@ -45,6 +45,9 @@
 git clone https://github.com/fredericf75/alcuin.git
 cd alcuin
 pip install -e .
+
+# Optional: Install Docling extra for deep-learning vision document parsing
+pip install -e ".[docling]"
 ```
 
 ### 3. Initialize a Vault
@@ -75,7 +78,7 @@ alcuin who is Charlie's pediatrician and what is the clinic phone number
 | `alcuin <question>` | Autonomous multi-hop research across vault documents (Default; aliases: `ask`, `query`, `research`) |
 | `alcuin init [path]` | Initialize target directory as an in-situ Alcuin vault |
 | `alcuin index` | Incrementally sync and vector-embed modified vault documents |
-| `alcuin ingest` | Convert raw files from `inbox/` into vault markdown notes and archive originals |
+| `alcuin ingest [--engine auto|pymupdf|docling]` | Convert raw files from `inbox/` into vault markdown notes with layout-aware table extraction |
 | `alcuin lint` | Audit vault integrity (dead wikilinks, sync drift, hygiene). Pass `--fix` to repair |
 | `alcuin gaps` | Inspect and manage unanswered knowledge gaps |
 | `alcuin status` / `doctor` | Audit vault statistics, vector index health, and model endpoint connectivity |

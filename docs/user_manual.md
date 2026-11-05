@@ -301,21 +301,29 @@ The Web Cockpit is divided into 5 operational tabs:
 Drop physical scans, PDFs, digital receipts, statements, and image files into your vault's `inbox/` folder:
 
 ```bash
+# Standard intake with native PyMuPDF layout-aware table extraction
 alcuin ingest
+
+# Ingest using optional vision-based Docling engine (requires pip install "alcuin[docling]")
+alcuin ingest --engine docling
 ```
 
 ### Ingestion Workflow
 1. **Discovery**: Scans `inbox/` for supported files (`.pdf`, `.docx`, `.png`, `.jpg`, `.jpeg`, `.tiff`, `.bmp`, `.txt`, `.md`).
 2. **Deduplication**: Computes SHA-256 hashes to guarantee duplicate files are never re-ingested.
-3. **Extraction & OCR**: Extracts native PDF/DOCX text layers and runs Tesseract OCR on scanned images and receipts.
-4. **Note Generation**: Produces a clean Markdown note in the vault with document headers, timestamps, and structured text.
+3. **Layout-Aware PDF Extraction & OCR**: 
+   - **Native Table Reconstruction**: Detects vector graphic tables in digital PDFs (`page.find_tables()`), interleaving Markdown pipe tables with narrative prose in visual reading order.
+   - **Cell Spatial Deduplication**: Filters text blocks within table bounding boxes, preventing cell values from duplicating as detached prose paragraphs.
+   - **Auto-OCR Fallback**: Automatically invokes Tesseract OCR on scanned, image-only PDF pages and image files (`.png`, `.jpg`).
+   - **Optional Docling Extra**: Enables IBM Research's Docling deep-learning vision engine via `--engine docling`.
+4. **Note Generation**: Produces a clean Markdown note in the vault with document headers, source provenance, timestamps, and structured table data.
 5. **Safe Archival**: Moves original files from `inbox/` to `archive/`.
 
 #### Ingest Options:
+* `--engine [auto|pymupdf|docling]`: Choose PDF extraction engine (default: `auto`). Native `pymupdf` has zero deep-learning dependencies; `docling` provides an optional deep-learning vision engine.
 * `--dry-run`: Preview files to be processed without modifying files.
-* `--force`: Force re-processing of previously ingested files.
-* `--inbox-dir <path>`: Override intake directory.
-* `--archive-dir <path>`: Override archive destination.
+* `--force`: Force re-processing of previously ingested files (bypassing SHA-256 hash match).
+* `-v, --vault <target>`: Target vault name or directory path.
 
 ---
 

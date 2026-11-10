@@ -59,7 +59,7 @@ class AgentState(TypedDict):
 
 
 def _extract_and_clean_thinking(raw_text: str) -> Tuple[str, str]:
-    """Extract latent reasoning enclosed in <think>...</think> tags (or template-prefixed </think>) and return (clean_text, thinking_trace)."""
+    """Extract latent reasoning enclosed in <think>...</think> tags (or template-prefixed </think> or plain-text CoT) and return (clean_text, thinking_trace)."""
     if not raw_text:
         return "", ""
     thinking = ""
@@ -74,6 +74,44 @@ def _extract_and_clean_thinking(raw_text: str) -> Tuple[str, str]:
         thinking = parts[0].strip()
         cleaned_text = parts[1].strip()
         return cleaned_text, thinking
+
+    # Plain-text CoT traces (e.g. Gemma prompted with <|think|> or models emitting "thought\nThinking Process:")
+    stripped = raw_text.strip()
+    if re.match(r"^thought\b", stripped, re.IGNORECASE):
+        # Match terminal step header in reasoning trace: e.g. N. **Final Output Generation** / **Construct the response**
+        final_step_regex = re.compile(
+            r"(?:\n|\A)\s*\d+\.\s+\*\*(?:Final|Construct|Draft|Formulate|Conclusion|Review)[^*]*\*\*[:\.]?\s*",
+            re.IGNORECASE,
+        )
+        matches = list(final_step_regex.finditer(stripped))
+        if matches:
+            last_m = matches[-1]
+            thought_prefix = stripped[:last_m.start()].strip()
+            remainder = stripped[last_m.end():]
+            clean = remainder
+            for _ in range(5):
+                clean = re.sub(r"^\s*\([^\)]*\)\s*", "", clean)
+                clean = re.sub(r"^\s*[:\.]\s*", "", clean)
+                clean = re.sub(
+                    r"^\s*(?:\*\s*)?(?:State|Ensure|The text states|As per the instructions|Directly|Based strictly|1-2 sentences|Zero conversational|Constraint check)[^\n\.\:\?]*[\.\:\?]\s*",
+                    "",
+                    clean,
+                    flags=re.IGNORECASE,
+                )
+                clean = re.sub(r"^\s*\*[^\*]+\*\s*", "", clean)
+                clean = re.sub(r"^\s*(?:Yes|No|Check)\.\s*", "", clean, flags=re.IGNORECASE)
+            clean = clean.strip()
+            if clean and len(clean) >= 8:
+                extracted_thought = (thought_prefix + "\n" + stripped[last_m.start():len(stripped) - len(clean)]).strip()
+                return clean, extracted_thought
+
+        # Resilient fallback: double-newline transition to non-numbered conclusion paragraph
+        m_split = re.search(r"\n\n([A-Z][^\n]{20,})$", stripped)
+        if m_split:
+            clean = m_split.group(1).strip()
+            extracted_thought = stripped[:m_split.start()].strip()
+            return clean, extracted_thought
+
     return raw_text.strip(), ""
 
 
@@ -251,7 +289,14 @@ class LLMClient:
                     ollama_body: Dict[str, Any] = {
                         "model": self.model,
                         "messages": [
-                            {"role": "system", "content": system_prompt},
+                            {
+                                "role": "system",
+                                "content": (
+                                    f"<|think|>\n{system_prompt}"
+                                    if self.think is True and "gemma" in self.model.lower() and not system_prompt.startswith("<|think|>")
+                                    else system_prompt
+                                ),
+                            },
                             {"role": "user", "content": user_prompt},
                         ],
                         "stream": False,
@@ -316,7 +361,14 @@ class LLMClient:
                     json={
                         "model": self.model,
                         "messages": [
-                            {"role": "system", "content": system_prompt},
+                            {
+                                "role": "system",
+                                "content": (
+                                    f"<|think|>\n{system_prompt}"
+                                    if self.think is True and "gemma" in self.model.lower() and not system_prompt.startswith("<|think|>")
+                                    else system_prompt
+                                ),
+                            },
                             {"role": "user", "content": user_prompt},
                         ],
                         "temperature": self.temperature,
@@ -619,6 +671,8 @@ class ResearchAgent:
 
         table_match = re.search(r"<!--\s*TABLE_DATA:\s*(.*?)\s*-->", r.content or "", re.DOTALL)
         table_text = table_match.group(1).lower() if table_match else ""
+        if getattr(r, "table_headers", None):
+            table_text = f"{table_text} {' '.join(r.table_headers).lower()}"
 
         header_parts = [sec_title, breadcrumbs, table_text]
         if include_doc_title:
@@ -728,8 +782,9 @@ class ResearchAgent:
                         admitted_sec_keys.add(self._normalize_section_key(r.section_title))
                     continue
 
-                # 2. Rescue companion TABLE_DATA chunk sharing the same section_title as an admitted chunk
-                if "<!-- TABLE_DATA:" in (r.content or "") and r.section_title:
+                # 2. Rescue companion table/schedule chunk sharing the same section_title as an admitted chunk
+                is_comp_table = getattr(r, "chunk_type", "") in ("table", "schedule") or "<!-- TABLE_DATA:" in (r.content or "")
+                if is_comp_table and r.section_title:
                     if self._normalize_section_key(r.section_title) in admitted_sec_keys:
                         admitted.append(r)
 

@@ -90,3 +90,38 @@ def test_incremental_indexing_lifecycle(temp_vault):
     doc2.unlink()
     report4 = storage.index()
     assert "vaccines.md" in report4.deleted_files
+
+
+def test_spec030_table_metadata_storage_and_filtering(temp_vault):
+    storage = VaultStorage(temp_vault)
+
+    # Add document containing a table schedule
+    doc = temp_vault.root_path / "penalties.md"
+    doc.write_text(
+        "# Municipal Code\n\n## Section 6-132 Animal Penalties\n\n"
+        "Offense Penalty\n"
+        "1st     $ 20.00 fine\n"
+        "2nd     $ 50.00 fine\n"
+        "3rd     $ 75.00 fine\n\n"
+        "## General Administrative Guidelines\n\n"
+        "All citations shall be issued by authorized personnel.\n",
+        encoding="utf-8",
+    )
+    report = storage.index()
+    assert report.total_chunks_indexed >= 2
+
+    # Verify LanceDB contains chunk_type and table_headers columns
+    arrow_tbl = storage.table.to_arrow()
+    assert "chunk_type" in arrow_tbl.column_names
+    assert "table_headers" in arrow_tbl.column_names
+    assert "table_rows" in arrow_tbl.column_names
+    assert "table_cols" in arrow_tbl.column_names
+
+    # Test filtered search on chunk_type
+    table_hits = storage.search("second offense penalty", top_k=5, where="chunk_type IN ('table', 'schedule')")
+    assert len(table_hits) >= 1
+    hit = table_hits[0]
+    assert hit.chunk_type in ("table", "schedule")
+    assert hit.table_headers == ["Offense", "Penalty"]
+    assert hit.table_rows == 3
+    assert hit.table_cols == 2

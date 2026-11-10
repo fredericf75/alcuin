@@ -170,3 +170,40 @@ def test_output_governor_subquery_synthesis_clipped(tmp_path):
     assert result["synthesis_clipped"] is True
     assert result["unaddressed_sub_questions"] == [3]
     assert any("[OUTPUT GOVERNOR WARNING]" in th for th in result["thought_history"])
+
+
+def test_extract_and_clean_thinking_variants():
+    """Verify _extract_and_clean_thinking properly strips XML and plain-text CoT while preserving traces."""
+    from alcuin.agent.graph import _extract_and_clean_thinking
+
+    # 1. Standard XML <think>...</think>
+    raw_xml = "<think>\nAnalyzing the regulatory guidelines...\n</think>\nThe maximum allowed is 5."
+    clean, thinking = _extract_and_clean_thinking(raw_xml)
+    assert clean == "The maximum allowed is 5."
+    assert "Analyzing the regulatory guidelines" in thinking
+
+    # 2. Standalone prefix </think>
+    raw_prefix = "Need to check chapter 4.\n</think>\nRoosters are strictly prohibited."
+    clean, thinking = _extract_and_clean_thinking(raw_prefix)
+    assert clean == "Roosters are strictly prohibited."
+    assert "Need to check chapter 4." in thinking
+
+    # 3. Plain-text CoT (Gemma 4 format)
+    raw_gemma = (
+        "thought\n"
+        "Thinking Process:\n\n"
+        "1.  **Analyze Request:** Identify setback requirements.\n"
+        "2.  **Scan Context:** Found Sec. 6-5.\n"
+        "3.  **Construct the final response.** (Self-Correction: Keep concise.) "
+        "Chicken coops must maintain a 15-foot setback from property lines."
+    )
+    clean, thinking = _extract_and_clean_thinking(raw_gemma)
+    assert clean == "Chicken coops must maintain a 15-foot setback from property lines."
+    assert "thought" in thinking
+    assert "Analyze Request" in thinking
+
+    # 4. Plain text without thinking passes through unchanged
+    raw_plain = "According to Section 10A, staff must be trained annually."
+    clean, thinking = _extract_and_clean_thinking(raw_plain)
+    assert clean == raw_plain
+    assert thinking == ""

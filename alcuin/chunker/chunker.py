@@ -30,7 +30,7 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -49,7 +49,10 @@ class DocumentChunk:
     content: str
     char_count: int
     token_estimate: int
-    chunk_type: str = "clause"  # clause, table, code, preamble
+    chunk_type: str = "clause"  # clause, table, schedule, code, preamble
+    table_headers: List[str] = field(default_factory=list)
+    table_rows: int = 0
+    table_cols: int = 0
 
 
 # =====================================================================
@@ -598,10 +601,36 @@ def detect_table_block(lines: List[str], start_idx: int) -> Optional[Tuple[int, 
     return None
 
 
-def serialize_tabular_data(text: str) -> str:
-    """Detect Markdown pipe tables and plain text schedules, appending machine-readable and linearized key-value blocks."""
+def serialize_tabular_data_with_metadata(text: str) -> Tuple[str, List[str], int, int, str]:
+    """Detect Markdown pipe tables and plain text schedules.
+    
+    Returns (serialized_text, headers, rows, cols, chunk_type).
+    """
+    headers: List[str] = []
+    num_rows: int = 0
+    num_cols: int = 0
+    detected_type: str = "clause"
+
+    # Pre-check for badges if text was already serialized or sliced
+    m_badge = re.search(r"> \*\*(?:Table|Schedule)(?: Context)?\*\*: \[(?:Table|Schedule): (\d+) rows? [×x] (\d+) columns?", text)
+    if not m_badge:
+        m_badge = re.search(r"> \*\*(?:Table|Schedule)\*\*: (\d+) rows? [×x] (\d+) columns?", text)
+    if m_badge:
+        num_rows = int(m_badge.group(1))
+        num_cols = int(m_badge.group(2))
+        detected_type = "table"
+
     if "<!-- TABLE_DATA:" in text:
-        return text
+        for line in text.splitlines():
+            if is_pipe_table_row(line):
+                raw_h = [c.strip() for c in line.strip().strip("|").split("|")]
+                headers = [h for h in raw_h if h and not set(h) <= {":", "-"}]
+                if headers:
+                    detected_type = "table"
+                    if not num_cols:
+                        num_cols = len(headers)
+                    break
+        return text, headers, num_rows, num_cols, detected_type
 
     lines = text.splitlines()
     output_lines: List[str] = []
@@ -613,7 +642,9 @@ def serialize_tabular_data(text: str) -> str:
 
             # Check if Markdown Pipe Table
             if is_pipe_table_row(table_lines[0]):
+                detected_type = "table"
                 raw_headers = [c.strip() for c in table_lines[0].strip().strip("|").split("|")]
+                headers = [c for c in raw_headers if c]
                 data_rows = []
                 for row_str in table_lines[2:]:
                     cells = [c.strip() for c in row_str.strip().strip("|").split("|")]
@@ -646,6 +677,13 @@ def serialize_tabular_data(text: str) -> str:
                 continue
             else:
                 # Plain text schedule
+                detected_type = "schedule"
+                hdr_words = table_lines[0].strip().split()
+                if len(hdr_words) >= 2:
+                    headers = hdr_words
+                else:
+                    headers = ["Offense", "Penalty"]
+                num_cols = len(headers)
                 entries: Dict[str, str] = {}
                 data_rows_count = 0
                 for row in table_lines[1:]:
@@ -654,6 +692,7 @@ def serialize_tabular_data(text: str) -> str:
                         entries[m.group(1).strip()] = m.group(2).strip()
                         data_rows_count += 1
 
+                num_rows = data_rows_count
                 dim_badge = f"> **Schedule**: {data_rows_count} rows × 2 columns"
                 if not (output_lines and output_lines[-1].strip().startswith("> **Schedule") or (output_lines and output_lines[-1].strip().startswith("> **Table"))):
                     output_lines.append(dim_badge)
@@ -674,6 +713,24 @@ def serialize_tabular_data(text: str) -> str:
     res = "\n".join(output_lines)
     if text.endswith("\n"):
         res += "\n"
+
+    if not headers:
+        for line in lines:
+            if is_pipe_table_row(line):
+                raw_h = [c.strip() for c in line.strip().strip("|").split("|")]
+                headers = [h for h in raw_h if h and not set(h) <= {":", "-"}]
+                if headers:
+                    detected_type = "table"
+                    if not num_cols:
+                        num_cols = len(headers)
+                    break
+
+    return res, headers, num_rows, num_cols, detected_type
+
+
+def serialize_tabular_data(text: str) -> str:
+    """Detect Markdown pipe tables and plain text schedules, appending machine-readable and linearized key-value blocks."""
+    res, _, _, _, _ = serialize_tabular_data_with_metadata(text)
     return res
 
 
@@ -768,8 +825,10 @@ def chunk_document_text(
             return
 
         def add_chunk(raw_text: str, title: str):
-            serialized = serialize_tabular_data(raw_text)
-            c_type = "table" if ("<!-- TABLE_DATA:" in serialized or chunk_type == "table" or any(is_pipe_table_row(l) for l in raw_text.splitlines())) else chunk_type
+            serialized, t_headers, t_rows, t_cols, t_type = serialize_tabular_data_with_metadata(raw_text)
+            c_type = t_type if t_type in ("table", "schedule") else (
+                "table" if ("<!-- TABLE_DATA:" in serialized or chunk_type in ("table", "schedule") or any(is_pipe_table_row(l) for l in raw_text.splitlines())) else chunk_type
+            )
             chunks.append(
                 DocumentChunk(
                     chunk_id=len(chunks) + 1,
@@ -781,6 +840,9 @@ def chunk_document_text(
                     char_count=len(serialized),
                     token_estimate=int(len(serialized) / 4),
                     chunk_type=c_type,
+                    table_headers=t_headers,
+                    table_rows=t_rows,
+                    table_cols=t_cols,
                 )
             )
 

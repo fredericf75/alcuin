@@ -47,6 +47,10 @@ SCHEMA = pa.schema(
         pa.field("wikilinks", pa.list_(pa.string())),
         pa.field("vector", pa.list_(pa.float32(), EMBEDDING_DIM)),
         pa.field("updated_at", pa.string()),
+        pa.field("chunk_type", pa.string()),
+        pa.field("table_headers", pa.list_(pa.string())),
+        pa.field("table_rows", pa.int32()),
+        pa.field("table_cols", pa.int32()),
     ]
 )
 
@@ -61,6 +65,10 @@ class SearchResult:
     content: str
     wikilinks: List[str]
     score: float
+    chunk_type: str = "clause"
+    table_headers: List[str] = field(default_factory=list)
+    table_rows: int = 0
+    table_cols: int = 0
 
 
 @dataclass
@@ -374,7 +382,12 @@ class VaultStorage:
 
     def _get_or_create_table(self):
         try:
-            return self.db.open_table(CHUNKS_TABLE_NAME)
+            tbl = self.db.open_table(CHUNKS_TABLE_NAME)
+            curr_names = set(tbl.schema.names)
+            expected_names = set(SCHEMA.names)
+            if not expected_names.issubset(curr_names):
+                return self.db.create_table(CHUNKS_TABLE_NAME, schema=SCHEMA, mode="overwrite")
+            return tbl
         except Exception:
             return self.db.create_table(CHUNKS_TABLE_NAME, schema=SCHEMA, mode="overwrite")
 
@@ -486,11 +499,13 @@ class VaultStorage:
             try:
                 doc_title, raw_text, chunks = chunk_file_in_memory(full_path)
                 file_links = extract_wikilinks(raw_text)
-                # Batch embed and prepare records with Arm C appositive prose enrichment
-                chunk_texts = [
-                    f"{c.breadcrumbs}\n{enrich_wikilinks_appositive(c.content)}"
-                    for c in chunks
-                ]
+                # Batch embed and prepare records with Arm C appositive prose enrichment + SPEC-030 table schema prefix
+                chunk_texts = []
+                for c in chunks:
+                    schema_prefix = ""
+                    if getattr(c, "chunk_type", "") in ("table", "schedule") and getattr(c, "table_headers", None):
+                        schema_prefix = f"> **Table Schema**: {c.section_title} | Columns: {', '.join(c.table_headers)}\n\n"
+                    chunk_texts.append(f"{c.breadcrumbs}\n{schema_prefix}{enrich_wikilinks_appositive(c.content)}")
                 embeddings = self.embedder.get_embeddings_batch(chunk_texts)
 
                 wikilinks_map[rel_path] = file_links
@@ -519,6 +534,10 @@ class VaultStorage:
                             "wikilinks": chunk_links,
                             "vector": vec,
                             "updated_at": now_str,
+                            "chunk_type": getattr(chunk, "chunk_type", "clause"),
+                            "table_headers": getattr(chunk, "table_headers", []),
+                            "table_rows": getattr(chunk, "table_rows", 0),
+                            "table_cols": getattr(chunk, "table_cols", 0),
                         }
                     )
             except Exception as e:
@@ -541,7 +560,7 @@ class VaultStorage:
         report.duration_seconds = round(time.time() - start_time, 2)
         return report
 
-    def search(self, query: str, top_k: int = 5) -> List[SearchResult]:
+    def search(self, query: str, top_k: int = 5, where: Optional[str] = None) -> List[SearchResult]:
         """Perform hybrid search over LanceDB chunks."""
         if self.table.count_rows() == 0:
             return []
@@ -555,16 +574,20 @@ class VaultStorage:
             # keyword-only evidence (fee schedules, statutory citations) below the 0.40 score-cliff
             # floor, drops recall from 90.3% to 83.9%, and triggers sibling expansion flooding (>0.58)
             # on pure-vector chunks. Cormack's unweighted rank fusion is scale-invariant and optimal here.
-            res = (
+            builder = (
                 self.table.search(query_type="hybrid")
                 .vector(query_vec)
                 .text(search_query)
-                .limit(top_k)
-                .to_list()
             )
+            if where:
+                builder = builder.where(where)
+            res = builder.limit(top_k).to_list()
         except Exception:
             # Fallback to vector search
-            res = self.table.search(query_vec).limit(top_k).to_list()
+            builder = self.table.search(query_vec)
+            if where:
+                builder = builder.where(where)
+            res = builder.limit(top_k).to_list()
 
         q_norm = math.sqrt(sum(x * x for x in query_vec)) or 1.0
 
@@ -588,12 +611,16 @@ class VaultStorage:
                 SearchResult(
                     id=r["id"],
                     file_path=r["file_path"],
-                    document_title=r["document_title"],
-                    section_title=r["section_title"],
-                    breadcrumbs=r["breadcrumbs"],
+                    document_title=r.get("document_title", ""),
+                    section_title=r.get("section_title", ""),
+                    breadcrumbs=r.get("breadcrumbs", ""),
                     content=r["content"],
                     wikilinks=list(r.get("wikilinks", [])),
                     score=score,
+                    chunk_type=r.get("chunk_type", "clause"),
+                    table_headers=list(r.get("table_headers") or []),
+                    table_rows=int(r.get("table_rows", 0) or 0),
+                    table_cols=int(r.get("table_cols", 0) or 0),
                 )
             )
 
@@ -634,6 +661,10 @@ class VaultStorage:
             where_sql = " or ".join(clauses)
             arrow_tbl = self.table.search().where(where_sql).to_arrow()
             results = []
+            has_chunk_type = "chunk_type" in arrow_tbl.column_names
+            has_table_headers = "table_headers" in arrow_tbl.column_names
+            has_table_rows = "table_rows" in arrow_tbl.column_names
+            has_table_cols = "table_cols" in arrow_tbl.column_names
             for i in range(len(arrow_tbl)):
                 results.append(
                     SearchResult(
@@ -645,6 +676,10 @@ class VaultStorage:
                         content=arrow_tbl["content"][i].as_py(),
                         wikilinks=list(arrow_tbl["wikilinks"][i].as_py() or []),
                         score=1.0,
+                        chunk_type=arrow_tbl["chunk_type"][i].as_py() if has_chunk_type else "clause",
+                        table_headers=list(arrow_tbl["table_headers"][i].as_py() or []) if has_table_headers else [],
+                        table_rows=int(arrow_tbl["table_rows"][i].as_py() or 0) if has_table_rows else 0,
+                        table_cols=int(arrow_tbl["table_cols"][i].as_py() or 0) if has_table_cols else 0,
                     )
                 )
             return results

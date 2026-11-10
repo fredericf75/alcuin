@@ -227,3 +227,39 @@ def test_massive_table_slicing_with_context():
     for c in table_chunks:
         assert "> **Table Context**: [Table: 30 rows × 3 columns | Showing rows" in c.content
         assert "| Item | Category | Price |" in c.content
+
+
+def test_spec030_table_metadata_preservation():
+    doc = (
+        "# Finance\n\n## Revenue Breakdown\n\n"
+        "| Product | 2025 | 2026 | Growth |\n"
+        "| :--- | :--- | :--- | :--- |\n"
+        "| iPhone | $200B | $220B | +10% |\n"
+        "| Mac | $30B | $32B | +6.7% |\n"
+    )
+    chunks = chunk_document_text("FinanceDoc", doc)
+    t_chunks = [c for c in chunks if c.chunk_type == "table"]
+    assert len(t_chunks) == 1
+    tc = t_chunks[0]
+    assert tc.chunk_type == "table"
+    assert tc.table_headers == ["Product", "2025", "2026", "Growth"]
+    assert tc.table_rows == 2
+    assert tc.table_cols == 4
+
+
+def test_spec030_schedule_metadata_preservation():
+    doc = (
+        "# Town Code\n\n## Section 6-132 Penalties\n\n"
+        "Offense Penalty\n"
+        "1st     $ 20.00 fine\n"
+        "2nd     $ 50.00 fine\n"
+        "3rd     $ 75.00 fine\n"
+    )
+    chunks = chunk_document_text("CaryCode", doc)
+    s_chunks = [c for c in chunks if c.chunk_type in ("table", "schedule")]
+    assert len(s_chunks) == 1
+    sc = s_chunks[0]
+    assert sc.chunk_type in ("table", "schedule")
+    assert sc.table_headers == ["Offense", "Penalty"]
+    assert sc.table_rows == 3
+    assert sc.table_cols == 2

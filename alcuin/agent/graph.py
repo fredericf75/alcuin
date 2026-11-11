@@ -22,6 +22,54 @@ from alcuin.storage.vault import Vault, VaultRegistry
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+# SPEC-013 & SPEC-031: Adaptive Score-Cliff Pruning Constants
+DEFAULT_CLIFF_MIN_STEP_DROP: float = 0.12          # Minimum absolute step delta (alpha)
+DEFAULT_CLIFF_MIN_RELATIVE_DROP: float = 0.20      # Minimum relative drop from predecessor (20%)
+DEFAULT_CLIFF_GRADIENT_DOMINANCE: float = 2.0      # Gradient dominance multiplier over prior plateau
+DEFAULT_CLIFF_ABSOLUTE_FLOOR: float = 0.40         # Baseline relevance floor below which hits drop
+
+
+def compute_adaptive_cliff_cutoff(
+    scores: List[float],
+    min_step_drop: float = DEFAULT_CLIFF_MIN_STEP_DROP,
+    min_relative_drop: float = DEFAULT_CLIFF_MIN_RELATIVE_DROP,
+    gradient_dominance: float = DEFAULT_CLIFF_GRADIENT_DOMINANCE,
+    absolute_floor: float = DEFAULT_CLIFF_ABSOLUTE_FLOOR,
+) -> int:
+    """Compute the cutoff index where an empirical score cliff occurs in sorted descending scores.
+
+    Returns the integer cutoff index k such that scores[:k] are admitted and scores[k:] are pruned.
+    If the top score is below absolute_floor, returns 0 (total cliff drop).
+    If no cliff is triggered, admits all scores >= absolute_floor.
+    """
+    if not scores:
+        return 0
+    if scores[0] < absolute_floor:
+        return 0
+    if len(scores) == 1:
+        return 1
+
+    deltas = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
+
+    for i, delta in enumerate(deltas):
+        # Condition 1: Minimum absolute drop
+        if delta < min_step_drop:
+            continue
+        # Condition 2: Minimum relative drop from predecessor
+        if scores[i] <= 0 or (delta / scores[i]) < min_relative_drop:
+            continue
+        # Condition 3: Gradient dominance over previous plateau (if i > 0)
+        if i > 0:
+            mean_prior = sum(deltas[:i]) / i
+            if delta < gradient_dominance * mean_prior:
+                continue
+        return i + 1
+
+    # No discrete cliff detected: admit all scores at or above the absolute floor
+    qualifying = [i for i, s in enumerate(scores) if s >= absolute_floor]
+    return len(qualifying)
+
+
 
 class CoverageItem(TypedDict):
     id: int
@@ -608,26 +656,52 @@ class ResearchAgent:
         if len(cleaned_items) >= 2:
             return self._extract_subgoals_from_items(cleaned_items, question)
 
-        # 2. Numbered decomposition for unstructured inquiries (bypasses brittle JSON serialization)
+        # 2. Numbered decomposition for unstructured inquiries (SPEC-031 role preservation)
         sys_prompt = (
             "You are a research query planner.\n"
-            "Deconstruct the user's inquiry into a numbered list of standalone, specific questions.\n"
+            "Deconstruct the user's inquiry into a numbered list of standalone, atomic search questions.\n"
             "Identify every distinct topic, condition, ratio, requirement, deadline, rule, or exception asked.\n"
             "CRITICAL RULES:\n"
             "1. Output each question as a numbered item (e.g. 1. [Question], 2. [Question]).\n"
-            "2. Each question must be strictly ATOMIC. Never combine multiple topics, requirements, or conditions into one question.\n"
-            "3. PRESERVE SPECIFICITY: Retain all numbers, measurements, thresholds, entity names, and statutory citations (e.g. '30-bed', '10A NCAC 13F', '14 days').\n"
-            "4. Do NOT output JSON, preamble, or conversational filler. Output ONLY the numbered questions."
+            "2. ATOMICITY: Each question must address exactly ONE requirement, topic, or condition. Never bundle multiple questions together.\n"
+            "3. ENTITY PRESERVATION: Name the specific entity, subject, or statute in every question. Never use pronouns like 'it', 'they', 'this rule', or 'the facility'.\n"
+            "4. PRESERVE SPECIFICITY: Retain all numbers, measurements, thresholds, and citations (e.g. '30-bed', '10A NCAC 13F', '14 days').\n"
+            "5. NO CONVERSATION: Do NOT answer the questions. Do NOT output preamble, intro, or JSON. Output ONLY numbered questions."
         )
-        llm_resp = self.planner_llm.chat(sys_prompt, question[:2000])
+        user_prompt = (
+            "[Task]\n"
+            "Deconstruct the user inquiry into a numbered list of standalone, atomic search questions.\n"
+            "Rules: Output ONLY numbered questions (1. ..., 2. ...). Name specific entities in every question (no pronouns). Do NOT answer the questions.\n\n"
+            "[Examples]\n"
+            "Inquiry: Can I build a 600 sq ft detached garage in the backyard, how close can it be to the property line, and does it need a separate electric permit?\n"
+            "1. What is the maximum permitted size for a detached accessory garage?\n"
+            "2. What are the minimum setback distances from the property line for a detached garage?\n"
+            "3. Is a separate electrical permit required for a detached garage?\n\n"
+            "Inquiry: For a 30-bed adult care home, how many aide duty hours are required per day, when must they stay awake at all times, and what is the penalty for failing to meet ratios?\n"
+            "1. How many daily personal care aide duty hours are required for a 30-bed adult care home?\n"
+            "2. Under what conditions must an adult care home personal care aide remain awake at all times?\n"
+            "3. What penalties apply to an adult care home for failure to meet required staffing ratios?\n\n"
+            f"[Inquiry]\n{question[:2000]}\n\n"
+            "[Numbered Questions]"
+        )
+        llm_resp = self.planner_llm.chat(sys_prompt, user_prompt)
         llm_resp, _ = _extract_and_clean_thinking(llm_resp)
 
         if llm_resp:
-            unstr_matches = re.findall(r"(?:^|\n)\s*(?:[A-Z]\.|\d+[\.\)])\s*([^\n]+)", llm_resp)
+            if "[Numbered Questions]" in llm_resp:
+                llm_resp = llm_resp.split("[Numbered Questions]")[-1].strip()
+
+            unstr_matches = re.findall(
+                r"(?:^|\n)\s*(?:\*\*)?(?:[A-Z]\.|\d+[\.\)])(?:\*\*)?\s*([^\n]+)",
+                llm_resp,
+            )
             unstr_items = [
-                re.sub(r"^\s*(?:[A-Z]\.|\d+[\.\)])\s*", "", m).strip()
+                re.sub(r"^\s*(?:\*\*)?(?:[A-Z]\.|\d+[\.\)])(?:\*\*)?\s*", "", m).strip(" *#")
                 for m in unstr_matches
                 if len(m.strip()) >= 8
+                and not m.strip().lower().startswith(
+                    ("here are", "certainly", "sure", "the following", "note that", "task:", "inquiry:")
+                )
             ]
             if len(unstr_items) >= 2:
                 return self._extract_subgoals_from_items(unstr_items, question)
@@ -636,7 +710,11 @@ class ResearchAgent:
             raw_lines = [
                 re.sub(r"^[\d\.\-\?\*\•\s]+", "", line).strip()
                 for line in llm_resp.strip().splitlines()
-                if len(line.strip()) >= 12 and not line.strip().endswith(":")
+                if len(line.strip()) >= 12
+                and not line.strip().endswith(":")
+                and not line.strip().lower().startswith(
+                    ("here are", "certainly", "sure", "the following", "note that", "task:", "inquiry:", "numbered questions")
+                )
             ]
             if len(raw_lines) >= 2:
                 return self._extract_subgoals_from_items(raw_lines, question)
@@ -722,8 +800,8 @@ class ResearchAgent:
     def prune_by_score_cliff(
         self,
         results: List[SearchResult],
-        min_drop: float = 0.12,
-        min_relative_drop: float = 0.20,
+        min_drop: float = DEFAULT_CLIFF_MIN_STEP_DROP,
+        min_relative_drop: float = DEFAULT_CLIFF_MIN_RELATIVE_DROP,
         query: str = "",
     ) -> List[SearchResult]:
         """Apply adaptive score-cliff pruning (Track 1) with non-body structural header & table rescue (Track 2)."""
@@ -732,37 +810,18 @@ class ResearchAgent:
 
         # Ensure results are strictly ordered descending by semantic score
         sorted_results = sorted(results, key=lambda x: x.score, reverse=True)
+        scores = [r.score for r in sorted_results]
 
-        # Track 1: Pure Vector Cliff
-        if sorted_results[0].score < 0.40:
-            admitted: List[SearchResult] = []
-            pruned: List[SearchResult] = list(sorted_results)
-        else:
-            scores = [r.score for r in sorted_results]
-            deltas = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
+        cutoff_idx = compute_adaptive_cliff_cutoff(
+            scores,
+            min_step_drop=min_drop,
+            min_relative_drop=min_relative_drop,
+            gradient_dominance=DEFAULT_CLIFF_GRADIENT_DOMINANCE,
+            absolute_floor=DEFAULT_CLIFF_ABSOLUTE_FLOOR,
+        )
 
-            cutoff_idx = None
-            for i, delta in enumerate(deltas):
-                # Condition 1: Minimum absolute drop
-                if delta < min_drop:
-                    continue
-                # Condition 2: Minimum relative drop from predecessor
-                if scores[i] <= 0 or (delta / scores[i]) < min_relative_drop:
-                    continue
-                # Condition 3: Gradient dominance over previous plateau (if i > 0)
-                if i > 0:
-                    mean_prior = sum(deltas[:i]) / i
-                    if delta < 2.0 * mean_prior:
-                        continue
-                cutoff_idx = i + 1
-                break
-
-            if cutoff_idx is not None:
-                admitted = sorted_results[:cutoff_idx]
-                pruned = sorted_results[cutoff_idx:]
-            else:
-                admitted = [r for r in sorted_results if r.score >= 0.40]
-                pruned = [r for r in sorted_results if r.score < 0.40]
+        admitted = sorted_results[:cutoff_idx]
+        pruned = sorted_results[cutoff_idx:]
 
         # Track 2: Non-Body Structural Header & Companion Table Rescue
         if pruned:

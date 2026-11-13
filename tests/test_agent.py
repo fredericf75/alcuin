@@ -43,6 +43,7 @@ def indexed_vault(tmp_path, monkeypatch):
 
 
 def test_research_agent_end_to_end(indexed_vault):
+    indexed_vault.config.multi_hop = True
     mock_llm = MockLLM(answer="Charlie's pediatrician Dr. Robinson is located at 742 Evergreen Terrace.")
     agent = ResearchAgent(indexed_vault, llm=mock_llm)
 
@@ -63,8 +64,9 @@ def test_research_agent_turn_ceiling_guardrail(indexed_vault):
                 return '{"sufficient": false, "thought": "Need more info", "next_query": "more info"}'
             return "Synthesized after max turns."
 
-    # Set vault max_iterations to 2
+    # Set vault max_iterations to 2 and multi_hop to True
     indexed_vault.config.max_iterations = 2
+    indexed_vault.config.multi_hop = True
     agent = ResearchAgent(indexed_vault, llm=AlwaysInsufficientLLM())
 
     result = agent.research("Complex query that never finishes")
@@ -74,6 +76,7 @@ def test_research_agent_turn_ceiling_guardrail(indexed_vault):
 
 
 def test_research_agent_streaming(indexed_vault):
+    indexed_vault.config.multi_hop = True
     mock_llm = MockLLM(answer="Streaming test answer.")
     agent = ResearchAgent(indexed_vault, llm=mock_llm)
 
@@ -146,6 +149,7 @@ def test_subquery_document_title_affinity(tmp_path, monkeypatch):
     storage = VaultStorage(vault)
     storage.index()
 
+    vault.config.subquery_synthesis = True
     mock_llm = MockLLM(answer="Adult care staff must remain awake.")
     agent = ResearchAgent(vault, llm=mock_llm)
 

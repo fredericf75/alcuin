@@ -112,6 +112,8 @@ class VaultConfig:
     source_diversification_decay: float = 0.90
     glossary_expansion: bool = True
     glossary: Dict[str, str] = field(default_factory=dict)
+    adaptive_fast_path: bool = True
+    fast_path_max_words: int = 32
 
     def __post_init__(self):
         inbox_pattern = f"{self.inbox_dir}/*"
@@ -264,6 +266,12 @@ class VaultConfig:
                 agent_sec.get("glossary_expansion", g_agent.get("glossary_expansion", True))
             ),
             glossary=dict(data.get("glossary", vault_sec.get("glossary", {}))),
+            adaptive_fast_path=bool(
+                agent_sec.get("adaptive_fast_path", g_agent.get("adaptive_fast_path", True))
+            ),
+            fast_path_max_words=int(
+                agent_sec.get("fast_path_max_words", g_agent.get("fast_path_max_words", 32))
+            ),
         )
 
     def apply_overrides(self, overrides: Dict[str, Any]) -> VaultConfig:
@@ -314,6 +322,8 @@ class VaultConfig:
             f"source_diversification_quota = {self.source_diversification_quota}",
             f"source_diversification_decay = {self.source_diversification_decay}",
             f"glossary_expansion = {'true' if self.glossary_expansion else 'false'}",
+            f"adaptive_fast_path = {'true' if self.adaptive_fast_path else 'false'}",
+            f"fast_path_max_words = {self.fast_path_max_words}",
         ]
         if self.context_headroom_tokens is not None:
             agent_lines.append(f"context_headroom_tokens = {self.context_headroom_tokens}")

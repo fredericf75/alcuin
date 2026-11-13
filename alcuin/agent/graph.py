@@ -114,6 +114,7 @@ class AgentState(TypedDict):
     unaddressed_sub_questions: Optional[List[int]]
     synthesis_evidence: Optional[List[Dict[str, Any]]]
     subquery_evidence_map: Optional[Dict[str, List[Dict[str, Any]]]]
+    fast_path_engaged: Optional[bool]
 
 
 def _extract_and_clean_thinking(raw_text: str) -> Tuple[str, str]:
@@ -663,8 +664,52 @@ class ResearchAgent:
 
         return sub_goals, sub_questions
 
+    def is_atomic_inquiry(self, question: str) -> bool:
+        """Deterministic syntactic classifier to determine if an inquiry is atomic (single-intent) under SPEC-036."""
+        if not getattr(self.vault.config, "adaptive_fast_path", True):
+            return False
+
+        clean_q = question.strip()
+        words = clean_q.split()
+        max_words = getattr(self.vault.config, "fast_path_max_words", 32)
+
+        # 1. Word count constraint
+        if len(words) > max_words:
+            return False
+
+        # 2. Punctuation constraint: at most 1 question mark, 0 semicolons
+        if clean_q.count("?") > 1 or ";" in clean_q:
+            return False
+
+        # 3. Enumeration or list structure constraint
+        if re.search(r"(?:^|\n)\s*(?:[A-Za-z]\.|\d+[\.\)]|[-*•])\s+", clean_q):
+            return False
+
+        # 4. Multi-clause conjunctions and comparative markers
+        comparative_markers = r"\b(?:compare|contrast|difference between|versus|\bvs\.?)\b"
+        if re.search(comparative_markers, clean_q, re.IGNORECASE):
+            return False
+
+        compound_conjunctions = r"\b(?:and also|as well as|furthermore|in addition to|along with|plus)\b"
+        if re.search(compound_conjunctions, clean_q, re.IGNORECASE):
+            return False
+
+        multi_question_conjunctions = r"\band\s+(?:what|when|where|why|how|who|which|can|is|are|does|do|will|should|must)\b"
+        if re.search(multi_question_conjunctions, clean_q, re.IGNORECASE):
+            return False
+
+        multi_clause_conditionals = r"\bif\b.+\bthen\b.+\band if\b"
+        if re.search(multi_clause_conditionals, clean_q, re.IGNORECASE):
+            return False
+
+        return True
+
     def decompose_query(self, question: str) -> Tuple[List[str], List[str]]:
         """Decompose a complex or multi-part inquiry into discrete search targets and synthesis sub-questions."""
+        # SPEC-036: Adaptive Fast-Path Intent Routing for atomic inquiries
+        if self.is_atomic_inquiry(question):
+            return [question], [question]
+
         has_subparts = bool(re.search(r"(?:[A-Z]\.|\b\d+[\.\)])", question))
         is_long = len(question.split()) > 25
 
@@ -1167,7 +1212,13 @@ class ResearchAgent:
         subquery_evidence_map: Dict[str, List[Dict[str, Any]]] = dict(state.get("subquery_evidence_map") or {})
 
         # 1. On turn 0, decompose question into discrete sub-goals and sub-questions
+        fast_path_engaged = state.get("fast_path_engaged", False)
         if state["iteration"] == 0:
+            if self.is_atomic_inquiry(state["question"]):
+                fast_path_engaged = True
+                thought_history.append(
+                    f"[FAST_PATH] Atomic inquiry detected ({len(state['question'].split())} words, single intent). Bypassing LLM planner."
+                )
             sub_goals, sub_questions = self.decompose_query(state["question"])
             # Batch all discrete sub-goals concurrently on initial turn (SPEC-032)
             search_targets = [g for g in sub_goals if g not in visited_queries]
@@ -1496,6 +1547,7 @@ class ResearchAgent:
             "thought_history": thought_history,
             "governor_alert": governor_alert,
             "subquery_evidence_map": subquery_evidence_map,
+            "fast_path_engaged": fast_path_engaged,
         }
 
     def _evaluate_node(self, state: AgentState) -> Dict[str, Any]:
@@ -2116,6 +2168,7 @@ class ResearchAgent:
             "synthesis_evidence": [],
             "subquery_evidence_map": {},
             "evidence_only": evidence_only,
+            "fast_path_engaged": False,
         }
 
         result = self.graph.invoke(initial_state)
@@ -2150,6 +2203,7 @@ class ResearchAgent:
             "synthesis_evidence": [],
             "subquery_evidence_map": {},
             "evidence_only": evidence_only,
+            "fast_path_engaged": False,
         }
 
         for step in self.graph.stream(initial_state):

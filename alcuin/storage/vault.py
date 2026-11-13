@@ -40,6 +40,16 @@ def load_global_config() -> Dict[str, Any]:
     return {}
 
 
+# SPEC-034 Dynamic Score Elasticity Empirical Constants
+# Note: Empirical calibration factors; to be replaced by dynamic non-empirical derivation in future work.
+DEFAULT_RETRIEVAL_ELASTICITY: bool = True
+DEFAULT_SUBQUERY_TOP_K_MIN: int = 3
+DEFAULT_SUBQUERY_TOP_K: int = 4
+DEFAULT_ELASTICITY_SCORE_THRESHOLD: float = 1.0  # Absolute high-confidence logit pass
+DEFAULT_ELASTICITY_ELBOW_FLOOR: float = -0.5     # Minimum logit floor for relative pass
+DEFAULT_ELASTICITY_ELBOW_DELTA: float = 2.5      # Maximum drop from Rank 1 logit
+
+
 @dataclass
 class VaultConfig:
     name: str = "default"
@@ -89,7 +99,12 @@ class VaultConfig:
     pre_synthesis_rerank: bool = True
     pre_synthesis_top_k: Optional[int] = None
     subquery_synthesis: bool = False
-    subquery_top_k: int = 4
+    retrieval_elasticity: bool = DEFAULT_RETRIEVAL_ELASTICITY
+    subquery_top_k_min: int = DEFAULT_SUBQUERY_TOP_K_MIN
+    subquery_top_k: int = DEFAULT_SUBQUERY_TOP_K
+    elasticity_score_threshold: float = DEFAULT_ELASTICITY_SCORE_THRESHOLD
+    elasticity_elbow_floor: float = DEFAULT_ELASTICITY_ELBOW_FLOOR
+    elasticity_elbow_delta: float = DEFAULT_ELASTICITY_ELBOW_DELTA
     reranker_enabled: bool = True
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     source_diversification: bool = True
@@ -212,8 +227,23 @@ class VaultConfig:
             subquery_synthesis=bool(
                 agent_sec.get("subquery_synthesis", g_agent.get("subquery_synthesis", False))
             ),
+            retrieval_elasticity=bool(
+                agent_sec.get("retrieval_elasticity", g_agent.get("retrieval_elasticity", DEFAULT_RETRIEVAL_ELASTICITY))
+            ),
+            subquery_top_k_min=int(
+                agent_sec.get("subquery_top_k_min", g_agent.get("subquery_top_k_min", DEFAULT_SUBQUERY_TOP_K_MIN))
+            ),
             subquery_top_k=int(
-                agent_sec.get("subquery_top_k", g_agent.get("subquery_top_k", 4))
+                agent_sec.get("subquery_top_k", g_agent.get("subquery_top_k", DEFAULT_SUBQUERY_TOP_K))
+            ),
+            elasticity_score_threshold=float(
+                agent_sec.get("elasticity_score_threshold", g_agent.get("elasticity_score_threshold", DEFAULT_ELASTICITY_SCORE_THRESHOLD))
+            ),
+            elasticity_elbow_floor=float(
+                agent_sec.get("elasticity_elbow_floor", g_agent.get("elasticity_elbow_floor", DEFAULT_ELASTICITY_ELBOW_FLOOR))
+            ),
+            elasticity_elbow_delta=float(
+                agent_sec.get("elasticity_elbow_delta", g_agent.get("elasticity_elbow_delta", DEFAULT_ELASTICITY_ELBOW_DELTA))
             ),
             reranker_enabled=bool(
                 agent_sec.get("reranker_enabled", g_agent.get("reranker_enabled", True))
@@ -272,7 +302,12 @@ class VaultConfig:
             f"pre_synthesis_rerank = {'true' if self.pre_synthesis_rerank else 'false'}",
             *( [f"pre_synthesis_top_k = {self.pre_synthesis_top_k}"] if self.pre_synthesis_top_k is not None else [] ),
             f"subquery_synthesis = {str(self.subquery_synthesis).lower()}",
+            f"retrieval_elasticity = {'true' if self.retrieval_elasticity else 'false'}",
+            f"subquery_top_k_min = {self.subquery_top_k_min}",
             f"subquery_top_k = {self.subquery_top_k}",
+            f"elasticity_score_threshold = {self.elasticity_score_threshold}",
+            f"elasticity_elbow_floor = {self.elasticity_elbow_floor}",
+            f"elasticity_elbow_delta = {self.elasticity_elbow_delta}",
             f"reranker_enabled = {'true' if self.reranker_enabled else 'false'}",
             f'reranker_model = "{self.reranker_model}"',
             f"source_diversification = {'true' if self.source_diversification else 'false'}",

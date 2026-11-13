@@ -17,7 +17,16 @@ import httpx
 from langgraph.graph import END, START, StateGraph
 
 from alcuin.storage.engine import SearchResult, VaultStorage
-from alcuin.storage.vault import Vault, VaultRegistry
+from alcuin.storage.vault import (
+    Vault,
+    VaultRegistry,
+    DEFAULT_RETRIEVAL_ELASTICITY,
+    DEFAULT_SUBQUERY_TOP_K_MIN,
+    DEFAULT_SUBQUERY_TOP_K,
+    DEFAULT_ELASTICITY_SCORE_THRESHOLD,
+    DEFAULT_ELASTICITY_ELBOW_FLOOR,
+    DEFAULT_ELASTICITY_ELBOW_DELTA,
+)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -1197,8 +1206,25 @@ class ResearchAgent:
                     ce_scores = self.cross_encoder.predict(pairs)
                     for r, sc in zip(raw_results, ce_scores):
                         r.score = float(sc)
-                    sub_k = getattr(self.vault.config, "subquery_top_k", 4)
-                    qualified = sorted(raw_results, key=lambda x: x.score, reverse=True)[:sub_k]
+                    sorted_results = sorted(raw_results, key=lambda x: x.score, reverse=True)
+                    elasticity_enabled = getattr(self.vault.config, "retrieval_elasticity", DEFAULT_RETRIEVAL_ELASTICITY)
+                    sub_k = getattr(self.vault.config, "subquery_top_k", DEFAULT_SUBQUERY_TOP_K)
+                    if not elasticity_enabled:
+                        qualified = sorted_results[:sub_k]
+                    else:
+                        k_min = getattr(self.vault.config, "subquery_top_k_min", DEFAULT_SUBQUERY_TOP_K_MIN)
+                        tau_abs = getattr(self.vault.config, "elasticity_score_threshold", DEFAULT_ELASTICITY_SCORE_THRESHOLD)
+                        tau_floor = getattr(self.vault.config, "elasticity_elbow_floor", DEFAULT_ELASTICITY_ELBOW_FLOOR)
+                        tau_delta = getattr(self.vault.config, "elasticity_elbow_delta", DEFAULT_ELASTICITY_ELBOW_DELTA)
+
+                        qualified = sorted_results[:min(k_min, len(sorted_results))]
+                        if len(sorted_results) > k_min:
+                            top1_sc = sorted_results[0].score
+                            for cand in sorted_results[k_min:sub_k]:
+                                passes_abs = (cand.score >= tau_abs)
+                                passes_rel = (cand.score >= tau_floor and (top1_sc - cand.score) <= tau_delta)
+                                if passes_abs or passes_rel:
+                                    qualified.append(cand)
                 except Exception as ce_exc:
                     logger.warning("CrossEncoder reranking failed, falling back to score cliff: %s", ce_exc)
                     qualified = self.prune_by_score_cliff(raw_results, query=target_query)

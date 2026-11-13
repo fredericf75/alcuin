@@ -110,3 +110,39 @@ def test_spec033_monolithic_synthesis_defaults():
     assert "multi_hop = false" in toml_str
     assert "reranker_enabled = true" in toml_str
 
+
+def test_spec034_elasticity_defaults_and_serialization():
+    cfg = VaultConfig()
+    assert cfg.retrieval_elasticity is True
+    assert cfg.subquery_top_k_min == 3
+    assert cfg.subquery_top_k == 4
+    assert cfg.elasticity_score_threshold == 1.0
+    assert cfg.elasticity_elbow_floor == -0.5
+    assert cfg.elasticity_elbow_delta == 2.5
+
+    toml_str = cfg.to_toml()
+    assert "retrieval_elasticity = true" in toml_str
+    assert "subquery_top_k_min = 3" in toml_str
+    assert "elasticity_score_threshold = 1.0" in toml_str
+    assert "elasticity_elbow_floor = -0.5" in toml_str
+    assert "elasticity_elbow_delta = 2.5" in toml_str
+
+    # Test roundtrip from dict
+    parsed = VaultConfig.from_dict({
+        "agent": {
+            "retrieval_elasticity": False,
+            "subquery_top_k_min": 1,
+            "subquery_top_k": 6,
+            "elasticity_score_threshold": 1.5,
+            "elasticity_elbow_floor": 0.0,
+            "elasticity_elbow_delta": 2.0,
+        }
+    })
+    assert parsed.retrieval_elasticity is False
+    assert parsed.subquery_top_k_min == 1
+    assert parsed.subquery_top_k == 6
+    assert parsed.elasticity_score_threshold == 1.5
+    assert parsed.elasticity_elbow_floor == 0.0
+    assert parsed.elasticity_elbow_delta == 2.0
+
+

@@ -197,3 +197,26 @@ def test_score_cliff_graph_hop_title_rescue(tmp_path):
     pruned = agent.prune_by_score_cliff(hits, query="Dr. Sarah Miller Pediatrics")
     assert [p.id for p in pruned] == ["c1"]
 
+
+def test_compute_adaptive_cliff_cutoff():
+    from alcuin.agent.graph import compute_adaptive_cliff_cutoff
+
+    # Empty list
+    assert compute_adaptive_cliff_cutoff([]) == 0
+
+    # Top score below floor
+    assert compute_adaptive_cliff_cutoff([0.35, 0.30]) == 0
+
+    # Single qualifying score
+    assert compute_adaptive_cliff_cutoff([0.75]) == 1
+
+    # Singular fact steep cliff: [0.88, 0.50, 0.45, 0.40] -> Cutoff at 1
+    assert compute_adaptive_cliff_cutoff([0.88, 0.50, 0.45, 0.40]) == 1
+
+    # Multi-clause flat plateau then cliff: [0.86, 0.84, 0.82, 0.45] -> Cutoff at 3
+    assert compute_adaptive_cliff_cutoff([0.86, 0.84, 0.82, 0.45]) == 3
+
+    # Flat cluster with no cliff: [0.85, 0.84, 0.83, 0.82] -> All qualify
+    assert compute_adaptive_cliff_cutoff([0.85, 0.84, 0.83, 0.82]) == 4
+
+

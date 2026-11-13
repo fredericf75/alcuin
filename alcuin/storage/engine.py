@@ -625,6 +625,21 @@ class VaultStorage:
             )
 
         results.sort(key=lambda x: x.score, reverse=True)
+
+        # Source Fair-Share Diversification: Prevent any single file from monopolizing top slots
+        if getattr(self.vault.config, "source_diversification", True):
+            distinct_files = {r.file_path for r in results}
+            if len(distinct_files) >= 2:
+                quota = getattr(self.vault.config, "source_diversification_quota", 3)
+                decay = getattr(self.vault.config, "source_diversification_decay", 0.90)
+                doc_counts: Dict[str, int] = {}
+                for r in results:
+                    cnt = doc_counts.get(r.file_path, 0)
+                    if cnt >= quota:
+                        r.score = r.score * (decay ** (cnt - quota + 1))
+                    doc_counts[r.file_path] = cnt + 1
+                results.sort(key=lambda x: x.score, reverse=True)
+
         return results
 
     def get_linked_pages(self, page_target: str) -> List[str]:

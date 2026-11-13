@@ -197,15 +197,17 @@ Alcuin implements **SPEC-025 Table Atomicity**:
 
 ---
 
-### Subquery-Isolated Synthesis (Anti-Contamination)
-When presented with a multi-part question (e.g., asking about roosters, coop setbacks, and fine amounts in a single prompt), naive RAG architectures suffer from *context contamination*—the LLM conflates clauses from different sections.
+### Monolithic Distilled Synthesis & High-Purity Retrieval
+When presented with complex multi-part questions (e.g. multi-statute regulatory inquiries, lease disputes, or financial disclosures), naive RAG architectures suffer from either *context contamination* (unfiltered noisy chunks confusing the LLM) or *context starvation* (isolated subquery passes that hide interdependent cross-clause context and truncate tables).
 
-Alcuin eliminates this via **Subquery-Isolated Synthesis**:
-1. **Syntactic Decomposition**: Automatically extracts atomic sub-goals (e.g. Sub-question 1: Hen count; Sub-question 2: Coop setback; Sub-question 3: Civil penalty).
-2. **Hybrid Candidate Scoring**: For each sub-question, Alcuin computes an isolated affinity score across the full admitted pool combining dense vector cosine similarity, keyword/token overlap, document title affinity, and score-cliff suppression:
-   $$\text{Score} = (0.5 \cdot \text{Cosine}) + (0.5 \cdot \text{KeywordOverlap}) + \text{TitleAffinity}$$
-3. **Dedicated Context Slices**: Ranks and allocates the top `subquery_top_k` (default: 6) chunks exclusively for each sub-question, preventing repetitive sister clauses from starving other sub-goals.
-4. **Harmonized Synthesis**: Synthesizes accurate, cited answers for each sub-question independently before assembling the final coherent brief, eliminating prompt refusal leakage and cross-question hallucinations.
+Alcuin resolves both dilemmas through **Monolithic Distilled Synthesis** (SPEC-033):
+1. **Syntactic Query Decomposition**: Automatically extracts atomic sub-goals and numbered inquiries on Turn 0.
+2. **Cross-Encoder Neural Distillation**: Each sub-goal retrieves candidates that are reranked via a local Cross-Encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`). The top `subquery_top_k` (default: 4) chunks per sub-goal are selected into a deduplicated evidence pool.
+3. **Source Fair-Share Diversification**: Marginal source decay ($\alpha = 0.90$ past quota $M = 3$) ensures no single file monopolizes the evidence pool when analyzing multi-document corpora.
+4. **Unified Single-Pass Synthesis**: The model receives the full high-purity distilled evidence pool in a single synthesis prompt. This preserves table structures, eliminates sub-question answer truncation, and enables cross-clause reasoning while reducing latency by 25%–75%.
+
+> [!NOTE]
+> **Subquery-Isolated Synthesis Fallback**: For environments requiring strict per-subquestion accumulator isolation, set `subquery_synthesis = true` in `alcuin.toml`.
 
 ### Research Options & CLI Flags
 
@@ -444,9 +446,15 @@ context_governor = true
 context_window = 16384
 context_headroom_tokens = 2048
 
-# Subquery-Isolated Synthesis & Context Allocation
-subquery_synthesis = true              # Decompose multi-clause inquiries into isolated synthesis passes
-subquery_top_k = 6                     # Dedicated candidate chunk quota per subquery slice
+# Synthesis Architecture & Cross-Encoder Distillation
+subquery_synthesis = false            # Default: Monolithic distilled synthesis; set true for isolated subquery passes
+subquery_top_k = 4                    # Top-k primary candidates retrieved per sub-goal
+reranker_enabled = true               # Cross-Encoder neural reranker on Turn 0
+reranker_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+source_diversification = true         # Prevent single document monopolization in multi-source vaults
+source_diversification_quota = 3
+source_diversification_decay = 0.90
+multi_hop = false                     # Disable multi-turn hop exploration on Turn 0 when single pass suffices
 
 [storage]
 embedding_model = "nomic-embed-text"

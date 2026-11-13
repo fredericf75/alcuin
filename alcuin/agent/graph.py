@@ -22,6 +22,54 @@ from alcuin.storage.vault import Vault, VaultRegistry
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+# SPEC-013 & SPEC-031: Adaptive Score-Cliff Pruning Constants
+DEFAULT_CLIFF_MIN_STEP_DROP: float = 0.12          # Minimum absolute step delta (alpha)
+DEFAULT_CLIFF_MIN_RELATIVE_DROP: float = 0.20      # Minimum relative drop from predecessor (20%)
+DEFAULT_CLIFF_GRADIENT_DOMINANCE: float = 2.0      # Gradient dominance multiplier over prior plateau
+DEFAULT_CLIFF_ABSOLUTE_FLOOR: float = 0.40         # Baseline relevance floor below which hits drop
+
+
+def compute_adaptive_cliff_cutoff(
+    scores: List[float],
+    min_step_drop: float = DEFAULT_CLIFF_MIN_STEP_DROP,
+    min_relative_drop: float = DEFAULT_CLIFF_MIN_RELATIVE_DROP,
+    gradient_dominance: float = DEFAULT_CLIFF_GRADIENT_DOMINANCE,
+    absolute_floor: float = DEFAULT_CLIFF_ABSOLUTE_FLOOR,
+) -> int:
+    """Compute the cutoff index where an empirical score cliff occurs in sorted descending scores.
+
+    Returns the integer cutoff index k such that scores[:k] are admitted and scores[k:] are pruned.
+    If the top score is below absolute_floor, returns 0 (total cliff drop).
+    If no cliff is triggered, admits all scores >= absolute_floor.
+    """
+    if not scores:
+        return 0
+    if scores[0] < absolute_floor:
+        return 0
+    if len(scores) == 1:
+        return 1
+
+    deltas = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
+
+    for i, delta in enumerate(deltas):
+        # Condition 1: Minimum absolute drop
+        if delta < min_step_drop:
+            continue
+        # Condition 2: Minimum relative drop from predecessor
+        if scores[i] <= 0 or (delta / scores[i]) < min_relative_drop:
+            continue
+        # Condition 3: Gradient dominance over previous plateau (if i > 0)
+        if i > 0:
+            mean_prior = sum(deltas[:i]) / i
+            if delta < gradient_dominance * mean_prior:
+                continue
+        return i + 1
+
+    # No discrete cliff detected: admit all scores at or above the absolute floor
+    qualifying = [i for i, s in enumerate(scores) if s >= absolute_floor]
+    return len(qualifying)
+
+
 
 class CoverageItem(TypedDict):
     id: int
@@ -56,6 +104,7 @@ class AgentState(TypedDict):
     synthesis_clipped: Optional[bool]
     unaddressed_sub_questions: Optional[List[int]]
     synthesis_evidence: Optional[List[Dict[str, Any]]]
+    subquery_evidence_map: Optional[Dict[str, List[Dict[str, Any]]]]
 
 
 def _extract_and_clean_thinking(raw_text: str) -> Tuple[str, str]:
@@ -222,7 +271,9 @@ class LLMClient:
         system_prompt: str,
         user_prompt: str,
         return_metadata: bool = False,
+        temperature: Optional[float] = None,
     ) -> Any:
+        eff_temp = self.temperature if temperature is None else float(temperature)
         is_local = "localhost" in self.endpoint or "127.0.0.1" in self.endpoint
         is_openrouter = "openrouter.ai" in self.endpoint
         is_google = (
@@ -242,7 +293,7 @@ class LLMClient:
                 payload = {
                     "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
                     "systemInstruction": {"parts": [{"text": system_prompt}]},
-                    "generationConfig": {"temperature": self.temperature},
+                    "generationConfig": {"temperature": eff_temp},
                 }
                 with httpx.Client(timeout=self.timeout) as client:
                     resp = client.post(url, json=payload)
@@ -283,7 +334,7 @@ class LLMClient:
         if is_local and not is_openai_explicit:
             try:
                 with httpx.Client(timeout=self.timeout) as client:
-                    ollama_options: Dict[str, Any] = {"temperature": self.temperature}
+                    ollama_options: Dict[str, Any] = {"temperature": eff_temp}
                     if self.context_window:
                         ollama_options["num_ctx"] = int(self.context_window)
                     ollama_body: Dict[str, Any] = {
@@ -371,7 +422,7 @@ class LLMClient:
                             },
                             {"role": "user", "content": user_prompt},
                         ],
-                        "temperature": self.temperature,
+                        "temperature": eff_temp,
                         "max_tokens": 2048,
                     },
                 )
@@ -490,6 +541,16 @@ class ResearchAgent:
         if hasattr(self.llm, "context_window") and self.llm.context_window is None:
             self.llm.context_window = ctx_win
         self.planner_llm = planner_llm or self.llm
+
+        self.cross_encoder = None
+        if getattr(vault.config, "reranker_enabled", True):
+            try:
+                from sentence_transformers import CrossEncoder
+                m_name = getattr(vault.config, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+                self.cross_encoder = CrossEncoder(m_name)
+            except Exception as e:
+                logger.warning("Could not initialize CrossEncoder reranker: %s", e)
+
         self.graph = self._build_graph()
 
     def get_model_context_window(self) -> int:
@@ -525,7 +586,11 @@ class ResearchAgent:
         workflow.add_node("synthesize", self._synthesize_node)
 
         workflow.add_edge(START, "retrieve")
-        workflow.add_edge("retrieve", "evaluate")
+        workflow.add_conditional_edges(
+            "retrieve",
+            self._route_retrieval,
+            {"evaluate": "evaluate", "synthesize": "synthesize", "end": END},
+        )
         workflow.add_conditional_edges(
             "evaluate",
             self._route_evaluation,
@@ -608,26 +673,52 @@ class ResearchAgent:
         if len(cleaned_items) >= 2:
             return self._extract_subgoals_from_items(cleaned_items, question)
 
-        # 2. Numbered decomposition for unstructured inquiries (bypasses brittle JSON serialization)
+        # 2. Numbered decomposition for unstructured inquiries (SPEC-031 role preservation)
         sys_prompt = (
             "You are a research query planner.\n"
-            "Deconstruct the user's inquiry into a numbered list of standalone, specific questions.\n"
+            "Deconstruct the user's inquiry into a numbered list of standalone, atomic search questions.\n"
             "Identify every distinct topic, condition, ratio, requirement, deadline, rule, or exception asked.\n"
             "CRITICAL RULES:\n"
             "1. Output each question as a numbered item (e.g. 1. [Question], 2. [Question]).\n"
-            "2. Each question must be strictly ATOMIC. Never combine multiple topics, requirements, or conditions into one question.\n"
-            "3. PRESERVE SPECIFICITY: Retain all numbers, measurements, thresholds, entity names, and statutory citations (e.g. '30-bed', '10A NCAC 13F', '14 days').\n"
-            "4. Do NOT output JSON, preamble, or conversational filler. Output ONLY the numbered questions."
+            "2. ATOMICITY: Each question must address exactly ONE requirement, topic, or condition. Never bundle multiple questions together.\n"
+            "3. ENTITY PRESERVATION: Name the specific entity, subject, or statute in every question. Never use pronouns like 'it', 'they', 'this rule', or 'the facility'.\n"
+            "4. PRESERVE SPECIFICITY: Retain all numbers, measurements, thresholds, and specific legal citations from the inquiry (e.g. '14 days', '50 feet', 'second offense').\n"
+            "5. NO CONVERSATION: Do NOT answer the questions. Do NOT output preamble, intro, or JSON. Output ONLY numbered questions."
         )
-        llm_resp = self.planner_llm.chat(sys_prompt, question[:2000])
+        user_prompt = (
+            "[Task]\n"
+            "Deconstruct the user inquiry into a numbered list of standalone, atomic search questions.\n"
+            "Rules: Output ONLY numbered questions (1. ..., 2. ...). Name specific entities in every question (no pronouns). Do NOT answer the questions.\n\n"
+            "[Examples]\n"
+            "Inquiry: Can I build a 600 sq ft detached garage in the backyard, how close can it be to the property line, and does it need a separate electric permit?\n"
+            "1. What is the maximum permitted size for a detached accessory garage?\n"
+            "2. What are the minimum setback distances from the property line for a detached garage?\n"
+            "3. Is a separate electrical permit required for a detached garage?\n\n"
+            "Inquiry: For a 30-bed adult care home, how many aide duty hours are required per day, when must they stay awake at all times, and what is the penalty for failing to meet ratios?\n"
+            "1. How many daily personal care aide duty hours are required for a 30-bed adult care home?\n"
+            "2. Under what conditions must an adult care home personal care aide remain awake at all times?\n"
+            "3. What penalties apply to an adult care home for failure to meet required staffing ratios?\n\n"
+            f"[Inquiry]\n{question[:2000]}\n\n"
+            "[Numbered Questions]"
+        )
+        llm_resp = self.planner_llm.chat(sys_prompt, user_prompt, temperature=0.0)
         llm_resp, _ = _extract_and_clean_thinking(llm_resp)
 
         if llm_resp:
-            unstr_matches = re.findall(r"(?:^|\n)\s*(?:[A-Z]\.|\d+[\.\)])\s*([^\n]+)", llm_resp)
+            if "[Numbered Questions]" in llm_resp:
+                llm_resp = llm_resp.split("[Numbered Questions]")[-1].strip()
+
+            unstr_matches = re.findall(
+                r"(?:^|\n)\s*(?:\*\*)?(?:[A-Z]\.|\d+[\.\)])(?:\*\*)?\s*([^\n]+)",
+                llm_resp,
+            )
             unstr_items = [
-                re.sub(r"^\s*(?:[A-Z]\.|\d+[\.\)])\s*", "", m).strip()
+                re.sub(r"^\s*(?:\*\*)?(?:[A-Z]\.|\d+[\.\)])(?:\*\*)?\s*", "", m).strip(" *#")
                 for m in unstr_matches
                 if len(m.strip()) >= 8
+                and not m.strip().lower().startswith(
+                    ("here are", "certainly", "sure", "the following", "note that", "task:", "inquiry:")
+                )
             ]
             if len(unstr_items) >= 2:
                 return self._extract_subgoals_from_items(unstr_items, question)
@@ -636,7 +727,11 @@ class ResearchAgent:
             raw_lines = [
                 re.sub(r"^[\d\.\-\?\*\•\s]+", "", line).strip()
                 for line in llm_resp.strip().splitlines()
-                if len(line.strip()) >= 12 and not line.strip().endswith(":")
+                if len(line.strip()) >= 12
+                and not line.strip().endswith(":")
+                and not line.strip().lower().startswith(
+                    ("here are", "certainly", "sure", "the following", "note that", "task:", "inquiry:", "numbered questions")
+                )
             ]
             if len(raw_lines) >= 2:
                 return self._extract_subgoals_from_items(raw_lines, question)
@@ -722,8 +817,8 @@ class ResearchAgent:
     def prune_by_score_cliff(
         self,
         results: List[SearchResult],
-        min_drop: float = 0.12,
-        min_relative_drop: float = 0.20,
+        min_drop: float = DEFAULT_CLIFF_MIN_STEP_DROP,
+        min_relative_drop: float = DEFAULT_CLIFF_MIN_RELATIVE_DROP,
         query: str = "",
     ) -> List[SearchResult]:
         """Apply adaptive score-cliff pruning (Track 1) with non-body structural header & table rescue (Track 2)."""
@@ -732,37 +827,18 @@ class ResearchAgent:
 
         # Ensure results are strictly ordered descending by semantic score
         sorted_results = sorted(results, key=lambda x: x.score, reverse=True)
+        scores = [r.score for r in sorted_results]
 
-        # Track 1: Pure Vector Cliff
-        if sorted_results[0].score < 0.40:
-            admitted: List[SearchResult] = []
-            pruned: List[SearchResult] = list(sorted_results)
-        else:
-            scores = [r.score for r in sorted_results]
-            deltas = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
+        cutoff_idx = compute_adaptive_cliff_cutoff(
+            scores,
+            min_step_drop=min_drop,
+            min_relative_drop=min_relative_drop,
+            gradient_dominance=DEFAULT_CLIFF_GRADIENT_DOMINANCE,
+            absolute_floor=DEFAULT_CLIFF_ABSOLUTE_FLOOR,
+        )
 
-            cutoff_idx = None
-            for i, delta in enumerate(deltas):
-                # Condition 1: Minimum absolute drop
-                if delta < min_drop:
-                    continue
-                # Condition 2: Minimum relative drop from predecessor
-                if scores[i] <= 0 or (delta / scores[i]) < min_relative_drop:
-                    continue
-                # Condition 3: Gradient dominance over previous plateau (if i > 0)
-                if i > 0:
-                    mean_prior = sum(deltas[:i]) / i
-                    if delta < 2.0 * mean_prior:
-                        continue
-                cutoff_idx = i + 1
-                break
-
-            if cutoff_idx is not None:
-                admitted = sorted_results[:cutoff_idx]
-                pruned = sorted_results[cutoff_idx:]
-            else:
-                admitted = [r for r in sorted_results if r.score >= 0.40]
-                pruned = [r for r in sorted_results if r.score < 0.40]
+        admitted = sorted_results[:cutoff_idx]
+        pruned = sorted_results[cutoff_idx:]
 
         # Track 2: Non-Body Structural Header & Companion Table Rescue
         if pruned:
@@ -946,6 +1022,128 @@ class ResearchAgent:
             logger.warning("Candidate link scoring fallback triggered", exc_info=True)
             return [(link_clean, 1.0) for link_clean, _ in candidates]
 
+    def _expand_ast_siblings(
+        self,
+        primary_hits: List[SearchResult],
+        query: str,
+        visited_ids: Set[str],
+    ) -> Tuple[List[SearchResult], Dict[str, float]]:
+        """Expand AST siblings for high-scoring primary hits within their document subtree."""
+        sibling_candidates: List[SearchResult] = []
+        sibling_scores: Dict[str, float] = {}
+        if not getattr(self.vault.config, "sibling_traversal", True) or not primary_hits:
+            return sibling_candidates, sibling_scores
+
+        gamma = float(getattr(self.vault.config, "ast_sibling_attenuation", 0.72))
+        threshold = float(getattr(self.vault.config, "sibling_pruning_threshold", 0.45))
+        if 0.0 < gamma < 1.0 and threshold > 0.0:
+            max_admissible_dist = int(math.floor(math.log(threshold) / math.log(gamma) + 1e-9))
+        else:
+            max_admissible_dist = 10
+
+        cand_sibling_map: Dict[str, Tuple[SearchResult, int]] = {}
+        seen_cand_ids = set(visited_ids) | {p.id for p in primary_hits}
+        primary_indices_by_heading: Dict[Tuple[str, str], List[int]] = {}
+
+        for p in primary_hits:
+            # Expand siblings for primary hits with strong semantic relevance (Anchor Threshold >= 0.70)
+            if p.score >= 0.70 and p.breadcrumbs:
+                crumbs = [c.strip() for c in p.breadcrumbs.split(" > ") if c.strip()]
+                doc_title = p.document_title.strip() if p.document_title else ""
+                sec_crumbs = [c for c in crumbs if c.lower() != doc_title.lower()]
+                parent_heading = sec_crumbs[0] if sec_crumbs else crumbs[-1]
+                m_p = re.search(r"#(\d+)$", p.id)
+                p_idx = int(m_p.group(1)) if m_p else 0
+                key = (p.file_path, parent_heading)
+                primary_indices_by_heading.setdefault(key, []).append(p_idx)
+
+        for (fpath, parent_heading), indices in primary_indices_by_heading.items():
+            matched_rows = []
+            try:
+                if hasattr(self.storage, "table") and self.storage.table is not None:
+                    clean_heading = parent_heading.replace("'", "''")
+                    clean_file = fpath.replace("'", "''")
+                    query_filter = f"file_path = '{clean_file}' AND breadcrumbs LIKE '%{clean_heading}%'"
+                    matched_rows = self.storage.table.search().where(query_filter).to_list()
+            except Exception:
+                matched_rows = []
+
+            # Fallback for mock environments or storage engines without LanceDB table search
+            if not matched_rows and hasattr(self.storage, "get_chunks_by_ids"):
+                cand_ids = [
+                    f"{fpath}#{pi + off}"
+                    for pi in indices
+                    for off in (-2, -1, 1, 2)
+                    if (pi + off) > 0
+                ]
+                fallback_chunks = self.storage.get_chunks_by_ids(cand_ids)
+                for fc in fallback_chunks:
+                    matched_rows.append({
+                        "id": fc.id,
+                        "file_path": fc.file_path,
+                        "document_title": fc.document_title,
+                        "section_title": fc.section_title,
+                        "breadcrumbs": fc.breadcrumbs,
+                        "content": fc.content,
+                        "wikilinks": fc.wikilinks,
+                    })
+
+            for r in matched_rows:
+                cid = r["id"]
+                if cid not in seen_cand_ids and cid not in cand_sibling_map:
+                    seen_cand_ids.add(cid)
+                    m_s = re.search(r"#(\d+)$", cid)
+                    s_idx = int(m_s.group(1)) if m_s else 0
+                    dist = min(abs(s_idx - pi) for pi in indices)
+                    # Pre-embedding distance pruning: If distance alone attenuates eff_score below
+                    # threshold even under perfect cosine similarity (1.0 * gamma^dist < threshold),
+                    # skip embedding entirely to eliminate CPU embedding bottlenecks.
+                    if dist > max_admissible_dist or dist == 0:
+                        continue
+                    cand_sibling_map[cid] = (
+                        SearchResult(
+                            id=cid,
+                            file_path=r["file_path"],
+                            document_title=r.get("document_title", ""),
+                            section_title=r.get("section_title", ""),
+                            breadcrumbs=r.get("breadcrumbs", ""),
+                            content=r["content"],
+                            wikilinks=r.get("wikilinks", []),
+                            score=0.0,
+                        ),
+                        dist,
+                    )
+
+        if cand_sibling_map:
+            from unittest.mock import MagicMock
+            cand_entries = list(cand_sibling_map.values())
+            cand_items = [entry[0] for entry in cand_entries]
+            cand_dists = [entry[1] for entry in cand_entries]
+
+            if isinstance(getattr(self, "score_candidate_links", None), MagicMock):
+                mock_pairs = [(sr.id, f"{sr.breadcrumbs}: {sr.content[:300]}") for sr in cand_items]
+                mock_scored = dict(self.score_candidate_links(query, mock_pairs))
+                raw_sims = [mock_scored.get(sr.id, 0.0) for sr in cand_items]
+            else:
+                q_vec = self.storage.embedder.get_embedding(query)
+                q_norm = math.sqrt(sum(x * x for x in q_vec)) or 1.0
+                cand_texts = [f"{s.breadcrumbs}: {s.content[:300]}" for s in cand_items]
+                l_vecs = self.storage.embedder.get_embeddings_batch(cand_texts)
+                raw_sims = []
+                for l_vec in l_vecs:
+                    l_norm = math.sqrt(sum(x * x for x in l_vec)) or 1.0
+                    dot = sum(a * b for a, b in zip(q_vec, l_vec))
+                    raw_sims.append(max(0.0, dot / (q_norm * l_norm)))
+
+            for s, dist, raw_sim in zip(cand_items, cand_dists, raw_sims):
+                eff_score = raw_sim * (gamma ** min(dist, 10))
+                if eff_score >= threshold:
+                    s.score = eff_score
+                    sibling_candidates.append(s)
+                    sibling_scores[s.id] = eff_score
+
+        return sibling_candidates, sibling_scores
+
     def _retrieve_node(self, state: AgentState) -> Dict[str, Any]:
         evidence_list = list(state.get("evidence", []))
         visited_ids = {e["id"] for e in evidence_list}
@@ -957,12 +1155,13 @@ class ResearchAgent:
         sub_questions = list(state.get("sub_questions", []))
         recomposed_topics = list(state.get("recomposed_topics", []))
         thought_history = list(state.get("thought_history", []))
+        subquery_evidence_map: Dict[str, List[Dict[str, Any]]] = dict(state.get("subquery_evidence_map") or {})
 
         # 1. On turn 0, decompose question into discrete sub-goals and sub-questions
         if state["iteration"] == 0:
             sub_goals, sub_questions = self.decompose_query(state["question"])
-            # Batch discrete sub-goals up to 5 concurrent queries on initial turn
-            search_targets = [g for g in sub_goals if g not in visited_queries][:5]
+            # Batch all discrete sub-goals concurrently on initial turn (SPEC-032)
+            search_targets = [g for g in sub_goals if g not in visited_queries]
             if not search_targets:
                 search_targets = [state["question"]]
         else:
@@ -983,6 +1182,8 @@ class ResearchAgent:
         current_turn_primary: List[SearchResult] = []
         new_candidates: List[Tuple[str, str]] = []
         per_target_results: List[List[SearchResult]] = []
+        all_sibling_candidates: List[SearchResult] = []
+        all_sibling_scores: Dict[str, float] = {}
 
         for target_query in search_targets:
             if target_query in visited_queries:
@@ -990,8 +1191,80 @@ class ResearchAgent:
             visited_queries.append(target_query)
             search_depth = getattr(self.vault.config, "retrieval_candidates", 20)
             raw_results = self.storage.search(target_query, top_k=search_depth)
-            qualified = self.prune_by_score_cliff(raw_results, query=target_query)
+            if self.cross_encoder is not None and raw_results:
+                try:
+                    pairs = [(target_query, f"{r.section_title or ''} {r.content}") for r in raw_results]
+                    ce_scores = self.cross_encoder.predict(pairs)
+                    for r, sc in zip(raw_results, ce_scores):
+                        r.score = float(sc)
+                    sub_k = getattr(self.vault.config, "subquery_top_k", 4)
+                    qualified = sorted(raw_results, key=lambda x: x.score, reverse=True)[:sub_k]
+                except Exception as ce_exc:
+                    logger.warning("CrossEncoder reranking failed, falling back to score cliff: %s", ce_exc)
+                    qualified = self.prune_by_score_cliff(raw_results, query=target_query)
+            else:
+                qualified = self.prune_by_score_cliff(raw_results, query=target_query)
             per_target_results.append(qualified)
+
+            # Scoped sibling expansion strictly for this subquery's primary hits
+            scoped_siblings, scoped_sib_scores = self._expand_ast_siblings(
+                qualified,
+                query=target_query,
+                visited_ids=visited_ids | {r.id for r in qualified},
+            )
+            all_sibling_candidates.extend(scoped_siblings)
+            all_sibling_scores.update(scoped_sib_scores)
+
+            # Build partitioned subquery cluster with Tier-1 Priority and Intra-Section Quota (Max 2 per section)
+            primary_ids = {r.id for r in qualified}
+            sorted_cands = sorted(
+                list(qualified) + list(scoped_siblings),
+                key=lambda r: (1 if r.id in primary_ids else 0, scoped_sib_scores.get(r.id, r.score)),
+                reverse=True
+            )
+
+            def _get_major_sec(bc_val: Optional[str], fp_val: str) -> str:
+                bc_str = bc_val or ""
+                m_sec = re.search(r'(?:Sec\.|Section|§|\.)\s*(\d+\.\d+)', bc_str)
+                if m_sec:
+                    return f"{fp_val}#{m_sec.group(1)}"
+                m_art = re.search(r'(?:Article|Subchapter|\.)\s*([A-Za-z0-9]+)', bc_str)
+                if m_art:
+                    return f"{fp_val}#{m_art.group(1)}"
+                return fp_val
+
+            sec_quota_counts: Dict[str, int] = {}
+            cluster_hits: List[SearchResult] = []
+            for r in sorted_cands:
+                sec_k = _get_major_sec(r.breadcrumbs, r.file_path)
+                cnt = sec_quota_counts.get(sec_k, 0)
+                if cnt < 2:
+                    sec_quota_counts[sec_k] = cnt + 1
+                    cluster_hits.append(r)
+
+            seen_cluster_ids = set()
+            cluster_dicts: List[Dict[str, Any]] = []
+            for r in cluster_hits:
+                if r.id not in seen_cluster_ids:
+                    seen_cluster_ids.add(r.id)
+                    cluster_dicts.append({
+                        "id": r.id,
+                        "file_path": r.file_path,
+                        "document_title": r.document_title,
+                        "section_title": r.section_title,
+                        "breadcrumbs": r.breadcrumbs,
+                        "content": r.content,
+                        "wikilinks": r.wikilinks,
+                        "score": scoped_sib_scores.get(r.id, r.score),
+                        "origin_subquery": target_query,
+                        "is_primary": r.id in primary_ids,
+                    })
+
+            subquery_evidence_map[target_query] = cluster_dicts
+            if target_query in sub_goals:
+                sg_idx = sub_goals.index(target_query)
+                if sg_idx < len(sub_questions):
+                    subquery_evidence_map[sub_questions[sg_idx]] = cluster_dicts
 
             for r in qualified:
                 # Extract candidate cross-references if in broad inquiry scope
@@ -1019,116 +1292,6 @@ class ResearchAgent:
                         if r.id not in visited_ids and r.id not in seen_in_turn:
                             seen_in_turn.add(r.id)
                             current_turn_primary.append(r)
-        # Intra-Document AST Sibling Expansion (SPEC-006 with Spatial Distance Attenuation)
-        sibling_candidates: List[SearchResult] = []
-        sibling_scores: Dict[str, float] = {}
-        if getattr(self.vault.config, "sibling_traversal", True) and current_turn_primary:
-            gamma = float(getattr(self.vault.config, "ast_sibling_attenuation", 0.72))
-            threshold = float(getattr(self.vault.config, "sibling_pruning_threshold", 0.45))
-            if 0.0 < gamma < 1.0 and threshold > 0.0:
-                max_admissible_dist = int(math.floor(math.log(threshold) / math.log(gamma) + 1e-9))
-            else:
-                max_admissible_dist = 10
-
-            cand_sibling_map: Dict[str, Tuple[SearchResult, int]] = {}
-            seen_cand_ids = set(visited_ids) | {p.id for p in current_turn_primary}
-            primary_indices_by_heading: Dict[Tuple[str, str], List[int]] = {}
-
-            for p in current_turn_primary:
-                # Expand siblings for primary hits with strong semantic relevance
-                if p.score >= 0.58 and p.breadcrumbs:
-                    crumbs = [c.strip() for c in p.breadcrumbs.split(" > ") if c.strip()]
-                    doc_title = p.document_title.strip() if p.document_title else ""
-                    sec_crumbs = [c for c in crumbs if c.lower() != doc_title.lower()]
-                    parent_heading = sec_crumbs[0] if sec_crumbs else crumbs[-1]
-                    m_p = re.search(r"#(\d+)$", p.id)
-                    p_idx = int(m_p.group(1)) if m_p else 0
-                    key = (p.file_path, parent_heading)
-                    primary_indices_by_heading.setdefault(key, []).append(p_idx)
-
-            for (fpath, parent_heading), indices in primary_indices_by_heading.items():
-                matched_rows = []
-                try:
-                    if hasattr(self.storage, "table") and self.storage.table is not None:
-                        clean_heading = parent_heading.replace("'", "''")
-                        clean_file = fpath.replace("'", "''")
-                        query_filter = f"file_path = '{clean_file}' AND breadcrumbs LIKE '%{clean_heading}%'"
-                        matched_rows = self.storage.table.search().where(query_filter).to_list()
-                except Exception:
-                    matched_rows = []
-
-                # Fallback for mock environments or storage engines without LanceDB table search
-                if not matched_rows and hasattr(self.storage, "get_chunks_by_ids"):
-                    cand_ids = [
-                        f"{fpath}#{pi + off}"
-                        for pi in indices
-                        for off in (-2, -1, 1, 2)
-                        if (pi + off) > 0
-                    ]
-                    fallback_chunks = self.storage.get_chunks_by_ids(cand_ids)
-                    for fc in fallback_chunks:
-                        matched_rows.append({
-                            "id": fc.id,
-                            "file_path": fc.file_path,
-                            "document_title": fc.document_title,
-                            "section_title": fc.section_title,
-                            "breadcrumbs": fc.breadcrumbs,
-                            "content": fc.content,
-                            "wikilinks": fc.wikilinks,
-                        })
-
-                for r in matched_rows:
-                    cid = r["id"]
-                    if cid not in seen_cand_ids and cid not in cand_sibling_map:
-                        seen_cand_ids.add(cid)
-                        m_s = re.search(r"#(\d+)$", cid)
-                        s_idx = int(m_s.group(1)) if m_s else 0
-                        dist = min(abs(s_idx - pi) for pi in indices)
-                        # Pre-embedding distance pruning: If distance alone attenuates eff_score below
-                        # threshold even under perfect cosine similarity (1.0 * gamma^dist < threshold),
-                        # skip embedding entirely to eliminate CPU embedding bottlenecks.
-                        if dist > max_admissible_dist or dist == 0:
-                            continue
-                        cand_sibling_map[cid] = (
-                            SearchResult(
-                                id=cid,
-                                file_path=r["file_path"],
-                                document_title=r.get("document_title", ""),
-                                section_title=r.get("section_title", ""),
-                                breadcrumbs=r.get("breadcrumbs", ""),
-                                content=r["content"],
-                                wikilinks=r.get("wikilinks", []),
-                                score=0.0,
-                            ),
-                            dist,
-                        )
-
-            if cand_sibling_map:
-                from unittest.mock import MagicMock
-                cand_entries = list(cand_sibling_map.values())
-                cand_items = [entry[0] for entry in cand_entries]
-                cand_dists = [entry[1] for entry in cand_entries]
-
-                if isinstance(getattr(self, "score_candidate_links", None), MagicMock):
-                    mock_pairs = [(sr.id, f"{sr.breadcrumbs}: {sr.content[:300]}") for sr in cand_items]
-                    mock_scored = dict(self.score_candidate_links(state["question"], mock_pairs))
-                    raw_sims = [mock_scored.get(sr.id, 0.0) for sr in cand_items]
-                else:
-                    q_vec = self.storage.embedder.get_embedding(state["question"])
-                    q_norm = math.sqrt(sum(x * x for x in q_vec)) or 1.0
-                    cand_texts = [f"{s.breadcrumbs}: {s.content[:300]}" for s in cand_items]
-                    l_vecs = self.storage.embedder.get_embeddings_batch(cand_texts)
-                    raw_sims = []
-                    for l_vec in l_vecs:
-                        l_norm = math.sqrt(sum(x * x for x in l_vec)) or 1.0
-                        dot = sum(a * b for a, b in zip(q_vec, l_vec))
-                        raw_sims.append(max(0.0, dot / (q_norm * l_norm)))
-
-                for s, dist, raw_sim in zip(cand_items, cand_dists, raw_sims):
-                    eff_score = raw_sim * (gamma ** min(dist, 10))
-                    if eff_score >= threshold:
-                        sibling_candidates.append(s)
-                        sibling_scores[s.id] = eff_score
 
         # Context Governor & Greedy Token Budget Packing
         governor_enabled = getattr(self.vault.config, "context_governor", True)
@@ -1182,12 +1345,19 @@ class ResearchAgent:
                     )
 
         # 2. Pack sibling chunks (sorted descending by score)
-        sibling_candidates.sort(key=lambda s: sibling_scores.get(s.id, 0.0), reverse=True)
-        for s in sibling_candidates:
+        seen_sib_ids = set()
+        unique_siblings: List[SearchResult] = []
+        for s in all_sibling_candidates:
+            if s.id not in seen_sib_ids:
+                seen_sib_ids.add(s.id)
+                unique_siblings.append(s)
+        unique_siblings.sort(key=lambda s: all_sibling_scores.get(s.id, 0.0), reverse=True)
+
+        for s in unique_siblings:
             if s.id in visited_ids:
                 continue
             tok = int(len(s.content) / 4)
-            score = sibling_scores.get(s.id, 0.0)
+            score = all_sibling_scores.get(s.id, 0.0)
             if current_tokens + tok <= budget_tokens:
                 visited_ids.add(s.id)
                 new_sources.add(s.file_path)
@@ -1299,6 +1469,7 @@ class ResearchAgent:
             "recomposed_topics": recomposed_topics,
             "thought_history": thought_history,
             "governor_alert": governor_alert,
+            "subquery_evidence_map": subquery_evidence_map,
         }
 
     def _evaluate_node(self, state: AgentState) -> Dict[str, Any]:
@@ -1321,6 +1492,7 @@ class ResearchAgent:
         # Check if there are still unvisited sub-goals or pending links
         unvisited_goals = [g for g in sub_goals if g not in visited_queries]
         sub_questions = state.get("sub_questions", [])
+        sub_goals = state.get("sub_goals", [])
 
         # Ask LLM if evidence is sufficient (dynamic budget based on endpoint)
         is_local = "localhost" in self.llm.endpoint or "127.0.0.1" in self.llm.endpoint
@@ -1460,6 +1632,13 @@ class ResearchAgent:
             "thought_history": state["thought_history"] + [f"Eval (turn {iteration}): {thought}"],
         }
 
+    def _route_retrieval(self, state: AgentState) -> str:
+        if state.get("evidence_only", False):
+            return "end"
+        if not getattr(self.vault.config, "multi_hop", False) or not state.get("evidence"):
+            return "synthesize"
+        return "evaluate"
+
     def _route_evaluation(self, state: AgentState) -> str:
         if state["is_sufficient"]:
             if state.get("evidence_only", False):
@@ -1486,17 +1665,18 @@ class ResearchAgent:
             }
 
         sub_questions = state.get("sub_questions", [])
+        sub_goals = state.get("sub_goals", [])
         thought_history = list(state.get("thought_history", []))
         use_subquery_synthesis = (
-            getattr(self.vault.config, "subquery_synthesis", True)
+            getattr(self.vault.config, "subquery_synthesis", False)
             and bool(sub_questions)
             and len(sub_questions) >= 2
         )
 
         evidence_pool = list(state["evidence"])
 
-        # Pre-Synthesis Re-Ranking: Active only for monolithic fallback synthesis
-        if not use_subquery_synthesis and getattr(self.vault.config, "pre_synthesis_rerank", True) and len(evidence_pool) > 1:
+        # Pre-Synthesis Re-Ranking: Active only for monolithic fallback synthesis when CrossEncoder is not available
+        if not use_subquery_synthesis and self.cross_encoder is None and getattr(self.vault.config, "pre_synthesis_rerank", True) and len(evidence_pool) > 1:
             t_rerank_start = time.perf_counter()
             scoring_queries = [state["question"]] + [q for q in sub_questions if q != state["question"]]
             try:
@@ -1566,7 +1746,7 @@ class ResearchAgent:
             # Sub-query isolated synthesis partitions directly from the FULL admitted evidence pool,
             # unconstrained by monolithic single-prompt top-K caps.
             full_admitted_pool = list(state["evidence"])
-            subquery_top_k = getattr(self.vault.config, "subquery_top_k", 6)
+            subquery_top_k = getattr(self.vault.config, "subquery_top_k", 4)
             sub_q_embeddings = {}
             try:
                 sub_q_vecs = self.storage.embedder.get_embeddings_batch(sub_questions, is_query=True)
@@ -1608,44 +1788,63 @@ class ResearchAgent:
                 "under", "per", "their", "our", "its", "any", "all", "each", "both"
             }
 
+            subquery_map = state.get("subquery_evidence_map") or {}
             for i, sub_q in enumerate(sub_questions):
                 q_num = i + 1
-                q_tokens = set(re.findall(r"\w+", sub_q.lower()))
-                sub_content_tokens = q_tokens - stop_words
-                q_vec = sub_q_embeddings.get(sub_q)
-                if q_vec and chunk_vectors:
-                    q_norm = math.sqrt(sum(x * x for x in q_vec)) or 1.0
-                    def _score(e, _qv=q_vec, _qn=q_norm, _st=sub_content_tokens):
-                        doc_title = (e.get("document_title") or "").lower()
-                        if not doc_title:
-                            doc_title = os.path.splitext(os.path.basename(e.get("file_path") or ""))[0].replace("_", " ").lower()
-                        doc_tokens = set(re.findall(r"\w+", doc_title)) - stop_words
-                        overlap = len(_st & doc_tokens)
-                        affinity = min(0.15, 0.05 * overlap)
+                dedicated_cand = subquery_map.get(sub_q)
+                if not dedicated_cand and i < len(sub_goals):
+                    dedicated_cand = subquery_map.get(sub_goals[i])
 
-                        c_tokens = set(re.findall(r"\w+", e.get("content", "").lower()))
-                        kw_overlap = (len(_st & c_tokens) / max(len(_st), 1)) if _st else 0.0
-
-                        cv = chunk_vectors.get(e.get("id"))
-                        if cv is None:
-                            return kw_overlap + affinity
-                        cn = math.sqrt(sum(x * x for x in cv)) or 1.0
-                        cosine = sum(a * b for a, b in zip(cv, _qv)) / (cn * _qn)
-                        return (0.5 * cosine) + (0.5 * kw_overlap) + affinity
-                    dedicated = sorted(full_admitted_pool, key=_score, reverse=True)[:subquery_top_k]
+                if dedicated_cand and len(dedicated_cand) >= 2:
+                    dedicated = list(dedicated_cand)[:subquery_top_k]
+                    logger.info(
+                        "[SUBQUERY_TELEMETRY] Q%d/%d ('%.40s'): admitted %d chunks (dedicated: True) | Top: %s",
+                        q_num, len(sub_questions), sub_q, len(dedicated),
+                        [c.get("id") for c in dedicated[:3]],
+                    )
                 else:
-                    def _lex_score(e, _qt=q_tokens, _st=sub_content_tokens):
-                        ct = set(re.findall(r"\w+", e.get("content", "").lower()))
-                        doc_title = (e.get("document_title") or "").lower()
-                        if not doc_title:
-                            doc_title = os.path.splitext(os.path.basename(e.get("file_path") or ""))[0].replace("_", " ").lower()
-                        doc_tokens = set(re.findall(r"\w+", doc_title)) - stop_words
-                        overlap = len(_st & doc_tokens)
-                        return len(_qt & ct) + (2 * overlap)
-                    dedicated = sorted(full_admitted_pool, key=_lex_score, reverse=True)[:subquery_top_k]
+                    q_tokens = set(re.findall(r"\w+", sub_q.lower()))
+                    sub_content_tokens = q_tokens - stop_words
+                    q_vec = sub_q_embeddings.get(sub_q)
+                    if q_vec and chunk_vectors:
+                        q_norm = math.sqrt(sum(x * x for x in q_vec)) or 1.0
+                        def _score(e, _qv=q_vec, _qn=q_norm, _st=sub_content_tokens):
+                            doc_title = (e.get("document_title") or "").lower()
+                            if not doc_title:
+                                doc_title = os.path.splitext(os.path.basename(e.get("file_path") or ""))[0].replace("_", " ").lower()
+                            doc_tokens = set(re.findall(r"\w+", doc_title)) - stop_words
+                            overlap = len(_st & doc_tokens)
+                            affinity = min(0.15, 0.05 * overlap)
 
-                if len(dedicated) < 2 and len(full_admitted_pool) >= 2:
-                    dedicated = list(full_admitted_pool)[:2]
+                            c_tokens = set(re.findall(r"\w+", e.get("content", "").lower()))
+                            kw_overlap = (len(_st & c_tokens) / max(len(_st), 1)) if _st else 0.0
+
+                            cv = chunk_vectors.get(e.get("id"))
+                            if cv is None:
+                                return kw_overlap + affinity
+                            cn = math.sqrt(sum(x * x for x in cv)) or 1.0
+                            cosine = sum(a * b for a, b in zip(cv, _qv)) / (cn * _qn)
+                            return (0.5 * cosine) + (0.5 * kw_overlap) + affinity
+                        dedicated = sorted(full_admitted_pool, key=_score, reverse=True)[:subquery_top_k]
+                    else:
+                        def _lex_score(e, _qt=q_tokens, _st=sub_content_tokens):
+                            ct = set(re.findall(r"\w+", e.get("content", "").lower()))
+                            doc_title = (e.get("document_title") or "").lower()
+                            if not doc_title:
+                                doc_title = os.path.splitext(os.path.basename(e.get("file_path") or ""))[0].replace("_", " ").lower()
+                            doc_tokens = set(re.findall(r"\w+", doc_title)) - stop_words
+                            overlap = len(_st & doc_tokens)
+                            return len(_qt & ct) + (2 * overlap)
+                        dedicated = sorted(full_admitted_pool, key=_lex_score, reverse=True)[:subquery_top_k]
+
+                    if len(dedicated) < 2 and len(full_admitted_pool) >= 2:
+                        dedicated = list(full_admitted_pool)[:2]
+
+                    logger.info(
+                        "[SUBQUERY_TELEMETRY] Q%d/%d ('%.40s'): admitted %d chunks (dedicated: False) | Top: %s",
+                        q_num, len(sub_questions), sub_q, len(dedicated),
+                        [c.get("id") for c in dedicated[:3]],
+                    )
 
                 sub_budgeted_chunks = []
                 sub_chars = 0
@@ -1734,7 +1933,10 @@ class ResearchAgent:
             total_chars = 0
 
             for e in evidence_pool:
-                chunk_repr = f"[{e['breadcrumbs']} ({e['file_path']})]\n{e['content'].strip()}"
+                header = e.get("section_title") or e.get("breadcrumbs") or e.get("id") or ""
+                fp = e.get("file_path", "")
+                header_str = f"[{header} ({fp})]" if fp else f"[{header}]"
+                chunk_repr = f"{header_str}\n{e.get('content', '').strip()}"
                 if total_chars + len(chunk_repr) > max_evidence_chars and budgeted_chunks:
                     break
                 budgeted_chunks.append(chunk_repr)
@@ -1856,6 +2058,7 @@ class ResearchAgent:
             "synthesis_clipped": bool(unaddressed_indices),
             "unaddressed_sub_questions": unaddressed_indices,
             "synthesis_evidence": synthesis_evidence,
+            "subquery_evidence_map": state.get("subquery_evidence_map", {}),
         }
 
     def research(self, question: str, evidence_only: bool = False) -> AgentState:
@@ -1885,6 +2088,7 @@ class ResearchAgent:
             "synthesis_clipped": False,
             "unaddressed_sub_questions": [],
             "synthesis_evidence": [],
+            "subquery_evidence_map": {},
             "evidence_only": evidence_only,
         }
 
@@ -1918,6 +2122,7 @@ class ResearchAgent:
             "synthesis_clipped": False,
             "unaddressed_sub_questions": [],
             "synthesis_evidence": [],
+            "subquery_evidence_map": {},
             "evidence_only": evidence_only,
         }
 

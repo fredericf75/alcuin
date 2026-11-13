@@ -46,6 +46,7 @@ class VaultConfig:
     description: str = ""
     max_hops: int = 3
     max_iterations: int = 4
+    multi_hop: bool = False
     model_endpoint: str = ""
     model_name: str = ""
     temperature: float = 0.2
@@ -87,8 +88,13 @@ class VaultConfig:
     ast_sibling_attenuation: float = 0.72
     pre_synthesis_rerank: bool = True
     pre_synthesis_top_k: Optional[int] = None
-    subquery_synthesis: bool = True
-    subquery_top_k: int = 6
+    subquery_synthesis: bool = False
+    subquery_top_k: int = 4
+    reranker_enabled: bool = True
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    source_diversification: bool = True
+    source_diversification_quota: int = 3
+    source_diversification_decay: float = 0.90
     glossary_expansion: bool = True
     glossary: Dict[str, str] = field(default_factory=dict)
 
@@ -121,6 +127,7 @@ class VaultConfig:
             description=vault_sec.get("description", ""),
             max_hops=int(agent_sec.get("max_hops", g_agent.get("max_hops", 3))),
             max_iterations=int(agent_sec.get("max_iterations", g_agent.get("max_iterations", 4))),
+            multi_hop=bool(agent_sec.get("multi_hop", g_agent.get("multi_hop", False))),
             model_endpoint=model_ep,
             model_name=model_nm,
             temperature=float(agent_sec.get("temperature", g_agent.get("temperature", 0.2))),
@@ -203,10 +210,25 @@ class VaultConfig:
                 else (int(g_agent["pre_synthesis_top_k"]) if "pre_synthesis_top_k" in g_agent else None)
             ),
             subquery_synthesis=bool(
-                agent_sec.get("subquery_synthesis", g_agent.get("subquery_synthesis", True))
+                agent_sec.get("subquery_synthesis", g_agent.get("subquery_synthesis", False))
             ),
             subquery_top_k=int(
-                agent_sec.get("subquery_top_k", g_agent.get("subquery_top_k", 6))
+                agent_sec.get("subquery_top_k", g_agent.get("subquery_top_k", 4))
+            ),
+            reranker_enabled=bool(
+                agent_sec.get("reranker_enabled", g_agent.get("reranker_enabled", True))
+            ),
+            reranker_model=str(
+                agent_sec.get("reranker_model", g_agent.get("reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2"))
+            ),
+            source_diversification=bool(
+                agent_sec.get("source_diversification", g_agent.get("source_diversification", True))
+            ),
+            source_diversification_quota=int(
+                agent_sec.get("source_diversification_quota", g_agent.get("source_diversification_quota", 3))
+            ),
+            source_diversification_decay=float(
+                agent_sec.get("source_diversification_decay", g_agent.get("source_diversification_decay", 0.90))
             ),
             glossary_expansion=bool(
                 agent_sec.get("glossary_expansion", g_agent.get("glossary_expansion", True))
@@ -237,6 +259,7 @@ class VaultConfig:
         agent_lines = [
             f"max_hops = {self.max_hops}",
             f"max_iterations = {self.max_iterations}",
+            f"multi_hop = {'true' if self.multi_hop else 'false'}",
             f"temperature = {self.temperature}",
             f"link_pruning = {'true' if self.link_pruning else 'false'}",
             f"link_pruning_threshold = {self.link_pruning_threshold}",
@@ -250,6 +273,11 @@ class VaultConfig:
             *( [f"pre_synthesis_top_k = {self.pre_synthesis_top_k}"] if self.pre_synthesis_top_k is not None else [] ),
             f"subquery_synthesis = {str(self.subquery_synthesis).lower()}",
             f"subquery_top_k = {self.subquery_top_k}",
+            f"reranker_enabled = {'true' if self.reranker_enabled else 'false'}",
+            f'reranker_model = "{self.reranker_model}"',
+            f"source_diversification = {'true' if self.source_diversification else 'false'}",
+            f"source_diversification_quota = {self.source_diversification_quota}",
+            f"source_diversification_decay = {self.source_diversification_decay}",
             f"glossary_expansion = {'true' if self.glossary_expansion else 'false'}",
         ]
         if self.context_headroom_tokens is not None:

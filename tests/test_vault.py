@@ -93,3 +93,20 @@ def test_vault_unregister(tmp_path, temp_config_dir):
     assert "temp" not in VaultRegistry.list_vaults()
     # Directory still intact
     assert (vault_dir / ".alcuin").is_dir()
+
+
+def test_spec033_monolithic_synthesis_defaults():
+    cfg = VaultConfig()
+    assert cfg.subquery_synthesis is False
+    assert cfg.subquery_top_k == 4
+    assert cfg.multi_hop is False
+    assert cfg.reranker_enabled is True
+    assert cfg.source_diversification is True
+    assert cfg.source_diversification_quota == 3
+
+    toml_str = cfg.to_toml()
+    assert "subquery_synthesis = false" in toml_str
+    assert "subquery_top_k = 4" in toml_str
+    assert "multi_hop = false" in toml_str
+    assert "reranker_enabled = true" in toml_str
+

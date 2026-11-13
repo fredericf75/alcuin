@@ -449,7 +449,7 @@ context_headroom_tokens = 2048
 # Synthesis Architecture, Cross-Encoder Distillation & Dynamic Elasticity
 subquery_synthesis = false            # Default: Monolithic distilled synthesis; set true for isolated subquery passes
 retrieval_elasticity = true           # Dynamic score-aware candidate admission (SPEC-034)
-subquery_top_k_min = 2                # Guaranteed floor per sub-goal
+subquery_top_k_min = 3                # Calibrated guaranteed floor per sub-goal (SPEC-034)
 subquery_top_k = 4                    # Upper ceiling (and static slice if retrieval_elasticity=false)
 elasticity_score_threshold = 1.0      # High-confidence logit admission floor
 elasticity_elbow_floor = -0.5         # Minimum logit floor for relative elbow pass
@@ -460,6 +460,8 @@ source_diversification = true         # Prevent single document monopolization i
 source_diversification_quota = 3
 source_diversification_decay = 0.90
 multi_hop = false                     # Disable multi-turn hop exploration on Turn 0 when single pass suffices
+adaptive_fast_path = true             # Deterministic bypass of LLM planning on atomic queries (SPEC-036)
+fast_path_max_words = 32              # Maximum word count threshold for atomic fast-path candidacy
 
 [storage]
 embedding_model = "nomic-embed-text"

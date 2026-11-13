@@ -202,7 +202,7 @@ When presented with complex multi-part questions (e.g. multi-statute regulatory 
 
 Alcuin resolves both dilemmas through **Monolithic Distilled Synthesis** (SPEC-033):
 1. **Syntactic Query Decomposition**: Automatically extracts atomic sub-goals and numbered inquiries on Turn 0.
-2. **Cross-Encoder Neural Distillation**: Each sub-goal retrieves candidates that are reranked via a local Cross-Encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`). The top `subquery_top_k` (default: 4) chunks per sub-goal are selected into a deduplicated evidence pool.
+2. **Cross-Encoder Neural Distillation & Score Elasticity**: Each sub-goal retrieves candidates that are reranked via a local Cross-Encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`). With Dynamic Score Elasticity (SPEC-034), candidates between `subquery_top_k_min` (default: 2) and `subquery_top_k` (default: 4) are admitted dynamically via score thresholding ($\text{logit} \ge 1.0$) and relative elbow dropoff ($\Delta \le 2.5$), pruning negative distractor noise while capturing high-scoring boundary clauses.
 3. **Source Fair-Share Diversification**: Marginal source decay ($\alpha = 0.90$ past quota $M = 3$) ensures no single file monopolizes the evidence pool when analyzing multi-document corpora.
 4. **Unified Single-Pass Synthesis**: The model receives the full high-purity distilled evidence pool in a single synthesis prompt. This preserves table structures, eliminates sub-question answer truncation, and enables cross-clause reasoning while reducing latency by 25%–75%.
 
@@ -446,9 +446,14 @@ context_governor = true
 context_window = 16384
 context_headroom_tokens = 2048
 
-# Synthesis Architecture & Cross-Encoder Distillation
+# Synthesis Architecture, Cross-Encoder Distillation & Dynamic Elasticity
 subquery_synthesis = false            # Default: Monolithic distilled synthesis; set true for isolated subquery passes
-subquery_top_k = 4                    # Top-k primary candidates retrieved per sub-goal
+retrieval_elasticity = true           # Dynamic score-aware candidate admission (SPEC-034)
+subquery_top_k_min = 2                # Guaranteed floor per sub-goal
+subquery_top_k = 4                    # Upper ceiling (and static slice if retrieval_elasticity=false)
+elasticity_score_threshold = 1.0      # High-confidence logit admission floor
+elasticity_elbow_floor = -0.5         # Minimum logit floor for relative elbow pass
+elasticity_elbow_delta = 2.5          # Maximum logit drop from Rank 1 hit
 reranker_enabled = true               # Cross-Encoder neural reranker on Turn 0
 reranker_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 source_diversification = true         # Prevent single document monopolization in multi-source vaults

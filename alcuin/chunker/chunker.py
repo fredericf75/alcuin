@@ -313,54 +313,12 @@ def extract_pdf_content(pdf_path: Path, engine: str = "auto") -> Tuple[str, str]
                     print(f"  \033[91m[OCR Error]\033[0m Page {page_idx + 1}: {e}")
             continue
 
-        # Native layout-aware table extraction (SPEC-026)
-        tabs = None
-        try:
-            tabs = page.find_tables()
-        except Exception:
-            tabs = None
-
-        tables = tabs.tables if (tabs and hasattr(tabs, "tables")) else []
-
-        if not tables:
-            if raw_text:
-                pages_text.append(raw_text)
-        else:
-            # Interleave text blocks and tables in vertical visual reading order
-            page_items = []
-            for t in tables:
-                try:
-                    md_t = t.to_markdown()
-                    if md_t and md_t.strip():
-                        page_items.append((t.bbox[1], t.bbox[3], "table", md_t.strip()))
-                except Exception:
-                    pass
-
-            # Extract text blocks outside table bounding boxes to prevent cell duplication
-            blocks = page.get_text("blocks")
-            for b in blocks:
-                if len(b) > 6 and b[6] != 0:
-                    continue  # skip non-text blocks
-                b_text = b[4].strip()
-                if not b_text:
-                    continue
-
-                b_rect = fitz.Rect(b[:4])
-                inside_table = False
-                for t in tables:
-                    t_rect = fitz.Rect(t.bbox)
-                    inter = b_rect & t_rect
-                    if not inter.is_empty and (inter.get_area() > 0.4 * b_rect.get_area()):
-                        inside_table = True
-                        break
-
-                if not inside_table:
-                    page_items.append((b[1], b[3], "text", b_text))
-
-            page_items.sort(key=lambda item: item[0])
-            assembled_page = "\n\n".join(item[3] for item in page_items)
-            if assembled_page.strip():
-                pages_text.append(assembled_page.strip())
+        # Native coordinate-aware layout & table extraction (handles borderless tables + 2-column prose)
+        assembled_page = _extract_pdf_page_layout(page)
+        if assembled_page.strip():
+            pages_text.append(assembled_page.strip())
+        elif raw_text:
+            pages_text.append(raw_text)
 
     if scanned_pages and not tess_exe:
         print(f"\n  \033[93m[WARN]: Scanned PDF detected!\033[0m Pages {scanned_pages} appear to be image-based scans.")
@@ -368,6 +326,337 @@ def extract_pdf_content(pdf_path: Path, engine: str = "auto") -> Tuple[str, str]
 
     doc.close()
     return doc_title, "\n\n".join(pages_text)
+
+
+def _cluster_x_columns(
+    intervals: List[Tuple[float, float]],
+    row_intervals: Optional[List[List[Tuple[float, float]]]] = None,
+) -> List[Tuple[float, float]]:
+    """Cluster segment x-intervals into columns without merging distinct columns."""
+    if not intervals:
+        return []
+    sorted_iv = sorted(intervals, key=lambda x: (x[1] - x[0], x[0]))
+    cols: List[List[float]] = []
+    for x0, x1 in sorted_iv:
+        overlapping = []
+        for ci, (cx0, cx1) in enumerate(cols):
+            ov = min(x1, cx1) - max(x0, cx0)
+            if ov > 1.0:
+                overlapping.append((ov, ci))
+        if len(overlapping) == 1:
+            ci = overlapping[0][1]
+            cols[ci][0] = min(cols[ci][0], x0)
+            cols[ci][1] = max(cols[ci][1], x1)
+        elif len(overlapping) == 0:
+            cols.append([x0, x1])
+    cols.sort(key=lambda c: c[0])
+
+    # Merge adjacent clusters that never co-occur on the same row and are within 20pt
+    # (e.g. indented row sub-labels like "Total net sales" vs "iPhone").
+    if row_intervals and len(cols) >= 2:
+        merged = True
+        while merged and len(cols) >= 2:
+            merged = False
+            for ci in range(len(cols) - 1):
+                c0, c1 = cols[ci], cols[ci + 1]
+                if c1[0] - c0[1] > 20.0:
+                    continue
+                co_occur = False
+                for r_ivs in row_intervals:
+                    # Only count as co-occurring if two DISTINCT segments on the same row map to c0 and c1
+                    left_segs = [idx_s for idx_s, (rx0, rx1) in enumerate(r_ivs) if min(rx1, c0[1]) - max(rx0, c0[0]) > 0]
+                    right_segs = [idx_s for idx_s, (rx0, rx1) in enumerate(r_ivs) if min(rx1, c1[1]) - max(rx0, c1[0]) > 0]
+                    if left_segs and right_segs and set(left_segs) != set(right_segs):
+                        co_occur = True
+                        break
+                if not co_occur:
+                    cols[ci] = [min(c0[0], c1[0]), max(c0[1], c1[1])]
+                    cols.pop(ci + 1)
+                    merged = True
+                    break
+
+    return [(c[0], c[1]) for c in cols]
+
+
+def _extract_pdf_segments(
+    words: List[Tuple],
+    y_tol: float = 3.0,
+    gap_tol: float = 9.0,
+) -> List[Tuple[float, float, List[Tuple[float, float, str]]]]:
+    """Group PyMuPDF word tuples into y-lines and split each line into (x0, x1, text) segments."""
+    if not words:
+        return []
+    sorted_w = sorted(words, key=lambda w: (w[1], w[0]))
+    y_lines: List[List[Tuple]] = []
+    for w in sorted_w:
+        y_mid = (w[1] + w[3]) / 2.0
+        if y_lines:
+            prev_mid = sum((pw[1] + pw[3]) / 2.0 for pw in y_lines[-1]) / len(y_lines[-1])
+            if abs(y_mid - prev_mid) <= y_tol:
+                y_lines[-1].append(w)
+                continue
+        y_lines.append([w])
+
+    result = []
+    for line_w in y_lines:
+        line_w.sort(key=lambda w: w[0])
+        segs: List[Tuple[float, float, str]] = []
+        curr_words = [line_w[0][4]]
+        sx0, sx1 = line_w[0][0], line_w[0][2]
+        for w in line_w[1:]:
+            if w[0] - sx1 > gap_tol:
+                segs.append((sx0, sx1, " ".join(curr_words)))
+                curr_words = [w[4]]
+                sx0, sx1 = w[0], w[2]
+            else:
+                curr_words.append(w[4])
+                sx1 = max(sx1, w[2])
+        segs.append((sx0, sx1, " ".join(curr_words)))
+
+        # Split trailing currency symbol attached to a label (e.g. "sales $" -> "sales", "$")
+        split_segs: List[Tuple[float, float, str]] = []
+        for x0, x1, txt in segs:
+            if len(txt) > 2 and txt.endswith((" $", " €", " £")):
+                sym = txt[-1]
+                lbl = txt[:-2].strip()
+                split_segs.append((x0, max(x0 + 1.0, x1 - 8.0), lbl))
+                split_segs.append((max(x0, x1 - 6.0), x1, sym))
+            else:
+                split_segs.append((x0, x1, txt))
+
+        # Merge standalone currency prefix with next segment, and '%' suffix with previous segment
+        merged: List[Tuple[float, float, str]] = []
+        idx = 0
+        while idx < len(split_segs):
+            x0, x1, txt = split_segs[idx]
+            if txt in ("$", "€", "£") and idx + 1 < len(split_segs):
+                nx0, nx1, ntxt = split_segs[idx + 1]
+                merged.append((nx0, nx1, f"{txt}{ntxt}" if ntxt[0].isdigit() else f"{txt} {ntxt}"))
+                idx += 2
+                continue
+            if txt == "%" and merged:
+                px0, px1, ptxt = merged[-1]
+                merged[-1] = (px0, x1, f"{ptxt}%")
+                idx += 1
+                continue
+            merged.append((x0, x1, txt))
+            idx += 1
+
+        y0_min = min(w[1] for w in line_w)
+        y1_max = max(w[3] for w in line_w)
+        result.append((y0_min, y1_max, merged))
+    return result
+
+
+def _segments_to_markdown_table(
+    band_lines: List[Tuple[float, float, List[Tuple[float, float, str]]]],
+    pre_header_line: Optional[Tuple[float, float, List[Tuple[float, float, str]]]] = None,
+) -> Tuple[Optional[str], bool]:
+    """Reconstruct a Markdown pipe table from coordinate-segmented lines. Returns (md_table, consumed_pre_hdr)."""
+    multi_rows = [ln for ln in band_lines if len(ln[2]) >= 2]
+    if len(multi_rows) < 2:
+        return None, False
+
+    all_ivs = [(s[0], s[1]) for ln in multi_rows for s in ln[2]]
+    row_ivs = [[(s[0], s[1]) for s in ln[2]] for ln in multi_rows]
+    cols = _cluster_x_columns(all_ivs, row_intervals=row_ivs)
+    if len(cols) < 2:
+        return None, False
+
+    def _assign_col(x0: float, x1: float) -> int:
+        best_c = 0
+        best_score = -1e9
+        mid = (x0 + x1) / 2.0
+        for ci, (cx0, cx1) in enumerate(cols):
+            ov = min(x1, cx1) - max(x0, cx0)
+            score = ov if ov > 0 else -abs(mid - (cx0 + cx1) / 2.0)
+            if score > best_score:
+                best_score = score
+                best_c = ci
+        return best_c
+
+    grid_rows: List[List[str]] = []
+    pending_col0: List[str] = []
+
+    for _y0, _y1, segs in band_lines:
+        if len(segs) == 1:
+            sx0, sx1, stxt = segs[0]
+            ci = _assign_col(sx0, sx1)
+            if ci == 0:
+                if stxt.startswith("(") and stxt.endswith(")") and len(stxt) <= 5 and grid_rows:
+                    grid_rows[-1][0] = (grid_rows[-1][0] + " " + stxt).strip()
+                else:
+                    pending_col0.append(stxt)
+                continue
+
+        row = [""] * len(cols)
+        for sx0, sx1, stxt in segs:
+            ci = _assign_col(sx0, sx1)
+            row[ci] = (row[ci] + " " + stxt).strip() if row[ci] else stxt
+        if pending_col0:
+            prefix = " ".join(pending_col0)
+            row[0] = (prefix + " " + row[0]).strip() if row[0] else prefix
+            pending_col0 = []
+        grid_rows.append(row)
+
+    if pending_col0 and grid_rows:
+        grid_rows[-1][0] = (grid_rows[-1][0] + " " + " ".join(pending_col0)).strip()
+
+    if len(grid_rows) < 2:
+        return None, False
+
+    non_empty_cols = [ci for ci in range(len(cols)) if any(r[ci].strip() for r in grid_rows)]
+    if len(non_empty_cols) < 2:
+        return None, False
+    cols = [cols[ci] for ci in non_empty_cols]
+    grid_rows = [[r[ci] for ci in non_empty_cols] for r in grid_rows]
+
+    consumed_pre_hdr = False
+    if pre_header_line and len(pre_header_line[2]) == 1:
+        px0, px1, ptxt = pre_header_line[2][0]
+        if len(ptxt) <= 30 and not ptxt.endswith((":", ".", ",")):
+            pci = _assign_col(px0, px1)
+            if pci > 0:
+                hdr = [""] * len(cols)
+                hdr[0] = "Category / Item"
+                hdr[pci] = ptxt
+                grid_rows.insert(0, hdr)
+                consumed_pre_hdr = True
+
+    if len(grid_rows) >= 3 and not grid_rows[0][-1].strip():
+        hdr_end = 0
+        while hdr_end + 1 < len(grid_rows) and not grid_rows[hdr_end][-1].strip():
+            hdr_end += 1
+        if 0 < hdr_end < len(grid_rows) - 1 and grid_rows[hdr_end][-1].strip():
+            merged_hdr = [""] * len(cols)
+            for hr in grid_rows[: hdr_end + 1]:
+                for ci, val in enumerate(hr):
+                    if val.strip():
+                        merged_hdr[ci] = (merged_hdr[ci] + " " + val.strip()).strip()
+            grid_rows = [merged_hdr] + grid_rows[hdr_end + 1 :]
+
+    header = grid_rows[0]
+    if not header[0].strip():
+        header[0] = "Category / Item"
+    md_lines = [
+        "| " + " | ".join(c.replace("|", "\\|") for c in header) + " |",
+        "| " + " | ".join("---" for _ in header) + " |",
+    ]
+    for r in grid_rows[1:]:
+        md_lines.append("| " + " | ".join(c.replace("|", "\\|") for c in r) + " |")
+    return "\n".join(md_lines), consumed_pre_hdr
+
+
+def _extract_pdf_blocks_from_lines(
+    lines: List[Tuple[float, float, List[Tuple[float, float, str]]]],
+    page_width: float,
+) -> List[str]:
+    out_blocks: List[str] = []
+    i = 0
+    while i < len(lines):
+        if len(lines[i][2]) >= 2:
+            band = [lines[i]]
+            j = i + 1
+            while j < len(lines):
+                y_gap = lines[j][0] - lines[j - 1][1]
+                if y_gap > 55.0:
+                    break
+                if len(lines[j][2]) >= 2:
+                    if y_gap > 18.0:
+                        # Only bridge a wide vertical gap (18..55pt, e.g. tall padded cells)
+                        # if the next row's segments align with existing band columns.
+                        band_ivs = [(s[0], s[1]) for ln in band if len(ln[2]) >= 2 for s in ln[2]]
+                        aligned = sum(
+                            1 for sx0, sx1, _ in lines[j][2]
+                            if any(min(sx1, bx1) - max(sx0, bx0) > 0 for bx0, bx1 in band_ivs)
+                        )
+                        if aligned < 2:
+                            break
+                    band.append(lines[j])
+                    j += 1
+                else:
+                    if y_gap > 18.0:
+                        break
+                    sx0, sx1, stxt = lines[j][2][0]
+                    if len(stxt) <= 45 and (sx1 - sx0) < page_width * 0.45:
+                        found_next = False
+                        for k in range(j + 1, min(len(lines), j + 5)):
+                            if lines[k][0] - lines[k - 1][1] > 18.0:
+                                break
+                            if len(lines[k][2]) >= 2:
+                                found_next = True
+                                break
+                        if found_next or (stxt.startswith("(") and stxt.endswith(")") and len(stxt) <= 5):
+                            band.append(lines[j])
+                            j += 1
+                            continue
+                    break
+
+            pre_hdr = (
+                lines[i - 1]
+                if (i > 0 and (lines[i][0] - lines[i - 1][1]) < 18.0 and out_blocks and not out_blocks[-1].startswith("|"))
+                else None
+            )
+            md_tbl, consumed_pre_hdr = _segments_to_markdown_table(band, pre_header_line=pre_hdr)
+            if md_tbl:
+                if consumed_pre_hdr and out_blocks:
+                    last_lines = out_blocks[-1].splitlines()
+                    if last_lines and last_lines[-1].strip() == pre_hdr[2][0][2].strip():
+                        if len(last_lines) == 1:
+                            out_blocks.pop()
+                        else:
+                            out_blocks[-1] = "\n".join(last_lines[:-1])
+                out_blocks.append(md_tbl)
+                i = j
+                continue
+
+        prose = " ".join(s[2] for s in lines[i][2])
+        if out_blocks and not out_blocks[-1].startswith("|") and (lines[i][0] - lines[i - 1][1]) < 8.0:
+            out_blocks[-1] += "\n" + prose
+        else:
+            out_blocks.append(prose)
+        i += 1
+    return out_blocks
+
+
+def _extract_pdf_page_layout(page) -> str:
+    """Extract clean reading-order Markdown from a PDF page, supporting 2-column prose and borderless tables."""
+    words = page.get_text("words")
+    if not words:
+        return ""
+    lines = _extract_pdf_segments(words)
+
+    mid_min = page.rect.width * 0.42
+    mid_max = page.rect.width * 0.58
+    two_col_lines = []
+    for idx, (_y0, _y1, segs) in enumerate(lines):
+        if len(segs) == 2:
+            s0, s1 = segs
+            if s0[1] < mid_max and s1[0] > mid_min and (s1[0] - s0[1]) >= 12.0:
+                if (s0[1] - s0[0]) > page.rect.width * 0.18 and (s1[1] - s1[0]) > page.rect.width * 0.18:
+                    if not any(ch in s1[2] for ch in ("$", "%")) and sum(c.isalpha() for c in s1[2]) > sum(c.isdigit() for c in s1[2]):
+                        two_col_lines.append(idx)
+
+    if len(two_col_lines) >= 5:
+        first_2c, last_2c = two_col_lines[0], two_col_lines[-1]
+        gutter_x = (
+            max(lines[k][2][0][1] for k in two_col_lines) + min(lines[k][2][1][0] for k in two_col_lines)
+        ) / 2.0
+        blocks: List[str] = []
+        if first_2c > 0:
+            blocks.extend(_extract_pdf_blocks_from_lines(lines[:first_2c], page.rect.width))
+        y_top, y_bot = lines[first_2c][0] - 1.0, lines[last_2c][1] + 1.0
+        left_words = [w for w in words if y_top <= w[1] <= y_bot and (w[0] + w[2]) / 2.0 < gutter_x]
+        right_words = [w for w in words if y_top <= w[1] <= y_bot and (w[0] + w[2]) / 2.0 >= gutter_x]
+        if left_words:
+            blocks.extend(_extract_pdf_blocks_from_lines(_extract_pdf_segments(left_words), gutter_x))
+        if right_words:
+            blocks.extend(_extract_pdf_blocks_from_lines(_extract_pdf_segments(right_words), page.rect.width - gutter_x))
+        if last_2c + 1 < len(lines):
+            blocks.extend(_extract_pdf_blocks_from_lines(lines[last_2c + 1 :], page.rect.width))
+        return "\n\n".join(blocks)
+
+    return "\n\n".join(_extract_pdf_blocks_from_lines(lines, page.rect.width))
 
 
 def extract_docx_content(docx_path: Path) -> Tuple[str, str]:
@@ -991,8 +1280,9 @@ def chunk_document_text(
             tbl_len = sum(len(l) for l in table_lines) + len(table_lines)
             curr_len = sum(len(l) for l in current_block_lines) + len(current_block_lines)
 
-            # Pre-table flush: only flush if accumulated lines + table exceeds max_size
-            if current_block_lines and (curr_len + tbl_len > max_size):
+            # Pre-table flush: isolate distinct tables from each other, or flush if accumulated + table > max_size
+            has_existing_table = any(is_pipe_table_row(l) for l in current_block_lines)
+            if current_block_lines and (has_existing_table or curr_len + tbl_len > max_size):
                 # Preserve introductory lead-in sentence/paragraph with the table
                 k = len(current_block_lines) - 1
                 while k >= 0 and not current_block_lines[k].strip():
@@ -1002,7 +1292,12 @@ def chunk_document_text(
                     k -= 1
                 candidate_lead_in = current_block_lines[k + 1 : lead_end]
                 candidate_text = "\n".join(candidate_lead_in).strip()
-                if candidate_text and len(candidate_text) <= 500 and (candidate_text.endswith(":") or k >= 0):
+                if (
+                    not has_existing_table
+                    and candidate_text
+                    and len(candidate_text) <= 500
+                    and (candidate_text.endswith(":") or k >= 0)
+                ):
                     prose_lines = current_block_lines[: k + 1]
                     lead_in_lines = candidate_lead_in
                 else:
@@ -1010,13 +1305,16 @@ def chunk_document_text(
                     lead_in_lines = []
 
                 if prose_lines:
-                    finalize_chunk("\n".join(prose_lines))
+                    finalize_chunk("\n".join(prose_lines), chunk_type="table" if has_existing_table else "clause")
                 current_block_lines = list(lead_in_lines)
 
             if tbl_len > max_size:
-                # Massive table: slice across chunks
-                for s in slice_massive_table(table_lines, max_size):
-                    finalize_chunk(s, chunk_type="table")
+                # Massive table: slice across chunks, attaching any lead-in to the first slice
+                lead_prefix = "\n".join(current_block_lines).strip()
+                current_block_lines = []
+                for idx_s, s in enumerate(slice_massive_table(table_lines, max_size)):
+                    chunk_text = f"{lead_prefix}\n\n{s}" if (idx_s == 0 and lead_prefix) else s
+                    finalize_chunk(chunk_text, chunk_type="table")
                 i = end_idx
                 continue
             else:

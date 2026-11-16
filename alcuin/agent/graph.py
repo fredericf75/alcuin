@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, TypedDict
 import logging
 from dotenv import load_dotenv
 import httpx
+import numpy as np
 from langgraph.graph import END, START, StateGraph
 
 from alcuin.storage.engine import SearchResult, VaultStorage
@@ -30,6 +31,25 @@ from alcuin.storage.vault import (
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+# SPEC-038: Zero-Shot Intent Prototype Anchor Phrases
+_ATOMIC_INTENT_PROTOTYPES = [
+    "What is the exact date, time, code, or phone number?",
+    "Give me a single specific fact, number, or rule.",
+    "Where is a specific document or item located?",
+    "When does a specific deadline or expiration occur?",
+    "Who holds a specific role or title?",
+    "How much is a single fee, penalty, or cost?",
+]
+
+_COMPOSITE_INTENT_PROTOTYPES = [
+    "Gather all necessary documents and information to prepare for an event or procedure.",
+    "Compare multiple rules, terms, or requirements across different subjects.",
+    "Give me a complete checklist, overview, and multiple details for a situation.",
+    "Explain the multi-step procedure, deadlines, exceptions, and requirements.",
+    "Pull all relevant files, contacts, and instructions needed for an emergency or transaction.",
+    "Summarize multiple aspects including rules, penalties, dates, and restrictions.",
+]
 
 # SPEC-013 & SPEC-031: Adaptive Score-Cliff Pruning Constants
 DEFAULT_CLIFF_MIN_STEP_DROP: float = 0.12          # Minimum absolute step delta (alpha)
@@ -664,8 +684,68 @@ class ResearchAgent:
 
         return sub_goals, sub_questions
 
+    def _get_intent_centroids(self):
+        """Lazily compute and cache normalized zero-shot intent prototype centroids (SPEC-038)."""
+        cached = getattr(self, "_intent_centroids", None)
+        if cached is not None:
+            return cached
+
+        storage = getattr(self, "storage", None)
+        embedder = getattr(storage, "embedder", None) if storage is not None else None
+        if embedder is None:
+            return None
+
+        try:
+            atom_vecs = np.array(
+                embedder.get_embeddings_batch(_ATOMIC_INTENT_PROTOTYPES, is_query=True),
+                dtype=np.float32,
+            )
+            comp_vecs = np.array(
+                embedder.get_embeddings_batch(_COMPOSITE_INTENT_PROTOTYPES, is_query=True),
+                dtype=np.float32,
+            )
+            if atom_vecs.ndim != 2 or comp_vecs.ndim != 2 or atom_vecs.shape[0] == 0 or comp_vecs.shape[0] == 0:
+                return None
+            atom_centroid = atom_vecs.mean(axis=0)
+            comp_centroid = comp_vecs.mean(axis=0)
+            a_norm = float(np.linalg.norm(atom_centroid))
+            c_norm = float(np.linalg.norm(comp_centroid))
+            if a_norm <= 0.0 or c_norm <= 0.0:
+                return None
+            atom_centroid /= a_norm
+            comp_centroid /= c_norm
+            self._intent_centroids = (atom_centroid, comp_centroid)
+            return self._intent_centroids
+        except Exception as exc:
+            logger.debug(f"[SPEC-038] Failed to compute intent centroids, falling back to syntactic routing: {exc}")
+            return None
+
+    def _semantic_is_composite(self, question: str) -> bool:
+        """Evaluate zero-shot embedding centroid margin to detect implicit multi-domain requests (SPEC-038)."""
+        if not getattr(self.vault.config, "adaptive_fast_path_semantic", True):
+            return False
+
+        centroids = self._get_intent_centroids()
+        if centroids is None:
+            return False
+
+        embedder = self.storage.embedder
+        try:
+            q_vec = np.array(embedder.get_embedding(question, is_query=True), dtype=np.float32)
+            q_norm = float(np.linalg.norm(q_vec))
+            if q_norm <= 0.0:
+                return False
+            q_vec /= q_norm
+            atom_centroid, comp_centroid = centroids
+            margin = float(np.dot(q_vec, comp_centroid) - np.dot(q_vec, atom_centroid))
+            threshold = float(getattr(self.vault.config, "fast_path_embedding_threshold", 0.0))
+            return margin > threshold
+        except Exception as exc:
+            logger.debug(f"[SPEC-038] Semantic intent evaluation failed, falling back to syntactic routing: {exc}")
+            return False
+
     def is_atomic_inquiry(self, question: str) -> bool:
-        """Deterministic syntactic classifier to determine if an inquiry is atomic (single-intent) under SPEC-036."""
+        """Hybrid syntactic-embedding classifier to determine if an inquiry is atomic (SPEC-036 / SPEC-038)."""
         if not getattr(self.vault.config, "adaptive_fast_path", True):
             return False
 
@@ -702,18 +782,16 @@ class ResearchAgent:
         if re.search(multi_clause_conditionals, clean_q, re.IGNORECASE):
             return False
 
+        # 5. SPEC-038: Semantic zero-shot embedding centroid check for implicit multi-domain requests
+        if self._semantic_is_composite(clean_q):
+            return False
+
         return True
 
     def decompose_query(self, question: str) -> Tuple[List[str], List[str]]:
         """Decompose a complex or multi-part inquiry into discrete search targets and synthesis sub-questions."""
-        # SPEC-036: Adaptive Fast-Path Intent Routing for atomic inquiries
+        # SPEC-036 / SPEC-038: Adaptive Fast-Path Intent Routing for atomic inquiries
         if self.is_atomic_inquiry(question):
-            return [question], [question]
-
-        has_subparts = bool(re.search(r"(?:[A-Z]\.|\b\d+[\.\)])", question))
-        is_long = len(question.split()) > 25
-
-        if not (has_subparts or is_long):
             return [question], [question]
 
         # 1. Deterministic extraction: Numbered or lettered items already present

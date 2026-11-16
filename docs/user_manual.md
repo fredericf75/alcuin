@@ -460,8 +460,10 @@ source_diversification = true         # Prevent single document monopolization i
 source_diversification_quota = 3
 source_diversification_decay = 0.90
 multi_hop = false                     # Disable multi-turn hop exploration on Turn 0 when single pass suffices
-adaptive_fast_path = true             # Deterministic bypass of LLM planning on atomic queries (SPEC-036)
+adaptive_fast_path = true             # Hybrid bypass of LLM planning on atomic queries (SPEC-036 / SPEC-038)
+adaptive_fast_path_semantic = true    # Enable zero-shot embedding centroid detection for implicit multi-domain queries
 fast_path_max_words = 32              # Maximum word count threshold for atomic fast-path candidacy
+fast_path_embedding_threshold = 0.0   # Cosine similarity margin threshold for composite routing
 
 [storage]
 embedding_model = "nomic-embed-text"

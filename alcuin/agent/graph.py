@@ -436,25 +436,28 @@ class LLMClient:
                     target_url = f"{base_ep}/chat/completions"
                 else:
                     target_url = f"{base_ep}/v1/chat/completions"
+                openai_payload = {
+                    "model": self.model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                f"<|think|>\n{system_prompt}"
+                                if self.think is True and "gemma" in self.model.lower() and not system_prompt.startswith("<|think|>")
+                                else system_prompt
+                            ),
+                        },
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": eff_temp,
+                    "max_tokens": 2048,
+                }
+                if is_local:
+                    openai_payload["frequency_penalty"] = 0.15
                 resp = client.post(
                     target_url,
                     headers=headers,
-                    json={
-                        "model": self.model,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": (
-                                    f"<|think|>\n{system_prompt}"
-                                    if self.think is True and "gemma" in self.model.lower() and not system_prompt.startswith("<|think|>")
-                                    else system_prompt
-                                ),
-                            },
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        "temperature": eff_temp,
-                        "max_tokens": 2048,
-                    },
+                    json=openai_payload,
                 )
                 if resp.status_code == 200:
                     data = resp.json()

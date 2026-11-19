@@ -196,3 +196,14 @@ def test_semantic_fast_path_toggle():
     # Without semantic gate, ER query has no syntactic markers so returns True
     assert agent.is_atomic_inquiry(er_query) is True
     mock_storage.embedder.get_embedding.assert_not_called()
+
+
+def test_conjoined_entity_attribute_triggers_decomposition():
+    """SPEC-036 delta: conjoined attribute requests on an entity must decompose, while joint subjects stay atomic."""
+    vault = DummyVault(adaptive_fast_path=True, adaptive_fast_path_semantic=False)
+    agent = ResearchAgent.__new__(ResearchAgent)
+    agent.vault = vault
+    agent.storage = MagicMock()
+
+    assert agent.is_atomic_inquiry("What is Tara's birthday and maiden name?") is False
+    assert agent.is_atomic_inquiry("When did Tara and Daniel get married?") is True

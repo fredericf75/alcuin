@@ -553,6 +553,48 @@ class LLMClient:
         return ""
 
 
+class _RemoteCrossEncoder:
+    """Lightweight HTTP CrossEncoder client backed by local-llm /v1/rerank (avoids local PyTorch cold start)."""
+
+    def __init__(self, rerank_url: str, model_name: str):
+        self.rerank_url = rerank_url
+        self.model_name = model_name
+
+    def predict(self, pairs: List[Tuple[str, str]]) -> List[float]:
+        import requests
+        if not pairs:
+            return []
+        query = pairs[0][0]
+        docs = [p[1] for p in pairs]
+        resp = requests.post(
+            self.rerank_url,
+            json={"model": self.model_name, "query": query, "documents": docs},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return [float(s) for s in resp.json()["scores"]]
+
+
+def _try_init_remote_reranker(endpoint: Optional[str], model_name: str) -> Optional[_RemoteCrossEncoder]:
+    """Return a _RemoteCrossEncoder if the configured LLM server exposes /v1/rerank."""
+    if not endpoint:
+        return None
+    import requests
+    base = endpoint.rstrip("/")
+    rerank_url = f"{base}/rerank" if base.endswith("/v1") else f"{base}/v1/rerank"
+    try:
+        resp = requests.post(
+            rerank_url,
+            json={"model": model_name, "query": "ping", "documents": ["ping"]},
+            timeout=5.0,
+        )
+        if resp.status_code == 200 and "scores" in resp.json():
+            return _RemoteCrossEncoder(rerank_url, model_name)
+    except Exception:
+        pass
+    return None
+
+
 class ResearchAgent:
     """Autonomous multi-hop knowledge research agent."""
 
@@ -577,12 +619,19 @@ class ResearchAgent:
 
         self.cross_encoder = None
         if getattr(vault.config, "reranker_enabled", True):
-            try:
-                from sentence_transformers import CrossEncoder
-                m_name = getattr(vault.config, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-                self.cross_encoder = CrossEncoder(m_name)
-            except Exception as e:
-                logger.warning("Could not initialize CrossEncoder reranker: %s", e)
+            m_name = getattr(vault.config, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+            remote_ce = _try_init_remote_reranker(getattr(vault.config, "model_endpoint", None), m_name)
+            if remote_ce is not None:
+                self.cross_encoder = remote_ce
+            else:
+                try:
+                    from sentence_transformers import CrossEncoder
+                    try:
+                        self.cross_encoder = CrossEncoder(m_name, local_files_only=True)
+                    except Exception:
+                        self.cross_encoder = CrossEncoder(m_name)
+                except Exception as e:
+                    logger.warning("Could not initialize CrossEncoder reranker: %s", e)
 
         self.graph = self._build_graph()
 
@@ -781,11 +830,21 @@ class ResearchAgent:
         if re.search(multi_question_conjunctions, clean_q, re.IGNORECASE):
             return False
 
+        # Conjoined entity-attribute requests (e.g. "What is Tara's birthday and maiden name?")
+        conjoined_attributes = r"\b(?:what|which|who|list|give|tell)\b.+(?:'s|s'|\bof\b)\s+[^?]+\band\b\s+[^?]+"
+        if re.search(conjoined_attributes, clean_q, re.IGNORECASE):
+            return False
+
         multi_clause_conditionals = r"\bif\b.+\bthen\b.+\band if\b"
         if re.search(multi_clause_conditionals, clean_q, re.IGNORECASE):
             return False
 
-        # 5. SPEC-038: Semantic zero-shot embedding centroid check for implicit multi-domain requests
+        # 5. Short single-fact lookups (<= 6 words without broad/composite cue words) bypass noisy embedding margins
+        broad_cues = r"\b(?:all|everything|necessary|info|information|summary|overview|steps|checklist|requirements|policies|rules|details|explain)\b"
+        if len(words) <= 6 and not re.search(broad_cues, clean_q, re.IGNORECASE):
+            return True
+
+        # 6. SPEC-038: Semantic zero-shot embedding centroid check for implicit multi-domain requests
         if self._semantic_is_composite(clean_q):
             return False
 
@@ -1157,6 +1216,44 @@ class ResearchAgent:
             logger.warning("Candidate link scoring fallback triggered", exc_info=True)
             return [(link_clean, 1.0) for link_clean, _ in candidates]
 
+    @staticmethod
+    def _is_curated_path(file_path: Optional[str]) -> bool:
+        norm = (file_path or "").replace("\\", "/").lstrip("/")
+        return norm.startswith("_curated/") or "/_curated/" in norm
+
+    def _select_diverse_k_min(
+        self,
+        sorted_results: List[SearchResult],
+        k_min: int,
+    ) -> Tuple[List[SearchResult], List[SearchResult]]:
+        """Select k_min floor while capping _curated/ summaries so primary sources aren't crowded out."""
+        target = min(k_min, len(sorted_results))
+        if target <= 0:
+            return [], list(sorted_results)
+
+        selected: List[SearchResult] = []
+        deferred: List[SearchResult] = []
+        curated_selected = 0
+        seen_curated_files: set[str] = set()
+
+        for cand in sorted_results:
+            if len(selected) >= target:
+                deferred.append(cand)
+                continue
+            if self._is_curated_path(cand.file_path):
+                fp = (cand.file_path or "").replace("\\", "/")
+                if curated_selected >= 1 or fp in seen_curated_files:
+                    deferred.append(cand)
+                    continue
+                curated_selected += 1
+                seen_curated_files.add(fp)
+            selected.append(cand)
+
+        while len(selected) < target and deferred:
+            selected.append(deferred.pop(0))
+
+        return selected, deferred
+
     def _expand_ast_siblings(
         self,
         primary_hits: List[SearchResult],
@@ -1349,10 +1446,10 @@ class ResearchAgent:
                         tau_floor = getattr(self.vault.config, "elasticity_elbow_floor", DEFAULT_ELASTICITY_ELBOW_FLOOR)
                         tau_delta = getattr(self.vault.config, "elasticity_elbow_delta", DEFAULT_ELASTICITY_ELBOW_DELTA)
 
-                        qualified = sorted_results[:min(k_min, len(sorted_results))]
-                        if len(sorted_results) > k_min:
+                        qualified, remainder = self._select_diverse_k_min(sorted_results, k_min)
+                        if remainder:
                             top1_sc = sorted_results[0].score
-                            for cand in sorted_results[k_min:sub_k]:
+                            for cand in remainder[:max(0, sub_k - len(qualified))]:
                                 passes_abs = (cand.score >= tau_abs)
                                 passes_rel = (cand.score >= tau_floor and (top1_sc - cand.score) <= tau_delta)
                                 if passes_abs or passes_rel:

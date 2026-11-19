@@ -249,6 +249,85 @@ def fetch_url_content(url: str) -> Tuple[str, str]:
     return title, full_markdown
 
 
+_RAPIDOCR_ENGINE = None
+
+
+def _get_rapidocr_engine():
+    """Lazily initialize a singleton RapidOCR engine."""
+    global _RAPIDOCR_ENGINE
+    if _RAPIDOCR_ENGINE is None:
+        from rapidocr_onnxruntime import RapidOCR
+
+        _RAPIDOCR_ENGINE = RapidOCR()
+    return _RAPIDOCR_ENGINE
+
+
+_TESSERACT_LANGS_CACHE: dict[str, str] = {}
+
+
+def _get_tesseract_langs(tess_exe: str) -> str:
+    """Return installed Tesseract language pack string (preferring eng+fra when available)."""
+    if tess_exe in _TESSERACT_LANGS_CACHE:
+        return _TESSERACT_LANGS_CACHE[tess_exe]
+    import subprocess
+
+    lang_arg = "eng"
+    try:
+        res = subprocess.run(
+            [tess_exe, "--list-langs"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        available = {line.strip() for line in (res.stdout or "").splitlines() if line.strip()}
+        chosen = [lang for lang in ("eng", "fra") if lang in available]
+        if chosen:
+            lang_arg = "+".join(chosen)
+    except Exception:
+        pass
+    _TESSERACT_LANGS_CACHE[tess_exe] = lang_arg
+    return lang_arg
+
+
+def _ocr_page_with_tesseract(page, tess_exe: str) -> str:
+    """Render a PyMuPDF page at 200 DPI and extract text via Tesseract CLI (no pytesseract required)."""
+    import subprocess
+    import tempfile
+
+    langs = _get_tesseract_langs(tess_exe)
+    png_bytes = page.get_pixmap(dpi=200).tobytes("png")
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp.write(png_bytes)
+        tmp_path = tmp.name
+    try:
+        res = subprocess.run(
+            [tess_exe, tmp_path, "stdout", "-l", langs, "--psm", "3"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        if res.returncode != 0 and res.stderr:
+            raise RuntimeError(res.stderr.strip())
+        return (res.stdout or "").strip()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def _ocr_page_with_rapidocr(page) -> str:
+    """Render a PyMuPDF page at 200 DPI and extract text lines via RapidOCR."""
+    engine = _get_rapidocr_engine()
+    png_bytes = page.get_pixmap(dpi=200).tobytes("png")
+    result, _ = engine(png_bytes)
+    if not result:
+        return ""
+    lines = [str(item[1]).strip() for item in result if len(item) >= 2 and str(item[1]).strip()]
+    return "\n".join(lines).strip()
+
+
 def extract_pdf_content(pdf_path: Path, engine: str = "auto") -> Tuple[str, str]:
     """Extract structured text and tables from PDF, with auto-OCR for scanned pages (SPEC-026)."""
     if engine.lower() == "docling":
@@ -275,12 +354,6 @@ def extract_pdf_content(pdf_path: Path, engine: str = "auto") -> Tuple[str, str]
             raise RuntimeError("pymupdf is required for PDF extraction. Run: pip install pymupdf")
 
     tess_exe = find_tesseract_binary()
-    if tess_exe:
-        try:
-            import pytesseract
-            pytesseract.pytesseract.tesseract_cmd = tess_exe
-        except Exception:
-            pass
 
     doc = fitz.open(str(pdf_path))
     doc_title = doc.metadata.get("title") if doc.metadata else ""
@@ -294,23 +367,25 @@ def extract_pdf_content(pdf_path: Path, engine: str = "auto") -> Tuple[str, str]
         page = doc[page_idx]
         raw_text = page.get_text("text").strip()
 
-        # Detect scanned page (less than 40 chars of selectable text with images/drawings)
-        if len(raw_text) < 40 and (len(page.get_images()) > 0 or len(page.get_drawings()) > 0):
+        # Detect scanned page (less than 50 chars of selectable text with images/drawings)
+        if len(raw_text) < 50 and (len(page.get_images()) > 0 or len(page.get_drawings()) > 0):
             scanned_pages.append(page_idx + 1)
+            ocr_text = ""
             if tess_exe:
                 try:
-                    import pytesseract
-                    from PIL import Image
-                    pix = page.get_pixmap(dpi=200)
-                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                    ocr_text = pytesseract.image_to_string(img).strip()
-                    if ocr_text:
-                        print(f"  \033[92m[OCR]\033[0m Page {page_idx + 1}: Scanned image recognized ({len(ocr_text):,} characters)")
-                        pages_text.append(ocr_text)
-                    else:
-                        print(f"  \033[90m[OCR]\033[0m Page {page_idx + 1}: No text detected via OCR")
+                    ocr_text = _ocr_page_with_tesseract(page, tess_exe)
                 except Exception as e:
                     print(f"  \033[91m[OCR Error]\033[0m Page {page_idx + 1}: {e}")
+            if not ocr_text:
+                try:
+                    ocr_text = _ocr_page_with_rapidocr(page)
+                except Exception as e:
+                    print(f"  \033[91m[RapidOCR Error]\033[0m Page {page_idx + 1}: {e}")
+            if ocr_text:
+                print(f"  \033[92m[OCR]\033[0m Page {page_idx + 1}: Scanned image recognized ({len(ocr_text):,} characters)")
+                pages_text.append(ocr_text)
+            else:
+                print(f"  \033[90m[OCR]\033[0m Page {page_idx + 1}: No text detected via OCR")
             continue
 
         # Native coordinate-aware layout & table extraction (handles borderless tables + 2-column prose)
@@ -319,10 +394,6 @@ def extract_pdf_content(pdf_path: Path, engine: str = "auto") -> Tuple[str, str]
             pages_text.append(assembled_page.strip())
         elif raw_text:
             pages_text.append(raw_text)
-
-    if scanned_pages and not tess_exe:
-        print(f"\n  \033[93m[WARN]: Scanned PDF detected!\033[0m Pages {scanned_pages} appear to be image-based scans.")
-        print(f"  \033[90m(Install Tesseract to enable automatic OCR: 'winget install UB-Mannheim.TesseractOCR')\033[0m\n")
 
     doc.close()
     return doc_title, "\n\n".join(pages_text)

@@ -5,6 +5,8 @@ alcuin.cli.main - Research-First Command Line Interface for Alcuin
 from __future__ import annotations
 
 import json
+import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -247,21 +249,32 @@ def research_cmd(
             )
         console.print(f"[bold cyan]Researching:[/bold cyan] {query}\n")
 
-    agent = ResearchAgent(vault)
-
     status_text = "[bold green]Retrieving evidence...[/bold green]" if evidence_only else "[bold green]Researching...[/bold green]"
     chunks: List[Dict[str, Any]] = []
     final_state = None
 
+    def _silence_hf_progress() -> None:
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        os.environ.setdefault("TQDM_DISABLE", "1")
+        try:
+            from transformers.utils import logging as hf_logging
+            hf_logging.set_verbosity_error()
+            hf_logging.disable_progress_bar()
+        except Exception:
+            pass
+
+    _silence_hf_progress()
     kwargs: Dict[str, Any] = {"evidence_only": True} if evidence_only else {}
     try:
         if json_output:
             # Non-interactive mode for piping
+            agent = ResearchAgent(vault)
             final_state = agent.research(query, **kwargs)
             chunks = final_state.get("evidence", [])
         else:
             final_state = {}
             with console.status(status_text, spinner="dots") as status:
+                agent = ResearchAgent(vault)
                 for node_name, state_update in agent.stream_research(query, **kwargs):
                     final_state.update(state_update)
                     if "evidence" in state_update:
@@ -329,8 +342,11 @@ def research_cmd(
         click.echo(format_evidence_dossier(chunks))
         return
 
-    console.print("\n")
-    console.print(Markdown(answer or "No answer could be synthesized."))
+    display_answer = (answer or "No answer could be synthesized.").strip()
+    if not (verbose or with_evidence):
+        display_answer = re.sub(r"(?m)^\s*(?:\*{0,2})Context(?:\*{0,2}):.*\r?\n?", "", display_answer).strip()
+
+    console.print(Markdown(display_answer))
 
     if friction_alert:
         console.print(f"\n[bold yellow]⚡ {friction_alert}[/bold yellow]")
@@ -342,7 +358,7 @@ def research_cmd(
     footer_elements = []
     if chunks:
         footer_elements.append(f"Evidence: {len(chunks)} chunks")
-    if sources:
+    if sources and (verbose or with_evidence):
         footer_elements.append(f"Sources: {', '.join(sources)}")
     if confidence:
         footer_elements.append(f"Confidence: {int(confidence * 100)}%")
@@ -458,6 +474,119 @@ def index(vault_target: Optional[str], force: bool):
         f"  • Unchanged: {len(report.unchanged_files)}\n"
         f"  • Total Chunks Upserted: {report.total_chunks_indexed}"
     )
+
+
+@cli.command(name="gdrive-sync", short_help="Sync & export a Google Drive folder into a local Alcuin vault")
+@click.option("--folder-id", required=True, help="Google Drive folder ID to mirror")
+@click.option("-v", "--vault", "vault_target", required=True, type=click.Path(file_okay=False), help="Target local vault directory path")
+@click.option("--credentials", type=click.Path(dir_okay=False), help="Path to Google Desktop OAuth client_secret JSON (default: ~/.alcuin/gdrive_credentials.json)")
+@click.option("--token", type=click.Path(dir_okay=False), help="Path to cached OAuth token JSON (default: ~/.alcuin/gdrive_token.json)")
+@click.option("--prune", is_flag=True, help="Delete previously synced local files removed from Drive")
+@click.option("--index", "run_index", is_flag=True, help="Initialize (if needed) and index the vault immediately after sync")
+def gdrive_sync(
+    folder_id: str,
+    vault_target: str,
+    credentials: Optional[str],
+    token: Optional[str],
+    prune: bool,
+    run_index: bool,
+):
+    """Mirror a Google Drive folder (exporting Docs/Sheets/Slides) into a local vault."""
+    from alcuin.connectors.gdrive import (
+        default_credentials_path,
+        default_token_path,
+        get_drive_service,
+        sync_gdrive_folder,
+    )
+
+    vault_dir = Path(vault_target).resolve()
+    creds_path = Path(credentials).expanduser().resolve() if credentials else default_credentials_path()
+    token_path = Path(token).expanduser().resolve() if token else default_token_path()
+
+    console.print(f"[bold cyan]Syncing Google Drive folder '{folder_id}' -> {vault_dir}...[/bold cyan]")
+    try:
+        service = get_drive_service(creds_path, token_path)
+    except Exception as exc:
+        console.print(f"[bold red]Google Drive authentication failed:[/bold red] {exc}")
+        raise SystemExit(1)
+
+    report = sync_gdrive_folder(service=service, folder_id=folder_id, vault_dir=vault_dir, prune=prune)
+    console.print(
+        f"[bold green]Drive Sync Complete:[/bold green]\n"
+        f"  • Downloaded: {len(report.downloaded)}\n"
+        f"  • Updated:    {len(report.updated)}\n"
+        f"  • Unchanged:  {len(report.unchanged)}\n"
+        f"  • Skipped:    {len(report.skipped)}\n"
+        f"  • Pruned:     {len(report.pruned)}\n"
+        f"  • Errors:     {len(report.errors)}"
+    )
+    for err in report.errors:
+        console.print(f"  [yellow]WARN:[/yellow] {err}")
+
+    if run_index:
+        if not (vault_dir / ".alcuin").exists():
+            vault_obj = Vault.init(vault_dir)
+        else:
+            vault_obj = Vault.load(vault_dir)
+        console.print(f"[bold cyan]Indexing vault '[bold]{vault_obj.name}[/bold]'...[/bold cyan]")
+        idx_report = VaultStorage(vault_obj).index()
+        console.print(
+            f"[bold green]Index Complete ({idx_report.duration_seconds}s):[/bold green] "
+            f"+{len(idx_report.added_files)} added, "
+            f"~{len(idx_report.modified_files)} modified, "
+            f"{idx_report.total_chunks_indexed} chunks upserted."
+        )
+
+
+@cli.command(name="curate", short_help="Extract canonical entity profiles and resolve conflicts into _curated/ (SPEC-041)")
+@click.option("-v", "--vault", "vault_target", help="Vault name or directory path")
+@click.option("--model", "model_name", help="LLM model name to use for curation (e.g., Ministral-8B)")
+@click.option("--all", "process_all", is_flag=True, help="Process every chunk (default scans fact-bearing chunks only)")
+@click.option("--dry-run", is_flag=True, help="Extract and report counts without writing _curated/ files")
+@click.option("--index", "run_index", is_flag=True, help="Re-index the vault immediately after writing _curated/ profiles")
+def curate_cmd(
+    vault_target: Optional[str],
+    model_name: Optional[str],
+    process_all: bool,
+    dry_run: bool,
+    run_index: bool,
+):
+    """Synthesize canonical Markdown entity profiles from indexed vault chunks."""
+    from alcuin.storage.curator import VaultCurator
+
+    overrides = {"model_name": model_name} if model_name else {}
+    vault_obj = resolve_or_prompt_vault(target=vault_target, overrides=overrides)
+    curator = VaultCurator(vault_obj)
+
+    with console.status("[bold cyan]Curating canonical entity profiles...[/bold cyan]", spinner="dots") as status:
+        def _on_prog(idx: int, total: int, fpath: str) -> None:
+            short = Path(fpath).name
+            status.update(f"[bold cyan]Curating ({idx}/{total}):[/bold cyan] {short}")
+
+        report = curator.curate(process_all=process_all, dry_run=dry_run, progress_cb=_on_prog)
+
+    console.print(
+        f"[bold green]Curation Complete{' (dry-run)' if dry_run else ''}:[/bold green]\n"
+        f"  • Chunks scanned:   {report.chunks_scanned}\n"
+        f"  • Newly extracted:  {report.chunks_extracted}\n"
+        f"  • Cached unchanged: {report.chunks_cached}\n"
+        f"  • Skipped (no-sig): {report.chunks_skipped}\n"
+        f"  • Entities written: {len(report.entities_written)}\n"
+        f"  • Conflicts noted:  {report.conflicts_found}"
+    )
+    if report.errors:
+        for err in report.errors[:5]:
+            console.print(f"  [yellow]WARN:[/yellow] {err}")
+
+    if run_index and not dry_run:
+        console.print(f"[bold cyan]Indexing curated profiles in '{vault_obj.name}'...[/bold cyan]")
+        idx_report = VaultStorage(vault_obj).index()
+        console.print(
+            f"[bold green]Index Complete ({idx_report.duration_seconds}s):[/bold green] "
+            f"+{len(idx_report.added_files)} added, "
+            f"~{len(idx_report.modified_files)} modified, "
+            f"{idx_report.total_chunks_indexed} chunks upserted."
+        )
 
 
 @cli.command(short_help="Audit and repair vault integrity, wikilinks, and storage sync")

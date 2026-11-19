@@ -177,3 +177,50 @@ def test_elasticity_disabled_falls_back_to_static_top_k(test_vault):
     assert len(primary_admitted) == 3
     assert [c["id"] for c in primary_admitted] == ["c1", "c2", "c3"]
 
+
+def test_curated_profiles_do_not_crowd_out_primary_sources_in_k_min(test_vault):
+    """SPEC-034 delta: _curated/ summaries are capped at 1 slot in k_min so primary sources are admitted."""
+    test_vault.config.retrieval_elasticity = True
+    test_vault.config.subquery_top_k_min = 3
+    test_vault.config.subquery_top_k = 4
+
+    agent = ResearchAgent(vault=test_vault, llm=MagicMock())
+    agent.decompose_query = MagicMock(return_value=(["sub q1"], ["sub q1"]))
+    agent.cross_encoder = MagicMock()
+    agent.cross_encoder.predict.return_value = [3.0, 2.5, 2.0, -1.0, -1.5]
+
+    c1 = _make_result("cur1", 0.0, sec_num=1)
+    c1.file_path = "_curated/people/Tara.md"
+    c2 = _make_result("cur2", 0.0, sec_num=2)
+    c2.file_path = "_curated/people/Tara.md"
+    c3 = _make_result("cur3", 0.0, sec_num=3)
+    c3.file_path = "_curated/people/Daniel.md"
+    p1 = _make_result("pri1", 0.0, sec_num=4)
+    p1.file_path = "Marriage License.pdf"
+    p2 = _make_result("pri2", 0.0, sec_num=5)
+    p2.file_path = "Marriage License.pdf"
+
+    agent.storage = MagicMock()
+    agent.storage.search.return_value = [c1, c2, c3, p1, p2]
+
+    state = {
+        "question": "test question",
+        "sub_questions": ["sub q1"],
+        "sub_goals": ["sub q1"],
+        "visited_queries": [],
+        "evidence": [],
+        "visited_ids": set(),
+        "visited_links": set(),
+        "pending_links": [],
+        "thought_history": [],
+        "sources": set(),
+        "new_sources": set(),
+        "iteration": 0,
+        "max_iterations": 1,
+    }
+    new_state = agent._retrieve_node(state)
+    admitted = new_state.get("subquery_evidence_map", {}).get("sub q1", [])
+    primary_ids = [c["id"] for c in admitted if c.get("is_primary")]
+    assert {"cur1", "pri1", "pri2"}.issubset(set(primary_ids))
+    assert "cur3" not in primary_ids
+

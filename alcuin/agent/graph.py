@@ -1276,18 +1276,48 @@ class ResearchAgent:
         cand_sibling_map: Dict[str, Tuple[SearchResult, int]] = {}
         seen_cand_ids = set(visited_ids) | {p.id for p in primary_hits}
         primary_indices_by_heading: Dict[Tuple[str, str], List[int]] = {}
+        flat_pdf_anchors: List[Tuple[str, int]] = []
 
         for p in primary_hits:
+            crumbs = [c.strip() for c in (p.breadcrumbs or "").split(" > ") if c.strip()]
+            doc_title = p.document_title.strip() if p.document_title else ""
+            sec_crumbs = [c for c in crumbs if c.lower() != doc_title.lower()]
+            m_p = re.search(r"#(\d+)$", p.id)
+            p_idx = int(m_p.group(1)) if m_p else 0
+
+            # Flat / scanned PDFs lack Markdown section headings; queue ±1 adjacent chunk expansion
+            if (p.file_path or "").lower().endswith(".pdf") and not sec_crumbs and p_idx > 0:
+                flat_pdf_anchors.append((p.file_path, p_idx))
+
             # Expand siblings for primary hits with strong semantic relevance (Anchor Threshold >= 0.70)
-            if p.score >= 0.70 and p.breadcrumbs:
-                crumbs = [c.strip() for c in p.breadcrumbs.split(" > ") if c.strip()]
-                doc_title = p.document_title.strip() if p.document_title else ""
-                sec_crumbs = [c for c in crumbs if c.lower() != doc_title.lower()]
+            if p.score >= 0.70 and crumbs:
                 parent_heading = sec_crumbs[0] if sec_crumbs else crumbs[-1]
-                m_p = re.search(r"#(\d+)$", p.id)
-                p_idx = int(m_p.group(1)) if m_p else 0
                 key = (p.file_path, parent_heading)
                 primary_indices_by_heading.setdefault(key, []).append(p_idx)
+
+        if flat_pdf_anchors and hasattr(self.storage, "get_chunks_by_ids"):
+            adj_ids = []
+            for fpath, p_idx in flat_pdf_anchors:
+                for off in (-1, 1):
+                    if (p_idx + off) > 0:
+                        adj_ids.append(f"{fpath}#{p_idx + off}")
+            if adj_ids:
+                for fc in self.storage.get_chunks_by_ids(adj_ids):
+                    if fc.id not in seen_cand_ids and fc.id not in cand_sibling_map:
+                        seen_cand_ids.add(fc.id)
+                        cand_sibling_map[fc.id] = (
+                            SearchResult(
+                                id=fc.id,
+                                file_path=fc.file_path,
+                                document_title=fc.document_title,
+                                section_title=fc.section_title,
+                                breadcrumbs=fc.breadcrumbs,
+                                content=fc.content,
+                                wikilinks=fc.wikilinks,
+                                score=0.0,
+                            ),
+                            1,
+                        )
 
         for (fpath, parent_heading), indices in primary_indices_by_heading.items():
             matched_rows = []
@@ -2033,6 +2063,7 @@ class ResearchAgent:
                 "Factual & Biographical Equivalence: Treat standard factual and biographical equivalents as answering the question.\n"
                 "State the exact finding, number, rule, or prohibition directly in the first sentence. 2-3 sentences max. Zero conversational filler.\n"
                 "When citing tables, schedules, deadlines, or fine structures, transcribe the row values and numbers verbatim.\n"
+                "Verify Entity Attribution: Never attribute a date, number, or fact from a chunk about a different person, party, or document subject to the person or entity asked about.\n"
                 "If the evidence does not contain the answer, state clearly and concisely that the information is not found."
             )
 
@@ -2208,6 +2239,7 @@ class ResearchAgent:
                 "Factual & Biographical Equivalence: Treat standard factual and biographical equivalents as answering the question (e.g., 'Date of Birth', 'DOB', or 'born on' directly answers 'birthday'; full dates or ISO timestamps satisfy temporal queries).\n"
                 "State the exact answer, key metric, deadline, or entity directly before providing explanatory context.\n"
                 "When citing tables, schedules, deadlines, or fine structures, transcribe the row values and numbers verbatim.\n"
+                "Verify Entity Attribution: Never attribute a date, number, or fact from a chunk about a different person, party, or document subject to the person or entity asked about.\n"
                 "If the evidence does not contain the answer, state clearly and concisely that the information is not found."
             )
 

@@ -224,3 +224,26 @@ def test_curated_profiles_do_not_crowd_out_primary_sources_in_k_min(test_vault):
     assert {"cur1", "pri1", "pri2"}.issubset(set(primary_ids))
     assert "cur3" not in primary_ids
 
+
+def test_flat_pdf_adjacent_chunk_sibling_expansion(test_vault):
+    """Flat/scanned PDFs without Markdown headings expand ±1 adjacent chunks."""
+    agent = ResearchAgent(vault=test_vault, llm=MagicMock())
+    agent.score_candidate_links = MagicMock(return_value=[("Marriage License.pdf#2", 0.90)])
+
+    hit = _make_result("Marriage License.pdf#1", -0.84, sec_num=1)
+    hit.file_path = "Marriage License.pdf"
+    hit.document_title = "Marriage License"
+    hit.breadcrumbs = "Marriage License"
+
+    sib2 = _make_result("Marriage License.pdf#2", 0.0, sec_num=2)
+    sib2.file_path = "Marriage License.pdf"
+    sib2.document_title = "Marriage License"
+    sib2.breadcrumbs = "Marriage License"
+
+    agent.storage = MagicMock()
+    agent.storage.get_chunks_by_ids.return_value = [sib2]
+
+    sibs, scores = agent._expand_ast_siblings([hit], query="when did they get married", visited_ids=set())
+    assert [s.id for s in sibs] == ["Marriage License.pdf#2"]
+    assert scores["Marriage License.pdf#2"] > 0.0
+

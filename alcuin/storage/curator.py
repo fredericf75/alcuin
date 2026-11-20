@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 _CURATED_DIR_NAME = "_curated"
 _PEOPLE_SUBDIR = "people"
 _ORG_SUBDIR = "organizations"
+_MULTI_VALUE_FIELDS = {"Key Date", "Case Number", "Role / Relationship"}
 
 _FACT_SIGNAL_RE = re.compile(
     r"(?:"
@@ -246,6 +247,13 @@ class VaultCurator:
         """Merge extracted facts into canonical Markdown profile cards keyed by relative path."""
         entities: Dict[str, Dict[str, Any]] = {}
 
+        profiles: Dict[str, str] = {}
+        total_conflicts = 0
+        overrides_data = load_curated_overrides(self.vault.root_path)
+        overrides_map = overrides_data.get("overrides", {})
+        aliases_map = overrides_data.get("aliases", {})
+        entity_aliases: Dict[str, List[str]] = {}
+
         for rec in chunk_records.values():
             src = rec.get("file_path", "unknown")
             auth = int(rec.get("authority", 2))
@@ -260,26 +268,35 @@ class VaultCurator:
                 ent_type = _classify_entity_type(fact["entity"], fact.get("type", ""))
                 ent_key, display_name = _canonical_entity_key_and_name(fact["entity"], ent_type)
 
+                alias_target = aliases_map.get(ent_key) or aliases_map.get(display_name.lower())
+                if alias_target:
+                    orig_display = display_name
+                    ent_key, display_name = _canonical_entity_key_and_name(alias_target, ent_type)
+                    if orig_display.lower() != display_name.lower():
+                        entity_aliases.setdefault(ent_key, [])
+                        if orig_display not in entity_aliases[ent_key]:
+                            entity_aliases[ent_key].append(orig_display)
+
                 if ent_key not in entities:
                     entities[ent_key] = {
                         "display_name": display_name,
                         "type": ent_type,
                         "fields": {},
                     }
-                elif len(display_name) > len(entities[ent_key]["display_name"]):
+                elif not alias_target and len(display_name) > len(entities[ent_key]["display_name"]):
                     entities[ent_key]["display_name"] = display_name
 
                 entities[ent_key]["fields"].setdefault(norm_fld, []).append(
                     (auth, val_raw, src)
                 )
 
-        profiles: Dict[str, str] = {}
-        total_conflicts = 0
-
-        for ent_data in entities.values():
+        for ent_key, ent_data in entities.items():
             display = ent_data["display_name"]
             ent_type = ent_data["type"]
             fields_map: Dict[str, List[Tuple[int, str, str]]] = ent_data["fields"]
+            subdir = _ORG_SUBDIR if ent_type == "organization" else _PEOPLE_SUBDIR
+            rel_out = f"{subdir}/{_sanitize_entity_filename(display)}.md"
+            ent_key_prefix = f"{subdir}/{_sanitize_entity_filename(display)}"
 
             # Prune low-signal / one-off entities lacking primary identifiers and multi-field depth
             if len(fields_map) < 2 and not any(k in _PRIMARY_FIELDS for k in fields_map):
@@ -295,6 +312,16 @@ class VaultCurator:
             conflicts: List[str] = []
 
             for fld_name in sorted(fields_map.keys()):
+                ov_key = f"{ent_key_prefix}::{fld_name}"
+                if ov_key in overrides_map:
+                    ov = overrides_map[ov_key]
+                    if ov.get("mode") == "keep_all":
+                        for entry in ov.get("values", []):
+                            lines.append(f"- **{fld_name}**: {entry['value']} *(Source: `{entry['source']}`)*")
+                    else:
+                        lines.append(f"- **{fld_name}**: {ov['value']} *(Source: `{ov['source']}`)*")
+                    continue
+
                 mentions = fields_map[fld_name]
                 by_val: Dict[str, Tuple[int, str, List[str]]] = {}
                 is_date_field = fld_name in {"Date of Birth", "Key Date"}
@@ -320,6 +347,11 @@ class VaultCurator:
                     key=lambda item: (item[0], len(item[2])),
                     reverse=True,
                 )
+                if fld_name in _MULTI_VALUE_FIELDS:
+                    for _, m_val, m_srcs in ranked:
+                        lines.append(f"- **{fld_name}**: {m_val} *(Source: `{', '.join(m_srcs[:3])}`)*")
+                    continue
+
                 _, primary_val, primary_srcs = ranked[0]
                 src_str = ", ".join(primary_srcs[:3])
                 lines.append(f"- **{fld_name}**: {primary_val} *(Source: `{src_str}`)*")
@@ -330,6 +362,10 @@ class VaultCurator:
                         conflicts.append(
                             f"- **{fld_name}**: `{alt_val}` *(Source: `{', '.join(alt_srcs[:2])}`)* — differs from canonical `{primary_val}`"
                         )
+
+            if entity_aliases.get(ent_key) and "Aliases / Former Names" not in fields_map:
+                alias_str = ", ".join(sorted(entity_aliases[ent_key]))
+                lines.append(f"- **Aliases / Former Names**: {alias_str} *(Source: `Human Verified`)*")
 
             if conflicts:
                 lines.extend(["", "## Conflicting / Alternate Mentions", *conflicts])
@@ -401,13 +437,455 @@ class VaultCurator:
 
         if not dry_run:
             curated_root = self.vault.root_path / _CURATED_DIR_NAME
+            verified_path = curated_root / "verified_facts.md"
+            saved_verified = verified_path.read_text(encoding="utf-8") if verified_path.is_file() else None
             if curated_root.exists():
                 shutil.rmtree(curated_root)
             for rel_out, md_body in profiles.items():
                 dest = curated_root / rel_out
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_text(md_body, encoding="utf-8")
+            if saved_verified is not None:
+                verified_path.parent.mkdir(parents=True, exist_ok=True)
+                verified_path.write_text(saved_verified, encoding="utf-8")
             state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_text(json.dumps(new_state, indent=2), encoding="utf-8")
 
         return report
+
+
+# ---------------------------------------------------------------------------
+# SPEC-043: Assisted Curation (--review) & Knowledge Gap Resolution Helpers
+# ---------------------------------------------------------------------------
+
+def _overrides_path(vault_root: Path) -> Path:
+    return vault_root / ".alcuin" / "curated_overrides.json"
+
+
+def load_curated_overrides(vault_root: Path) -> Dict[str, Any]:
+    """Load persisted human-adjudicated overrides from .alcuin/curated_overrides.json."""
+    path = _overrides_path(vault_root)
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("overrides"), dict):
+                data.setdefault("aliases", {})
+                data.setdefault("not_merges", [])
+                return data
+        except Exception:
+            pass
+    return {"version": 1, "overrides": {}, "aliases": {}, "not_merges": []}
+
+
+def save_curated_override(vault_root: Path, key: str, value: str, source: str) -> None:
+    """Persist a single human-adjudicated conflict override immediately to disk."""
+    from datetime import datetime, timezone
+
+    data = load_curated_overrides(vault_root)
+    data["overrides"][key] = {
+        "value": value,
+        "source": source,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path = _overrides_path(vault_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def save_curated_keep_all_override(
+    vault_root: Path, key: str, entries: List[Dict[str, str]]
+) -> None:
+    """Persist a multi-value keep-all override immediately to disk."""
+    from datetime import datetime, timezone
+
+    data = load_curated_overrides(vault_root)
+    data["overrides"][key] = {
+        "mode": "keep_all",
+        "values": [{"value": e["value"], "source": e["source"]} for e in entries],
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path = _overrides_path(vault_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def apply_keep_all_resolution(vault_root: Path, item: Dict[str, Any]) -> None:
+    """Keep all competing values as valid Canonical Facts and clear the conflict."""
+    opts = item["options"]
+    save_curated_keep_all_override(vault_root, item["override_key"], opts)
+
+    md_path: Path = item["profile_path"]
+    if not md_path.is_file():
+        return
+
+    field = item["field"]
+    lines = md_path.read_text(encoding="utf-8").splitlines()
+    new_lines: List[str] = []
+    section = ""
+    canon_prefix = f"- **{field}**:"
+    inserted = False
+
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("## "):
+            section = s
+            new_lines.append(ln)
+            continue
+        if section == "## Canonical Facts" and s.startswith(canon_prefix):
+            if not inserted:
+                for opt in opts:
+                    new_lines.append(f"- **{field}**: {opt['value']} *(Source: `{opt['source']}`)*")
+                inserted = True
+        elif section == "## Conflicting / Alternate Mentions" and s.startswith(canon_prefix):
+            continue
+        else:
+            new_lines.append(ln)
+
+    if not inserted:
+        for opt in opts:
+            new_lines.append(f"- **{field}**: {opt['value']} *(Source: `{opt['source']}`)*")
+
+    cleaned: List[str] = []
+    for idx, ln in enumerate(new_lines):
+        if ln.strip() == "## Conflicting / Alternate Mentions":
+            remaining = [x for x in new_lines[idx + 1 :] if x.strip()]
+            if not remaining:
+                while cleaned and cleaned[-1].strip() == "":
+                    cleaned.pop()
+                break
+        cleaned.append(ln)
+
+    md_path.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
+
+
+def collect_conflicts(vault_root: Path) -> List[Dict[str, Any]]:
+    """Scan _curated/ Markdown profiles for unresolved Conflicting / Alternate Mentions."""
+    curated_root = vault_root / _CURATED_DIR_NAME
+    if not curated_root.is_dir():
+        return []
+
+    overrides_map = load_curated_overrides(vault_root).get("overrides", {})
+    items: List[Dict[str, Any]] = []
+
+    canon_re = re.compile(r"^- \*\*(.+?)\*\*:\s*(.+?)\s*\*\(Source:\s*`([^`]*)`\)\*$")
+    alt_re = re.compile(r"^- \*\*(.+?)\*\*:\s*`(.+?)`\s*\*\(Source:\s*`([^`]*)`\)\*\s*—\s*differs from canonical")
+
+    for md_path in sorted(curated_root.rglob("*.md")):
+        if md_path.name == "verified_facts.md":
+            continue
+        rel = md_path.relative_to(curated_root).as_posix()
+        ent_key_prefix = rel[:-3] if rel.endswith(".md") else rel
+        text = md_path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+
+        entity_name = md_path.stem
+        for ln in lines:
+            if ln.startswith("# "):
+                entity_name = ln[2:].split("—")[0].strip()
+                break
+
+        section = ""
+        canonical: Dict[str, Tuple[str, str]] = {}
+        alternates: Dict[str, List[Tuple[str, str]]] = {}
+
+        for ln in lines:
+            s = ln.strip()
+            if s.startswith("## "):
+                section = s
+                continue
+            if section == "## Canonical Facts":
+                m = canon_re.match(s)
+                if m:
+                    canonical[m.group(1)] = (m.group(2).strip(), m.group(3).strip())
+            elif section == "## Conflicting / Alternate Mentions":
+                m = alt_re.match(s)
+                if m:
+                    alternates.setdefault(m.group(1), []).append((m.group(2).strip(), m.group(3).strip()))
+
+        for fld, alts in alternates.items():
+            ov_key = f"{ent_key_prefix}::{fld}"
+            if ov_key in overrides_map:
+                continue
+            options: List[Dict[str, str]] = []
+            if fld in canonical:
+                c_val, c_src = canonical[fld]
+                options.append({"value": c_val, "source": c_src, "is_canonical": "true"})
+            for a_val, a_src in alts:
+                options.append({"value": a_val, "source": a_src, "is_canonical": "false"})
+            items.append({
+                "profile_path": md_path,
+                "rel_path": rel,
+                "entity": entity_name,
+                "field": fld,
+                "override_key": ov_key,
+                "options": options,
+            })
+
+    return items
+
+
+def apply_conflict_resolution(
+    vault_root: Path,
+    item: Dict[str, Any],
+    chosen_value: str,
+    chosen_source: str,
+) -> None:
+    """Persist override and update the _curated/ profile card in place."""
+    save_curated_override(vault_root, item["override_key"], chosen_value, chosen_source)
+
+    md_path: Path = item["profile_path"]
+    if not md_path.is_file():
+        return
+
+    field = item["field"]
+    lines = md_path.read_text(encoding="utf-8").splitlines()
+    new_lines: List[str] = []
+    section = ""
+    canon_prefix = f"- **{field}**:"
+    replaced_canon = False
+
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("## "):
+            section = s
+            new_lines.append(ln)
+            continue
+        if section == "## Canonical Facts" and s.startswith(canon_prefix):
+            new_lines.append(f"- **{field}**: {chosen_value} *(Source: `{chosen_source}`)*")
+            replaced_canon = True
+        elif section == "## Conflicting / Alternate Mentions" and s.startswith(canon_prefix):
+            continue
+        else:
+            new_lines.append(ln)
+
+    if not replaced_canon:
+        new_lines.append(f"- **{field}**: {chosen_value} *(Source: `{chosen_source}`)*")
+
+    # Strip empty ## Conflicting / Alternate Mentions header if no conflict bullets remain
+    cleaned: List[str] = []
+    for idx, ln in enumerate(new_lines):
+        if ln.strip() == "## Conflicting / Alternate Mentions":
+            remaining = [x for x in new_lines[idx + 1 :] if x.strip()]
+            if not remaining:
+                while cleaned and cleaned[-1].strip() == "":
+                    cleaned.pop()
+                break
+        cleaned.append(ln)
+
+    md_path.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
+
+
+def collect_open_gaps(vault_root: Path) -> List[Dict[str, Any]]:
+    """Load unresolved knowledge gaps from .alcuin/knowledge_gaps.json."""
+    gaps_path = vault_root / ".alcuin" / "knowledge_gaps.json"
+    if not gaps_path.is_file():
+        return []
+    try:
+        data = json.loads(gaps_path.read_text(encoding="utf-8"))
+        gaps = data.get("gaps", {})
+        return [
+            dict(g, id=gid)
+            for gid, g in gaps.items()
+            if isinstance(g, dict) and g.get("status", "unresolved") == "unresolved"
+        ]
+    except Exception:
+        return []
+
+
+def resolve_gap(vault_root: Path, gap_id: str, answer: Optional[str] = None) -> bool:
+    """Resolve a knowledge gap immediately, optionally writing a verified fact to _curated/verified_facts.md."""
+    from datetime import datetime, timezone
+
+    gaps_path = vault_root / ".alcuin" / "knowledge_gaps.json"
+    if not gaps_path.is_file():
+        return False
+
+    data = json.loads(gaps_path.read_text(encoding="utf-8"))
+    gaps = data.get("gaps", {})
+    if gap_id not in gaps:
+        return False
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    query_text = str(gaps[gap_id].get("query", gap_id)).strip()
+    wrote_fact = False
+
+    if answer and answer.strip():
+        verified_path = vault_root / _CURATED_DIR_NAME / "verified_facts.md"
+        verified_path.parent.mkdir(parents=True, exist_ok=True)
+        if not verified_path.is_file():
+            verified_path.write_text(
+                "# Human-Verified Facts\n\n"
+                "> Grounded answers supplied during assisted curation (`SPEC-043`).\n\n",
+                encoding="utf-8",
+            )
+        existing = verified_path.read_text(encoding="utf-8")
+        entry = (
+            f"## {query_text}\n"
+            f"- **Verified Answer**: {answer.strip()} *(Source: `Human Verified` — {now_iso[:10]})*\n\n"
+        )
+        verified_path.write_text(existing + entry, encoding="utf-8")
+        wrote_fact = True
+
+    gaps[gap_id]["status"] = "resolved"
+    gaps[gap_id]["resolved_at"] = now_iso
+    data["updated_at"] = now_iso
+    gaps_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return wrote_fact
+
+
+def _parse_profile_facts(md_path: Path) -> Tuple[str, Dict[str, Tuple[str, str]]]:
+    """Return (display_name, {field: (value, source)}) from a _curated/ profile card."""
+    lines = md_path.read_text(encoding="utf-8").splitlines()
+    display = md_path.stem
+    for ln in lines:
+        if ln.startswith("# "):
+            display = ln[2:].split("—")[0].strip()
+            break
+
+    canon_re = re.compile(r"^- \*\*(.+?)\*\*:\s*(.+?)\s*\*\(Source:\s*`([^`]*)`\)\*$")
+    facts: Dict[str, Tuple[str, str]] = {}
+    section = ""
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("## "):
+            section = s
+            continue
+        if section == "## Canonical Facts":
+            m = canon_re.match(s)
+            if m:
+                facts[m.group(1)] = (m.group(2).strip(), m.group(3).strip())
+    return display, facts
+
+
+def collect_merge_candidates(vault_root: Path) -> List[Dict[str, Any]]:
+    """Detect likely duplicate entity profiles in _curated/ for Google Contacts-style merge review."""
+    from difflib import SequenceMatcher
+
+    curated_root = vault_root / _CURATED_DIR_NAME
+    if not curated_root.is_dir():
+        return []
+
+    ov_data = load_curated_overrides(vault_root)
+    not_merges = {tuple(sorted(pair)) for pair in ov_data.get("not_merges", []) if len(pair) == 2}
+
+    profiles: List[Dict[str, Any]] = []
+    for md_path in sorted(curated_root.rglob("*.md")):
+        if md_path.name == "verified_facts.md":
+            continue
+        rel = md_path.relative_to(curated_root).as_posix()
+        category = rel.split("/")[0] if "/" in rel else "people"
+        display, facts = _parse_profile_facts(md_path)
+        tokens = [t for t in re.findall(r"[a-z0-9]+", display.lower()) if t]
+        profiles.append({
+            "path": md_path,
+            "rel_path": rel,
+            "category": category,
+            "display": display,
+            "facts": facts,
+            "tokens": tokens,
+        })
+
+    candidates: List[Dict[str, Any]] = []
+    primary_id_fields = ("Date of Birth", "Email", "Phone")
+
+    for i in range(len(profiles)):
+        for j in range(i + 1, len(profiles)):
+            a, b = profiles[i], profiles[j]
+            if a["category"] != b["category"]:
+                continue
+            pair_key = tuple(sorted([a["rel_path"], b["rel_path"]]))
+            if pair_key in not_merges:
+                continue
+
+            reasons: List[str] = []
+            for fld in primary_id_fields:
+                if fld in a["facts"] and fld in b["facts"]:
+                    va = re.sub(r"\s+", " ", a["facts"][fld][0]).strip().lower()
+                    vb = re.sub(r"\s+", " ", b["facts"][fld][0]).strip().lower()
+                    if va and va == vb:
+                        reasons.append(f"Shared {fld}: {a['facts'][fld][0]}")
+
+            ta, tb = a["tokens"], b["tokens"]
+            if ta and tb and ta[0] == tb[0]:
+                if set(ta).issubset(set(tb)) or set(tb).issubset(set(ta)):
+                    reasons.append(f"Name subset: '{a['display']}' / '{b['display']}'")
+                elif SequenceMatcher(None, a["display"].lower(), b["display"].lower()).ratio() >= 0.85:
+                    reasons.append(f"Similar name: '{a['display']}' / '{b['display']}'")
+
+            if reasons:
+                candidates.append({
+                    "a": a,
+                    "b": b,
+                    "reason": "; ".join(reasons),
+                })
+
+    return candidates
+
+
+def record_not_merge(vault_root: Path, rel_a: str, rel_b: str) -> None:
+    """Persist a negative merge decision so this pair is not prompted again."""
+    data = load_curated_overrides(vault_root)
+    pair = sorted([rel_a, rel_b])
+    if pair not in data["not_merges"]:
+        data["not_merges"].append(pair)
+    path = _overrides_path(vault_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def apply_entity_merge(
+    vault_root: Path,
+    cand: Dict[str, Any],
+    canonical_name: str,
+) -> Path:
+    """Merge two _curated/ profiles under canonical_name and persist aliases immediately."""
+    a, b = cand["a"], cand["b"]
+    curated_root = vault_root / _CURATED_DIR_NAME
+    category = a["category"]
+    target_path = curated_root / category / f"{_sanitize_entity_filename(canonical_name)}.md"
+
+    # Persist alias mappings for both source names that differ from canonical_name
+    ov_data = load_curated_overrides(vault_root)
+    for src_name in (a["display"], b["display"]):
+        if src_name.lower() != canonical_name.lower():
+            ov_data["aliases"][src_name.lower()] = canonical_name
+            ov_data["aliases"][_sanitize_entity_filename(src_name).lower()] = canonical_name
+    ov_path = _overrides_path(vault_root)
+    ov_path.parent.mkdir(parents=True, exist_ok=True)
+    ov_path.write_text(json.dumps(ov_data, indent=2), encoding="utf-8")
+
+    # Combine facts & aliases
+    merged_facts: Dict[str, Tuple[str, str]] = {}
+    merged_aliases: List[str] = []
+    for prof in (a, b):
+        if prof["display"].lower() != canonical_name.lower() and prof["display"] not in merged_aliases:
+            merged_aliases.append(prof["display"])
+        for fld, (val, src) in prof["facts"].items():
+            if fld == "Aliases / Former Names":
+                for al in [x.strip() for x in val.split(",") if x.strip()]:
+                    if al not in merged_aliases and al.lower() != canonical_name.lower():
+                        merged_aliases.append(al)
+            elif fld not in merged_facts:
+                merged_facts[fld] = (val, src)
+
+    lines = [
+        f"# {canonical_name} — Canonical Profile",
+        "",
+        "> Curated automatically by Alcuin (`SPEC-041`). Formal records take precedence over informal mentions.",
+        "",
+        "## Canonical Facts",
+    ]
+    for fld in sorted(merged_facts.keys()):
+        val, src = merged_facts[fld]
+        lines.append(f"- **{fld}**: {val} *(Source: `{src}`)*")
+    if merged_aliases:
+        lines.append(f"- **Aliases / Former Names**: {', '.join(sorted(merged_aliases))} *(Source: `Human Verified`)*")
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    for p in (a["path"], b["path"]):
+        if p.resolve() != target_path.resolve() and p.is_file():
+            p.unlink()
+
+    return target_path

@@ -538,47 +538,284 @@ def gdrive_sync(
         )
 
 
+def _run_assisted_review(vault_obj) -> bool:
+    """Interactive conflict, entity-merge, & knowledge-gap review loop (SPEC-043). Returns True if _curated/ changed."""
+    from alcuin.storage.curator import (
+        apply_conflict_resolution,
+        apply_entity_merge,
+        apply_keep_all_resolution,
+        collect_conflicts,
+        collect_merge_candidates,
+        collect_open_gaps,
+        record_not_merge,
+        resolve_gap,
+    )
+
+    conflicts = collect_conflicts(vault_obj.root_path)
+    merges = collect_merge_candidates(vault_obj.root_path)
+    gaps = collect_open_gaps(vault_obj.root_path)
+    if not conflicts and not merges and not gaps:
+        console.print("[green]No unresolved conflicts, duplicate entity candidates, or open knowledge gaps found.[/green]")
+        return False
+
+    modified = False
+    resolved_conflicts = 0
+    merged_entities = 0
+    resolved_gaps = 0
+
+    while True:
+        conflicts = collect_conflicts(vault_obj.root_path)
+        merges = collect_merge_candidates(vault_obj.root_path)
+        gaps = collect_open_gaps(vault_obj.root_path)
+        if not conflicts and not merges and not gaps:
+            break
+
+        console.print(
+            f"\n[bold cyan]Assisted Curation Menu:[/bold cyan]\n"
+            f"  [1] Conflicts ({len(conflicts)} pending)\n"
+            f"  [2] Entity Merges ({len(merges)} candidate pairs)\n"
+            f"  [3] Knowledge Gaps ({len(gaps)} open)\n"
+            f"  [q] Quit & save"
+        )
+        section = click.prompt(
+            "Section [1/2/3/q=quit]",
+            default="1" if conflicts else ("2" if merges else "3"),
+            show_default=False,
+        ).strip().lower()
+
+        if section == "q":
+            break
+
+        back_to_menu = False
+        quit_requested = False
+
+        if section == "1":
+            if not conflicts:
+                console.print("[green]No unresolved conflicts.[/green]")
+                continue
+            console.print(f"\n[bold cyan]Conflict Review ({len(conflicts)} pending):[/bold cyan]")
+            for idx, item in enumerate(conflicts, 1):
+                console.print(
+                    f"\n[bold][{idx}/{len(conflicts)}] {item['entity']} — {item['field']}[/bold] "
+                    f"[dim]({item['rel_path']})[/dim]"
+                )
+                opts = item["options"]
+                for opt_idx, opt in enumerate(opts, 1):
+                    tag = " [dim](current canonical)[/dim]" if opt.get("is_canonical") == "true" else ""
+                    console.print(f"  [{opt_idx}] {opt['value']} [dim](Source: {opt['source']})[/dim]{tag}")
+                console.print("  [a] Keep all (multi-value)   [c] Custom value   [d] Dismiss   [s] Skip   [m] Menu   [q] Quit & save", markup=False)
+
+                opt_range = f"1-{len(opts)}" if len(opts) > 1 else "1"
+                while True:
+                    choice = click.prompt(
+                        f"Choice [{opt_range}/a=keep-all/c=custom/d=dismiss/s=skip/m=menu/q=quit]",
+                        default="s",
+                        show_default=False,
+                    ).strip().lower()
+                    if choice == "q":
+                        quit_requested = True
+                        break
+                    if choice == "m":
+                        back_to_menu = True
+                        break
+                    if choice == "s":
+                        break
+                    if choice == "a":
+                        apply_keep_all_resolution(vault_obj.root_path, item)
+                        resolved_conflicts += 1
+                        modified = True
+                        break
+                    if choice == "d":
+                        apply_conflict_resolution(vault_obj.root_path, item, opts[0]["value"], opts[0]["source"])
+                        resolved_conflicts += 1
+                        modified = True
+                        break
+                    if choice == "c":
+                        custom_val = click.prompt("Enter canonical value").strip()
+                        if custom_val:
+                            apply_conflict_resolution(vault_obj.root_path, item, custom_val, "Human Verified")
+                            resolved_conflicts += 1
+                            modified = True
+                        break
+                    if choice.isdigit() and 1 <= int(choice) <= len(opts):
+                        picked = opts[int(choice) - 1]
+                        apply_conflict_resolution(vault_obj.root_path, item, picked["value"], picked["source"])
+                        resolved_conflicts += 1
+                        modified = True
+                        break
+                    console.print("[yellow]Invalid choice. Enter option number, a, c, d, s, m, or q.[/yellow]")
+
+                if quit_requested or back_to_menu:
+                    break
+
+        elif section == "2":
+            if not merges:
+                console.print("[green]No duplicate entity candidates.[/green]")
+                continue
+            console.print(f"\n[bold cyan]Entity Merge Review ({len(merges)} candidate pairs):[/bold cyan]")
+            for idx, cand in enumerate(merges, 1):
+                a, b = cand["a"], cand["b"]
+                if not a["path"].is_file() or not b["path"].is_file():
+                    continue
+                console.print(
+                    f"\n[bold][{idx}/{len(merges)}] {a['display']}  ↔  {b['display']}[/bold] "
+                    f"[dim]({cand['reason']})[/dim]"
+                )
+                console.print(f"  [1] Merge & name it '{a['display']}' ({len(a['facts'])} facts)")
+                for fld, (val, _) in list(a["facts"].items())[:4]:
+                    console.print(f"      • {fld}: {val}")
+                console.print(f"  [2] Merge & name it '{b['display']}' ({len(b['facts'])} facts)")
+                for fld, (val, _) in list(b["facts"].items())[:4]:
+                    console.print(f"      • {fld}: {val}")
+                console.print("  [c] Custom name   [n] Not same   [s] Skip   [m] Menu   [q] Quit & save", markup=False)
+
+                while True:
+                    choice = click.prompt(
+                        "Choice [1/2/c=custom/n=not-same/s=skip/m=menu/q=quit]",
+                        default="s",
+                        show_default=False,
+                    ).strip().lower()
+                    if choice == "q":
+                        quit_requested = True
+                        break
+                    if choice == "m":
+                        back_to_menu = True
+                        break
+                    if choice == "s":
+                        break
+                    if choice == "n":
+                        record_not_merge(vault_obj.root_path, a["rel_path"], b["rel_path"])
+                        break
+                    if choice == "1":
+                        apply_entity_merge(vault_obj.root_path, cand, a["display"])
+                        merged_entities += 1
+                        modified = True
+                        break
+                    if choice == "2":
+                        apply_entity_merge(vault_obj.root_path, cand, b["display"])
+                        merged_entities += 1
+                        modified = True
+                        break
+                    if choice == "c":
+                        custom_name = click.prompt("Enter canonical entity name").strip()
+                        if custom_name:
+                            apply_entity_merge(vault_obj.root_path, cand, custom_name)
+                            merged_entities += 1
+                            modified = True
+                        break
+                    console.print("[yellow]Invalid choice. Enter 1, 2, c, n, s, m, or q.[/yellow]")
+
+                if quit_requested or back_to_menu:
+                    break
+
+        elif section == "3":
+            if not gaps:
+                console.print("[green]No open knowledge gaps.[/green]")
+                continue
+            console.print(f"\n[bold cyan]Open Knowledge Gaps ({len(gaps)} remaining):[/bold cyan]")
+            for idx, gap in enumerate(gaps, 1):
+                console.print(
+                    f"\n[bold][{idx}/{len(gaps)}] {gap.get('query', gap['id'])}[/bold] "
+                    f"[dim](asked {gap.get('ask_count', 1)}x)[/dim]"
+                )
+                console.print("  [a] Enter answer   [d] Dismiss gap   [s] Skip   [m] Menu   [q] Quit & save", markup=False)
+
+                while True:
+                    choice = click.prompt(
+                        "Choice [a=answer/d=dismiss/s=skip/m=menu/q=quit]",
+                        default="s",
+                        show_default=False,
+                    ).strip().lower()
+                    if choice == "q":
+                        quit_requested = True
+                        break
+                    if choice == "m":
+                        back_to_menu = True
+                        break
+                    if choice == "s":
+                        break
+                    if choice == "d":
+                        resolve_gap(vault_obj.root_path, gap["id"], answer=None)
+                        resolved_gaps += 1
+                        break
+                    if choice == "a":
+                        ans = click.prompt("Verified answer").strip()
+                        if ans:
+                            if resolve_gap(vault_obj.root_path, gap["id"], answer=ans):
+                                modified = True
+                            resolved_gaps += 1
+                        break
+                    console.print("[yellow]Invalid choice. Enter a, d, s, m, or q.[/yellow]")
+
+                if quit_requested or back_to_menu:
+                    break
+        else:
+            console.print("[yellow]Invalid section. Enter 1, 2, 3, or q.[/yellow]")
+            continue
+
+        if quit_requested:
+            break
+
+    rem_conflicts = len(collect_conflicts(vault_obj.root_path))
+    rem_merges = len(collect_merge_candidates(vault_obj.root_path))
+    rem_gaps = len(collect_open_gaps(vault_obj.root_path))
+    console.print(
+        f"\n[bold green]Review Summary:[/bold green]\n"
+        f"  • Resolved this session: {resolved_conflicts} conflicts, {merged_entities} entity merges, {resolved_gaps} gaps\n"
+        f"  • Remaining backlog:     {rem_conflicts} conflicts, {rem_merges} entity merges, {rem_gaps} gaps"
+    )
+    return modified
+
+
 @cli.command(name="curate", short_help="Extract canonical entity profiles and resolve conflicts into _curated/ (SPEC-041)")
 @click.option("-v", "--vault", "vault_target", help="Vault name or directory path")
 @click.option("--model", "model_name", help="LLM model name to use for curation (e.g., Ministral-8B)")
 @click.option("--all", "process_all", is_flag=True, help="Process every chunk (default scans fact-bearing chunks only)")
 @click.option("--dry-run", is_flag=True, help="Extract and report counts without writing _curated/ files")
 @click.option("--index", "run_index", is_flag=True, help="Re-index the vault immediately after writing _curated/ profiles")
+@click.option("--review", "--interactive", "review_mode", is_flag=True, help="Interactively resolve _curated/ conflicts and open knowledge gaps (SPEC-043)")
 def curate_cmd(
     vault_target: Optional[str],
     model_name: Optional[str],
     process_all: bool,
     dry_run: bool,
     run_index: bool,
+    review_mode: bool,
 ):
     """Synthesize canonical Markdown entity profiles from indexed vault chunks."""
     from alcuin.storage.curator import VaultCurator
 
     overrides = {"model_name": model_name} if model_name else {}
     vault_obj = resolve_or_prompt_vault(target=vault_target, overrides=overrides)
-    curator = VaultCurator(vault_obj)
 
-    with console.status("[bold cyan]Curating canonical entity profiles...[/bold cyan]", spinner="dots") as status:
-        def _on_prog(idx: int, total: int, fpath: str) -> None:
-            short = Path(fpath).name
-            status.update(f"[bold cyan]Curating ({idx}/{total}):[/bold cyan] {short}")
+    if not review_mode or process_all:
+        curator = VaultCurator(vault_obj)
 
-        report = curator.curate(process_all=process_all, dry_run=dry_run, progress_cb=_on_prog)
+        with console.status("[bold cyan]Curating canonical entity profiles...[/bold cyan]", spinner="dots") as status:
+            def _on_prog(idx: int, total: int, fpath: str) -> None:
+                short = Path(fpath).name
+                status.update(f"[bold cyan]Curating ({idx}/{total}):[/bold cyan] {short}")
 
-    console.print(
-        f"[bold green]Curation Complete{' (dry-run)' if dry_run else ''}:[/bold green]\n"
-        f"  • Chunks scanned:   {report.chunks_scanned}\n"
-        f"  • Newly extracted:  {report.chunks_extracted}\n"
-        f"  • Cached unchanged: {report.chunks_cached}\n"
-        f"  • Skipped (no-sig): {report.chunks_skipped}\n"
-        f"  • Entities written: {len(report.entities_written)}\n"
-        f"  • Conflicts noted:  {report.conflicts_found}"
-    )
-    if report.errors:
-        for err in report.errors[:5]:
-            console.print(f"  [yellow]WARN:[/yellow] {err}")
+            report = curator.curate(process_all=process_all, dry_run=dry_run, progress_cb=_on_prog)
 
-    if run_index and not dry_run:
+        console.print(
+            f"[bold green]Curation Complete{' (dry-run)' if dry_run else ''}:[/bold green]\n"
+            f"  • Chunks scanned:   {report.chunks_scanned}\n"
+            f"  • Newly extracted:  {report.chunks_extracted}\n"
+            f"  • Cached unchanged: {report.chunks_cached}\n"
+            f"  • Skipped (no-sig): {report.chunks_skipped}\n"
+            f"  • Entities written: {len(report.entities_written)}\n"
+            f"  • Conflicts noted:  {report.conflicts_found}"
+        )
+        if report.errors:
+            for err in report.errors[:5]:
+                console.print(f"  [yellow]WARN:[/yellow] {err}")
+
+    review_modified = False
+    if review_mode and not dry_run:
+        review_modified = _run_assisted_review(vault_obj)
+
+    if (run_index or review_modified) and not dry_run:
         console.print(f"[bold cyan]Indexing curated profiles in '{vault_obj.name}'...[/bold cyan]")
         idx_report = VaultStorage(vault_obj).index()
         console.print(

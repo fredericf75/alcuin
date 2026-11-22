@@ -268,14 +268,25 @@ class VaultCurator:
                 ent_type = _classify_entity_type(fact["entity"], fact.get("type", ""))
                 ent_key, display_name = _canonical_entity_key_and_name(fact["entity"], ent_type)
 
-                alias_target = aliases_map.get(ent_key) or aliases_map.get(display_name.lower())
-                if alias_target:
-                    orig_display = display_name
-                    ent_key, display_name = _canonical_entity_key_and_name(alias_target, ent_type)
-                    if orig_display.lower() != display_name.lower():
-                        entity_aliases.setdefault(ent_key, [])
-                        if orig_display not in entity_aliases[ent_key]:
-                            entity_aliases[ent_key].append(orig_display)
+                # Resolve chained aliases transitively with cycle guard (e.g. A -> B -> C)
+                orig_display = display_name
+                alias_target = None
+                seen_hops = {ent_key, display_name.lower()}
+                while True:
+                    nxt = aliases_map.get(ent_key) or aliases_map.get(display_name.lower())
+                    if not nxt:
+                        break
+                    nxt_key, nxt_display = _canonical_entity_key_and_name(nxt, ent_type)
+                    if nxt_key in seen_hops and nxt_display.lower() in seen_hops:
+                        break
+                    seen_hops.add(nxt_key)
+                    seen_hops.add(nxt_display.lower())
+                    alias_target = nxt
+                    ent_key, display_name = nxt_key, nxt_display
+                if alias_target and orig_display.lower() != display_name.lower():
+                    entity_aliases.setdefault(ent_key, [])
+                    if orig_display not in entity_aliases[ent_key]:
+                        entity_aliases[ent_key].append(orig_display)
 
                 if ent_key not in entities:
                     entities[ent_key] = {
@@ -436,20 +447,29 @@ class VaultCurator:
         report.entities_written = sorted(profiles.keys())
 
         if not dry_run:
+            import os
+
             curated_root = self.vault.root_path / _CURATED_DIR_NAME
-            verified_path = curated_root / "verified_facts.md"
-            saved_verified = verified_path.read_text(encoding="utf-8") if verified_path.is_file() else None
-            if curated_root.exists():
-                shutil.rmtree(curated_root)
+            curated_root.mkdir(parents=True, exist_ok=True)
+            written_paths = set()
             for rel_out, md_body in profiles.items():
                 dest = curated_root / rel_out
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_text(md_body, encoding="utf-8")
-            if saved_verified is not None:
-                verified_path.parent.mkdir(parents=True, exist_ok=True)
-                verified_path.write_text(saved_verified, encoding="utf-8")
+                tmp_dest = dest.with_suffix(".md.tmp")
+                tmp_dest.write_text(md_body, encoding="utf-8")
+                os.replace(tmp_dest, dest)
+                written_paths.add(dest.resolve())
+            # Remove stale generated profile cards in managed subdirectories without touching verified_facts.md
+            for managed_sub in (_PEOPLE_SUBDIR, _ORG_SUBDIR):
+                sub_dir = curated_root / managed_sub
+                if sub_dir.is_dir():
+                    for existing in list(sub_dir.glob("*.md")):
+                        if existing.resolve() not in written_paths:
+                            existing.unlink(missing_ok=True)
             state_path.parent.mkdir(parents=True, exist_ok=True)
-            state_path.write_text(json.dumps(new_state, indent=2), encoding="utf-8")
+            tmp_state = state_path.with_suffix(".json.tmp")
+            tmp_state.write_text(json.dumps(new_state, indent=2), encoding="utf-8")
+            os.replace(tmp_state, state_path)
 
         return report
 
@@ -733,8 +753,8 @@ def resolve_gap(vault_root: Path, gap_id: str, answer: Optional[str] = None) -> 
     return wrote_fact
 
 
-def _parse_profile_facts(md_path: Path) -> Tuple[str, Dict[str, Tuple[str, str]]]:
-    """Return (display_name, {field: (value, source)}) from a _curated/ profile card."""
+def _parse_profile_full(md_path: Path) -> Tuple[str, Dict[str, List[Tuple[str, str]]], List[str]]:
+    """Return (display_name, {field: [(value, source), ...]}, conflict_lines) from a _curated/ profile card."""
     lines = md_path.read_text(encoding="utf-8").splitlines()
     display = md_path.stem
     for ln in lines:
@@ -743,7 +763,8 @@ def _parse_profile_facts(md_path: Path) -> Tuple[str, Dict[str, Tuple[str, str]]
             break
 
     canon_re = re.compile(r"^- \*\*(.+?)\*\*:\s*(.+?)\s*\*\(Source:\s*`([^`]*)`\)\*$")
-    facts: Dict[str, Tuple[str, str]] = {}
+    facts: Dict[str, List[Tuple[str, str]]] = {}
+    conflicts: List[str] = []
     section = ""
     for ln in lines:
         s = ln.strip()
@@ -753,8 +774,17 @@ def _parse_profile_facts(md_path: Path) -> Tuple[str, Dict[str, Tuple[str, str]]
         if section == "## Canonical Facts":
             m = canon_re.match(s)
             if m:
-                facts[m.group(1)] = (m.group(2).strip(), m.group(3).strip())
-    return display, facts
+                facts.setdefault(m.group(1), []).append((m.group(2).strip(), m.group(3).strip()))
+        elif section == "## Conflicting / Alternate Mentions":
+            if s.startswith("- "):
+                conflicts.append(s)
+    return display, facts, conflicts
+
+
+def _parse_profile_facts(md_path: Path) -> Tuple[str, Dict[str, Tuple[str, str]]]:
+    """Return (display_name, {field: (first_value, source)}) from a _curated/ profile card."""
+    display, full_facts, _ = _parse_profile_full(md_path)
+    return display, {fld: vals[0] for fld, vals in full_facts.items() if vals}
 
 
 def collect_merge_candidates(vault_root: Path) -> List[Dict[str, Any]]:
@@ -838,35 +868,81 @@ def apply_entity_merge(
     cand: Dict[str, Any],
     canonical_name: str,
 ) -> Path:
-    """Merge two _curated/ profiles under canonical_name and persist aliases immediately."""
+    """Merge two _curated/ profiles under canonical_name and persist aliases/overrides atomically."""
+    import os
+
     a, b = cand["a"], cand["b"]
     curated_root = vault_root / _CURATED_DIR_NAME
     category = a["category"]
-    target_path = curated_root / category / f"{_sanitize_entity_filename(canonical_name)}.md"
+    target_stem = _sanitize_entity_filename(canonical_name)
+    target_path = curated_root / category / f"{target_stem}.md"
 
-    # Persist alias mappings for both source names that differ from canonical_name
+    # Persist alias mappings, rewrite chained aliases, and re-key existing overrides
     ov_data = load_curated_overrides(vault_root)
+    merged_away_names = set()
     for src_name in (a["display"], b["display"]):
         if src_name.lower() != canonical_name.lower():
+            san_src = _sanitize_entity_filename(src_name)
+            merged_away_names.add(src_name.lower())
+            merged_away_names.add(san_src.lower())
             ov_data["aliases"][src_name.lower()] = canonical_name
-            ov_data["aliases"][_sanitize_entity_filename(src_name).lower()] = canonical_name
+            ov_data["aliases"][san_src.lower()] = canonical_name
+            old_prefix = f"{category}/{san_src}::"
+            new_prefix = f"{category}/{target_stem}::"
+            for old_key in list(ov_data.get("overrides", {}).keys()):
+                if old_key.startswith(old_prefix):
+                    new_key = new_prefix + old_key[len(old_prefix):]
+                    if new_key not in ov_data["overrides"]:
+                        ov_data["overrides"][new_key] = ov_data["overrides"][old_key]
+                    del ov_data["overrides"][old_key]
+    # Rewrite any existing alias targets pointing to a merged-away entity so chained merges stay flat
+    for ak, av in list(ov_data.get("aliases", {}).items()):
+        if isinstance(av, str) and (av.lower() in merged_away_names or _sanitize_entity_filename(av).lower() in merged_away_names):
+            ov_data["aliases"][ak] = canonical_name
+
     ov_path = _overrides_path(vault_root)
     ov_path.parent.mkdir(parents=True, exist_ok=True)
-    ov_path.write_text(json.dumps(ov_data, indent=2), encoding="utf-8")
+    tmp_ov = ov_path.with_suffix(".json.tmp")
+    tmp_ov.write_text(json.dumps(ov_data, indent=2), encoding="utf-8")
+    os.replace(tmp_ov, ov_path)
 
-    # Combine facts & aliases
-    merged_facts: Dict[str, Tuple[str, str]] = {}
+    # Combine all multi-value facts, competing single-value mentions, conflicts, and aliases
+    merged_facts: Dict[str, List[Tuple[str, str]]] = {}
+    merged_conflicts: List[str] = []
     merged_aliases: List[str] = []
     for prof in (a, b):
         if prof["display"].lower() != canonical_name.lower() and prof["display"] not in merged_aliases:
             merged_aliases.append(prof["display"])
-        for fld, (val, src) in prof["facts"].items():
+        if prof["path"].is_file():
+            _, prof_full_facts, prof_conflicts = _parse_profile_full(prof["path"])
+        else:
+            prof_full_facts = {k: [v] for k, v in prof.get("facts", {}).items()}
+            prof_conflicts = []
+        for cline in prof_conflicts:
+            if cline not in merged_conflicts:
+                merged_conflicts.append(cline)
+        for fld, val_list in prof_full_facts.items():
             if fld == "Aliases / Former Names":
-                for al in [x.strip() for x in val.split(",") if x.strip()]:
-                    if al not in merged_aliases and al.lower() != canonical_name.lower():
-                        merged_aliases.append(al)
-            elif fld not in merged_facts:
-                merged_facts[fld] = (val, src)
+                for val, _ in val_list:
+                    for al in [x.strip() for x in val.split(",") if x.strip()]:
+                        if al not in merged_aliases and al.lower() != canonical_name.lower():
+                            merged_aliases.append(al)
+                continue
+            for val, src in val_list:
+                norm_v = re.sub(r"\s+", " ", val).strip().lower()
+                if fld not in merged_facts:
+                    merged_facts[fld] = [(val, src)]
+                else:
+                    existing_norms = {re.sub(r"\s+", " ", ev).strip().lower() for ev, _ in merged_facts[fld]}
+                    if norm_v in existing_norms:
+                        continue
+                    if fld in _MULTI_VALUE_FIELDS or len(merged_facts[fld]) > 1:
+                        merged_facts[fld].append((val, src))
+                    else:
+                        canon_val = merged_facts[fld][0][0]
+                        alt_line = f"- **{fld}**: `{val}` *(Source: `{src}`)* — differs from canonical `{canon_val}`"
+                        if alt_line not in merged_conflicts:
+                            merged_conflicts.append(alt_line)
 
     lines = [
         f"# {canonical_name} — Canonical Profile",
@@ -876,13 +952,18 @@ def apply_entity_merge(
         "## Canonical Facts",
     ]
     for fld in sorted(merged_facts.keys()):
-        val, src = merged_facts[fld]
-        lines.append(f"- **{fld}**: {val} *(Source: `{src}`)*")
+        for val, src in merged_facts[fld]:
+            lines.append(f"- **{fld}**: {val} *(Source: `{src}`)*")
     if merged_aliases:
         lines.append(f"- **Aliases / Former Names**: {', '.join(sorted(merged_aliases))} *(Source: `Human Verified`)*")
+    if merged_conflicts:
+        lines.extend(["", "## Conflicting / Alternate Mentions"])
+        lines.extend(merged_conflicts)
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    target_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp_target = target_path.with_suffix(".md.tmp")
+    tmp_target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(tmp_target, target_path)
 
     for p in (a["path"], b["path"]):
         if p.resolve() != target_path.resolve() and p.is_file():

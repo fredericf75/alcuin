@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,9 +40,13 @@ class GDriveSyncReport:
 
 
 def sanitize_name(name: str) -> str:
-    """Replace OS-illegal filename characters and strip trailing dots/spaces."""
+    """Replace OS-illegal filename characters, strip trailing dots/spaces, and neutralize reserved dot-dirs."""
     cleaned = _ILLEGAL_PATH_CHARS.sub("_", name).strip().rstrip(".")
-    return cleaned or "untitled"
+    if not cleaned or cleaned in (".", ".."):
+        return "untitled"
+    if cleaned.lower() in (".alcuin", ".git"):
+        cleaned = f"_{cleaned.lstrip('.')}"
+    return cleaned
 
 
 def default_token_path() -> Path:
@@ -78,7 +83,23 @@ def get_drive_service(credentials_path: Path, token_path: Path) -> Any:
             flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), DRIVE_SCOPES)
             creds = flow.run_local_server(port=0)
         token_path.parent.mkdir(parents=True, exist_ok=True)
-        token_path.write_text(creds.to_json(), encoding="utf-8")
+        try:
+            os.chmod(token_path.parent, 0o700)
+        except OSError:
+            pass
+        tmp_token = token_path.with_suffix(".json.tmp")
+        fd = os.open(str(tmp_token), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(creds.to_json())
+        except Exception:
+            tmp_token.unlink(missing_ok=True)
+            raise
+        os.replace(tmp_token, token_path)
+        try:
+            os.chmod(token_path, 0o600)
+        except OSError:
+            pass
 
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
@@ -202,7 +223,12 @@ def sync_gdrive_folder(
                 continue
 
             rel_path, export_mime = resolved
-            dest = vault_dir / rel_path
+            vault_root = vault_dir.resolve()
+            alcuin_meta = (vault_root / ".alcuin").resolve()
+            dest = (vault_root / rel_path).resolve()
+            if not dest.is_relative_to(vault_root) or dest.is_relative_to(alcuin_meta):
+                report.errors.append(f"Blocked unsafe target path: {rel_path.as_posix()}")
+                continue
             rel_str = rel_path.as_posix()
 
             prior = prev_state.get(fid)
@@ -241,13 +267,19 @@ def sync_gdrive_folder(
     _walk(folder_id, Path("."))
 
     if prune:
+        vault_root = vault_dir.resolve()
+        alcuin_meta = (vault_root / ".alcuin").resolve()
         active_ids = set(new_state.keys())
         for old_id, info in prev_state.items():
             if old_id not in active_ids:
                 old_rel = info.get("local_path")
                 if old_rel:
-                    old_file = vault_dir / old_rel
-                    if old_file.is_file():
+                    old_file = (vault_root / old_rel).resolve()
+                    if (
+                        old_file.is_relative_to(vault_root)
+                        and not old_file.is_relative_to(alcuin_meta)
+                        and old_file.is_file()
+                    ):
                         old_file.unlink()
                         report.pruned.append(old_rel)
 

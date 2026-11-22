@@ -285,7 +285,7 @@ def research_cmd(
                             status.update(f"[dim]{latest_thought}[/dim]")
                             console.print(f"  [dim]• {latest_thought}[/dim]")
 
-            if not chunks or (not evidence_only and not final_state.get("final_answer")):
+            if not final_state or (not evidence_only and not final_state.get("final_answer")):
                 final_state = agent.research(query, **kwargs)
                 chunks = final_state.get("evidence", [])
     except ModelNotFoundError as e:
@@ -499,7 +499,10 @@ def gdrive_sync(
         sync_gdrive_folder,
     )
 
-    vault_dir = Path(vault_target).resolve()
+    registered_path = None
+    if "/" not in vault_target and "\\" not in vault_target and not Path(vault_target).exists():
+        registered_path = VaultRegistry.get_vault_path(vault_target)
+    vault_dir = registered_path.resolve() if registered_path else Path(vault_target).resolve()
     creds_path = Path(credentials).expanduser().resolve() if credentials else default_credentials_path()
     token_path = Path(token).expanduser().resolve() if token else default_token_path()
 
@@ -510,7 +513,11 @@ def gdrive_sync(
         console.print(f"[bold red]Google Drive authentication failed:[/bold red] {exc}")
         raise SystemExit(1)
 
-    report = sync_gdrive_folder(service=service, folder_id=folder_id, vault_dir=vault_dir, prune=prune)
+    try:
+        report = sync_gdrive_folder(service=service, folder_id=folder_id, vault_dir=vault_dir, prune=prune)
+    except Exception as exc:
+        console.print(f"[bold red]Google Drive sync failed:[/bold red] {exc}")
+        raise SystemExit(1)
     console.print(
         f"[bold green]Drive Sync Complete:[/bold green]\n"
         f"  • Downloaded: {len(report.downloaded)}\n"
@@ -563,198 +570,201 @@ def _run_assisted_review(vault_obj) -> bool:
     merged_entities = 0
     resolved_gaps = 0
 
-    while True:
-        conflicts = collect_conflicts(vault_obj.root_path)
-        merges = collect_merge_candidates(vault_obj.root_path)
-        gaps = collect_open_gaps(vault_obj.root_path)
-        if not conflicts and not merges and not gaps:
-            break
+    try:
+        while True:
+            conflicts = collect_conflicts(vault_obj.root_path)
+            merges = collect_merge_candidates(vault_obj.root_path)
+            gaps = collect_open_gaps(vault_obj.root_path)
+            if not conflicts and not merges and not gaps:
+                break
 
-        console.print(
-            f"\n[bold cyan]Assisted Curation Menu:[/bold cyan]\n"
-            f"  [1] Conflicts ({len(conflicts)} pending)\n"
-            f"  [2] Entity Merges ({len(merges)} candidate pairs)\n"
-            f"  [3] Knowledge Gaps ({len(gaps)} open)\n"
-            f"  [q] Quit & save"
-        )
-        section = click.prompt(
-            "Section [1/2/3/q=quit]",
-            default="1" if conflicts else ("2" if merges else "3"),
-            show_default=False,
-        ).strip().lower()
+            console.print(
+                f"\n[bold cyan]Assisted Curation Menu:[/bold cyan]\n"
+                f"  [1] Conflicts ({len(conflicts)} pending)\n"
+                f"  [2] Entity Merges ({len(merges)} candidate pairs)\n"
+                f"  [3] Knowledge Gaps ({len(gaps)} open)\n"
+                f"  [q] Quit & save"
+            )
+            section = click.prompt(
+                "Section [1/2/3/q=quit]",
+                default="1" if conflicts else ("2" if merges else "3"),
+                show_default=False,
+            ).strip().lower()
 
-        if section == "q":
-            break
+            if section == "q":
+                break
 
-        back_to_menu = False
-        quit_requested = False
+            back_to_menu = False
+            quit_requested = False
 
-        if section == "1":
-            if not conflicts:
-                console.print("[green]No unresolved conflicts.[/green]")
-                continue
-            console.print(f"\n[bold cyan]Conflict Review ({len(conflicts)} pending):[/bold cyan]")
-            for idx, item in enumerate(conflicts, 1):
-                console.print(
-                    f"\n[bold][{idx}/{len(conflicts)}] {item['entity']} — {item['field']}[/bold] "
-                    f"[dim]({item['rel_path']})[/dim]"
-                )
-                opts = item["options"]
-                for opt_idx, opt in enumerate(opts, 1):
-                    tag = " [dim](current canonical)[/dim]" if opt.get("is_canonical") == "true" else ""
-                    console.print(f"  [{opt_idx}] {opt['value']} [dim](Source: {opt['source']})[/dim]{tag}")
-                console.print("  [a] Keep all (multi-value)   [c] Custom value   [d] Dismiss   [s] Skip   [m] Menu   [q] Quit & save", markup=False)
+            if section == "1":
+                if not conflicts:
+                    console.print("[green]No unresolved conflicts.[/green]")
+                    continue
+                console.print(f"\n[bold cyan]Conflict Review ({len(conflicts)} pending):[/bold cyan]")
+                for idx, item in enumerate(conflicts, 1):
+                    console.print(
+                        f"\n[bold][{idx}/{len(conflicts)}] {item['entity']} — {item['field']}[/bold] "
+                        f"[dim]({item['rel_path']})[/dim]"
+                    )
+                    opts = item["options"]
+                    for opt_idx, opt in enumerate(opts, 1):
+                        tag = " [dim](current canonical)[/dim]" if opt.get("is_canonical") == "true" else ""
+                        console.print(f"  [{opt_idx}] {opt['value']} [dim](Source: {opt['source']})[/dim]{tag}")
+                    console.print("  [a] Keep all (multi-value)   [c] Custom value   [d] Dismiss   [s] Skip   [m] Menu   [q] Quit & save", markup=False)
 
-                opt_range = f"1-{len(opts)}" if len(opts) > 1 else "1"
-                while True:
-                    choice = click.prompt(
-                        f"Choice [{opt_range}/a=keep-all/c=custom/d=dismiss/s=skip/m=menu/q=quit]",
-                        default="s",
-                        show_default=False,
-                    ).strip().lower()
-                    if choice == "q":
-                        quit_requested = True
-                        break
-                    if choice == "m":
-                        back_to_menu = True
-                        break
-                    if choice == "s":
-                        break
-                    if choice == "a":
-                        apply_keep_all_resolution(vault_obj.root_path, item)
-                        resolved_conflicts += 1
-                        modified = True
-                        break
-                    if choice == "d":
-                        apply_conflict_resolution(vault_obj.root_path, item, opts[0]["value"], opts[0]["source"])
-                        resolved_conflicts += 1
-                        modified = True
-                        break
-                    if choice == "c":
-                        custom_val = click.prompt("Enter canonical value").strip()
-                        if custom_val:
-                            apply_conflict_resolution(vault_obj.root_path, item, custom_val, "Human Verified")
+                    opt_range = f"1-{len(opts)}" if len(opts) > 1 else "1"
+                    while True:
+                        choice = click.prompt(
+                            f"Choice [{opt_range}/a=keep-all/c=custom/d=dismiss/s=skip/m=menu/q=quit]",
+                            default="s",
+                            show_default=False,
+                        ).strip().lower()
+                        if choice == "q":
+                            quit_requested = True
+                            break
+                        if choice == "m":
+                            back_to_menu = True
+                            break
+                        if choice == "s":
+                            break
+                        if choice == "a":
+                            apply_keep_all_resolution(vault_obj.root_path, item)
                             resolved_conflicts += 1
                             modified = True
-                        break
-                    if choice.isdigit() and 1 <= int(choice) <= len(opts):
-                        picked = opts[int(choice) - 1]
-                        apply_conflict_resolution(vault_obj.root_path, item, picked["value"], picked["source"])
-                        resolved_conflicts += 1
-                        modified = True
-                        break
-                    console.print("[yellow]Invalid choice. Enter option number, a, c, d, s, m, or q.[/yellow]")
+                            break
+                        if choice == "d":
+                            apply_conflict_resolution(vault_obj.root_path, item, opts[0]["value"], opts[0]["source"])
+                            resolved_conflicts += 1
+                            modified = True
+                            break
+                        if choice == "c":
+                            custom_val = click.prompt("Enter canonical value").strip()
+                            if custom_val:
+                                apply_conflict_resolution(vault_obj.root_path, item, custom_val, "Human Verified")
+                                resolved_conflicts += 1
+                                modified = True
+                            break
+                        if choice.isdigit() and 1 <= int(choice) <= len(opts):
+                            picked = opts[int(choice) - 1]
+                            apply_conflict_resolution(vault_obj.root_path, item, picked["value"], picked["source"])
+                            resolved_conflicts += 1
+                            modified = True
+                            break
+                        console.print("[yellow]Invalid choice. Enter option number, a, c, d, s, m, or q.[/yellow]")
 
-                if quit_requested or back_to_menu:
-                    break
+                    if quit_requested or back_to_menu:
+                        break
 
-        elif section == "2":
-            if not merges:
-                console.print("[green]No duplicate entity candidates.[/green]")
-                continue
-            console.print(f"\n[bold cyan]Entity Merge Review ({len(merges)} candidate pairs):[/bold cyan]")
-            for idx, cand in enumerate(merges, 1):
-                a, b = cand["a"], cand["b"]
-                if not a["path"].is_file() or not b["path"].is_file():
+            elif section == "2":
+                if not merges:
+                    console.print("[green]No duplicate entity candidates.[/green]")
                     continue
-                console.print(
-                    f"\n[bold][{idx}/{len(merges)}] {a['display']}  ↔  {b['display']}[/bold] "
-                    f"[dim]({cand['reason']})[/dim]"
-                )
-                console.print(f"  [1] Merge & name it '{a['display']}' ({len(a['facts'])} facts)")
-                for fld, (val, _) in list(a["facts"].items())[:4]:
-                    console.print(f"      • {fld}: {val}")
-                console.print(f"  [2] Merge & name it '{b['display']}' ({len(b['facts'])} facts)")
-                for fld, (val, _) in list(b["facts"].items())[:4]:
-                    console.print(f"      • {fld}: {val}")
-                console.print("  [c] Custom name   [n] Not same   [s] Skip   [m] Menu   [q] Quit & save", markup=False)
+                console.print(f"\n[bold cyan]Entity Merge Review ({len(merges)} candidate pairs):[/bold cyan]")
+                for idx, cand in enumerate(merges, 1):
+                    a, b = cand["a"], cand["b"]
+                    if not a["path"].is_file() or not b["path"].is_file():
+                        continue
+                    console.print(
+                        f"\n[bold][{idx}/{len(merges)}] {a['display']}  ↔  {b['display']}[/bold] "
+                        f"[dim]({cand['reason']})[/dim]"
+                    )
+                    console.print(f"  [1] Merge & name it '{a['display']}' ({len(a['facts'])} facts)")
+                    for fld, (val, _) in list(a["facts"].items())[:4]:
+                        console.print(f"      • {fld}: {val}")
+                    console.print(f"  [2] Merge & name it '{b['display']}' ({len(b['facts'])} facts)")
+                    for fld, (val, _) in list(b["facts"].items())[:4]:
+                        console.print(f"      • {fld}: {val}")
+                    console.print("  [c] Custom name   [n] Not same   [s] Skip   [m] Menu   [q] Quit & save", markup=False)
 
-                while True:
-                    choice = click.prompt(
-                        "Choice [1/2/c=custom/n=not-same/s=skip/m=menu/q=quit]",
-                        default="s",
-                        show_default=False,
-                    ).strip().lower()
-                    if choice == "q":
-                        quit_requested = True
-                        break
-                    if choice == "m":
-                        back_to_menu = True
-                        break
-                    if choice == "s":
-                        break
-                    if choice == "n":
-                        record_not_merge(vault_obj.root_path, a["rel_path"], b["rel_path"])
-                        break
-                    if choice == "1":
-                        apply_entity_merge(vault_obj.root_path, cand, a["display"])
-                        merged_entities += 1
-                        modified = True
-                        break
-                    if choice == "2":
-                        apply_entity_merge(vault_obj.root_path, cand, b["display"])
-                        merged_entities += 1
-                        modified = True
-                        break
-                    if choice == "c":
-                        custom_name = click.prompt("Enter canonical entity name").strip()
-                        if custom_name:
-                            apply_entity_merge(vault_obj.root_path, cand, custom_name)
+                    while True:
+                        choice = click.prompt(
+                            "Choice [1/2/c=custom/n=not-same/s=skip/m=menu/q=quit]",
+                            default="s",
+                            show_default=False,
+                        ).strip().lower()
+                        if choice == "q":
+                            quit_requested = True
+                            break
+                        if choice == "m":
+                            back_to_menu = True
+                            break
+                        if choice == "s":
+                            break
+                        if choice == "n":
+                            record_not_merge(vault_obj.root_path, a["rel_path"], b["rel_path"])
+                            break
+                        if choice == "1":
+                            apply_entity_merge(vault_obj.root_path, cand, a["display"])
                             merged_entities += 1
                             modified = True
-                        break
-                    console.print("[yellow]Invalid choice. Enter 1, 2, c, n, s, m, or q.[/yellow]")
-
-                if quit_requested or back_to_menu:
-                    break
-
-        elif section == "3":
-            if not gaps:
-                console.print("[green]No open knowledge gaps.[/green]")
-                continue
-            console.print(f"\n[bold cyan]Open Knowledge Gaps ({len(gaps)} remaining):[/bold cyan]")
-            for idx, gap in enumerate(gaps, 1):
-                console.print(
-                    f"\n[bold][{idx}/{len(gaps)}] {gap.get('query', gap['id'])}[/bold] "
-                    f"[dim](asked {gap.get('ask_count', 1)}x)[/dim]"
-                )
-                console.print("  [a] Enter answer   [d] Dismiss gap   [s] Skip   [m] Menu   [q] Quit & save", markup=False)
-
-                while True:
-                    choice = click.prompt(
-                        "Choice [a=answer/d=dismiss/s=skip/m=menu/q=quit]",
-                        default="s",
-                        show_default=False,
-                    ).strip().lower()
-                    if choice == "q":
-                        quit_requested = True
-                        break
-                    if choice == "m":
-                        back_to_menu = True
-                        break
-                    if choice == "s":
-                        break
-                    if choice == "d":
-                        resolve_gap(vault_obj.root_path, gap["id"], answer=None)
-                        resolved_gaps += 1
-                        break
-                    if choice == "a":
-                        ans = click.prompt("Verified answer").strip()
-                        if ans:
-                            if resolve_gap(vault_obj.root_path, gap["id"], answer=ans):
+                            break
+                        if choice == "2":
+                            apply_entity_merge(vault_obj.root_path, cand, b["display"])
+                            merged_entities += 1
+                            modified = True
+                            break
+                        if choice == "c":
+                            custom_name = click.prompt("Enter canonical entity name").strip()
+                            if custom_name:
+                                apply_entity_merge(vault_obj.root_path, cand, custom_name)
+                                merged_entities += 1
                                 modified = True
-                            resolved_gaps += 1
+                            break
+                        console.print("[yellow]Invalid choice. Enter 1, 2, c, n, s, m, or q.[/yellow]")
+
+                    if quit_requested or back_to_menu:
                         break
-                    console.print("[yellow]Invalid choice. Enter a, d, s, m, or q.[/yellow]")
 
-                if quit_requested or back_to_menu:
-                    break
-        else:
-            console.print("[yellow]Invalid section. Enter 1, 2, 3, or q.[/yellow]")
-            continue
+            elif section == "3":
+                if not gaps:
+                    console.print("[green]No open knowledge gaps.[/green]")
+                    continue
+                console.print(f"\n[bold cyan]Open Knowledge Gaps ({len(gaps)} remaining):[/bold cyan]")
+                for idx, gap in enumerate(gaps, 1):
+                    console.print(
+                        f"\n[bold][{idx}/{len(gaps)}] {gap.get('query', gap['id'])}[/bold] "
+                        f"[dim](asked {gap.get('ask_count', 1)}x)[/dim]"
+                    )
+                    console.print("  [a] Enter answer   [d] Dismiss gap   [s] Skip   [m] Menu   [q] Quit & save", markup=False)
 
-        if quit_requested:
-            break
+                    while True:
+                        choice = click.prompt(
+                            "Choice [a=answer/d=dismiss/s=skip/m=menu/q=quit]",
+                            default="s",
+                            show_default=False,
+                        ).strip().lower()
+                        if choice == "q":
+                            quit_requested = True
+                            break
+                        if choice == "m":
+                            back_to_menu = True
+                            break
+                        if choice == "s":
+                            break
+                        if choice == "d":
+                            resolve_gap(vault_obj.root_path, gap["id"], answer=None)
+                            resolved_gaps += 1
+                            break
+                        if choice == "a":
+                            ans = click.prompt("Verified answer").strip()
+                            if ans:
+                                if resolve_gap(vault_obj.root_path, gap["id"], answer=ans):
+                                    modified = True
+                                resolved_gaps += 1
+                            break
+                        console.print("[yellow]Invalid choice. Enter a, d, s, m, or q.[/yellow]")
+
+                    if quit_requested or back_to_menu:
+                        break
+            else:
+                console.print("[yellow]Invalid section. Enter 1, 2, 3, or q.[/yellow]")
+                continue
+
+            if quit_requested:
+                break
+    except click.Abort:
+        console.print("\n[yellow]Review interrupted — saving completed decisions.[/yellow]")
 
     rem_conflicts = len(collect_conflicts(vault_obj.root_path))
     rem_merges = len(collect_merge_candidates(vault_obj.root_path))

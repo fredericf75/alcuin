@@ -42,6 +42,9 @@ def test_scanned_image_only_pdf_recovers_text_via_primary_ocr(tmp_path):
 
 
 def test_scanned_image_only_pdf_falls_back_to_rapidocr_when_no_tesseract(tmp_path, monkeypatch):
+    import pytest
+
+    pytest.importorskip("rapidocr_onnxruntime")
     import alcuin.chunker.chunker as chunker_mod
 
     monkeypatch.setattr(chunker_mod, "find_tesseract_binary", lambda: None)

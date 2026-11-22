@@ -77,6 +77,7 @@ def test_context_governor_budget_calculation(mock_vault):
 
 def test_context_governor_token_cap_and_telemetry(mock_vault):
     mock_vault.config.context_governor_max_tokens = 500  # Tight budget for testing
+    mock_vault.config.reranker_enabled = False  # Synthetic AAA/BBB/CCC chunks test cosine governor math directly
     agent = ResearchAgent(vault=mock_vault)
 
     state = {
@@ -153,6 +154,8 @@ def test_context_governor_token_cap_and_telemetry(mock_vault):
 def test_intra_document_sibling_traversal(mock_vault):
     mock_vault.config.context_governor_max_tokens = 5000
     mock_vault.config.sibling_traversal = True
+    mock_vault.config.reranker_enabled = False
+    mock_vault.config.sibling_pruning_threshold = 0.45
     agent = ResearchAgent(vault=mock_vault)
 
     state = {

@@ -351,8 +351,18 @@ class LLMClient:
                             if return_metadata:
                                 return clean_text, meta
                             return clean_text
+                    else:
+                        logger.warning(
+                            "Google AI Studio returned HTTP %s: %s",
+                            resp.status_code,
+                            resp.text[:200],
+                        )
+                        if resp.status_code in (400, 401, 403, 429):
+                            if return_metadata:
+                                return "", {"truncated": False, "finish_reason": f"http_{resp.status_code}", "provider": "google", "thinking": ""}
+                            return ""
             except Exception as exc:
-                logger.debug("Google AI Studio request failed: %s", exc)
+                logger.warning("Google AI Studio request failed: %s", exc)
 
         is_openai_explicit = (
             self.endpoint.rstrip("/").endswith("/v1")
@@ -418,10 +428,13 @@ class LLMClient:
                         if "model" in err_msg.lower() and "not found" in err_msg.lower():
                             avail = self.get_available_models()
                             raise ModelNotFoundError(self.model, self.endpoint, avail)
+                        logger.warning("Ollama /api/chat returned HTTP 404: %s", resp.text[:200])
+                    else:
+                        logger.warning("Ollama /api/chat returned HTTP %s: %s", resp.status_code, resp.text[:200])
             except ModelNotFoundError:
                 raise
             except Exception as exc:
-                logger.debug("Ollama endpoint request failed: %s", exc)
+                logger.warning("Ollama endpoint request failed: %s", exc)
 
         # 3. OpenAI-compatible /v1/chat/completions (hosted or local)
         headers = {}
@@ -487,16 +500,28 @@ class LLMClient:
                     if "model" in err_msg.lower() or "not found" in err_msg.lower():
                         avail = self.get_available_models()
                         raise ModelNotFoundError(self.model, self.endpoint, avail)
+                    logger.warning("OpenAI-compatible endpoint returned HTTP 404: %s", resp.text[:200])
+                else:
+                    logger.warning(
+                        "OpenAI-compatible endpoint (%s) returned HTTP %s: %s",
+                        target_url,
+                        resp.status_code,
+                        resp.text[:200],
+                    )
+                    if resp.status_code in (400, 401, 403, 429):
+                        if return_metadata:
+                            return "", {"truncated": False, "finish_reason": f"http_{resp.status_code}", "provider": "openai", "thinking": ""}
+                        return ""
         except ModelNotFoundError:
             raise
         except Exception as exc:
-            logger.debug("OpenAI-compatible endpoint request failed: %s", exc)
+            logger.warning("OpenAI-compatible endpoint request failed: %s", exc)
 
         # 4. Fallback to Ollama if not already tried
         if not is_local:
             try:
                 with httpx.Client(timeout=self.timeout) as client:
-                    ollama_options: Dict[str, Any] = {"temperature": self.temperature}
+                    ollama_options: Dict[str, Any] = {"temperature": eff_temp}
                     if self.context_window:
                         ollama_options["num_ctx"] = int(self.context_window)
                     fallback_body: Dict[str, Any] = {
@@ -561,37 +586,37 @@ class _RemoteCrossEncoder:
         self.model_name = model_name
 
     def predict(self, pairs: List[Tuple[str, str]]) -> List[float]:
-        import requests
         if not pairs:
             return []
         query = pairs[0][0]
         docs = [p[1] for p in pairs]
-        resp = requests.post(
-            self.rerank_url,
-            json={"model": self.model_name, "query": query, "documents": docs},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return [float(s) for s in resp.json()["scores"]]
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(
+                self.rerank_url,
+                json={"model": self.model_name, "query": query, "documents": docs},
+            )
+            resp.raise_for_status()
+            return [float(s) for s in resp.json()["scores"]]
 
 
 def _try_init_remote_reranker(endpoint: Optional[str], model_name: str) -> Optional[_RemoteCrossEncoder]:
     """Return a _RemoteCrossEncoder if the configured LLM server exposes /v1/rerank."""
     if not endpoint:
         return None
-    import requests
     base = endpoint.rstrip("/")
+    if base.endswith("/chat/completions"):
+        base = base[: -len("/chat/completions")]
     rerank_url = f"{base}/rerank" if base.endswith("/v1") else f"{base}/v1/rerank"
     try:
-        resp = requests.post(
-            rerank_url,
-            json={"model": model_name, "query": "ping", "documents": ["ping"]},
-            timeout=5.0,
-        )
-        if resp.status_code == 200 and "scores" in resp.json():
-            return _RemoteCrossEncoder(rerank_url, model_name)
-    except Exception:
-        pass
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.post(
+                rerank_url,
+                json={"model": model_name, "query": "ping", "documents": ["ping"]},
+            )
+            if resp.status_code == 200 and "scores" in resp.json():
+                return _RemoteCrossEncoder(rerank_url, model_name)
+    except Exception as exc:
+        logger.debug("Remote reranker probe at %s unavailable: %s", rerank_url, exc)
     return None
 
 
@@ -620,7 +645,7 @@ class ResearchAgent:
         self.cross_encoder = None
         if getattr(vault.config, "reranker_enabled", True):
             m_name = getattr(vault.config, "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-            remote_ce = _try_init_remote_reranker(getattr(vault.config, "model_endpoint", None), m_name)
+            remote_ce = _try_init_remote_reranker(self.llm.endpoint, m_name)
             if remote_ce is not None:
                 self.cross_encoder = remote_ce
             else:
@@ -777,6 +802,11 @@ class ResearchAgent:
         if not getattr(self.vault.config, "adaptive_fast_path_semantic", True):
             return False
 
+        threshold = float(getattr(self.vault.config, "fast_path_embedding_threshold", 0.0))
+        cache_key = (question, threshold)
+        if getattr(self, "_last_semantic_composite", None) is not None and self._last_semantic_composite[0] == cache_key:
+            return self._last_semantic_composite[1]
+
         centroids = self._get_intent_centroids()
         if centroids is None:
             return False
@@ -790,8 +820,9 @@ class ResearchAgent:
             q_vec /= q_norm
             atom_centroid, comp_centroid = centroids
             margin = float(np.dot(q_vec, comp_centroid) - np.dot(q_vec, atom_centroid))
-            threshold = float(getattr(self.vault.config, "fast_path_embedding_threshold", 0.0))
-            return margin > threshold
+            res = margin > threshold
+            self._last_semantic_composite = (cache_key, res)
+            return res
         except Exception as exc:
             logger.debug(f"[SPEC-038] Semantic intent evaluation failed, falling back to syntactic routing: {exc}")
             return False
@@ -1158,17 +1189,6 @@ class ResearchAgent:
 
         return not bool(scoped_numbers)
 
-        m = re.search(r"10A\s+NCAC\s+\d+[A-Z]\s*\.?\d+", breadcrumbs, re.IGNORECASE)
-        if m:
-            return re.sub(r"\s+", " ", m.group(0)).strip().upper()
-        m = re.search(r"Sec(?:tion|\.)?\s*\d+[\-\.]\d+", breadcrumbs, re.IGNORECASE)
-        if m:
-            return re.sub(r"\s+", " ", m.group(0)).strip()
-        m = re.search(r"(?:Article|Section)\s+\d+(?:\.\d+)?", breadcrumbs, re.IGNORECASE)
-        if m:
-            return re.sub(r"\s+", " ", m.group(0)).strip()
-        return ""
-
     def score_candidate_links(
         self,
         query: str,
@@ -1254,11 +1274,22 @@ class ResearchAgent:
 
         return selected, deferred
 
+    @staticmethod
+    def _unit_relevance(score: float, is_logit: bool) -> float:
+        """Map CrossEncoder raw logits onto (0, 1) via sigmoid for apples-to-apples comparison with [0, 1] cosine gates."""
+        if not is_logit:
+            return score
+        if score >= 0:
+            return 1.0 / (1.0 + math.exp(-score))
+        exp_x = math.exp(score)
+        return exp_x / (1.0 + exp_x)
+
     def _expand_ast_siblings(
         self,
         primary_hits: List[SearchResult],
         query: str,
         visited_ids: Set[str],
+        scores_are_logits: bool = False,
     ) -> Tuple[List[SearchResult], Dict[str, float]]:
         """Expand AST siblings for high-scoring primary hits within their document subtree."""
         sibling_candidates: List[SearchResult] = []
@@ -1289,8 +1320,8 @@ class ResearchAgent:
             if (p.file_path or "").lower().endswith(".pdf") and not sec_crumbs and p_idx > 0:
                 flat_pdf_anchors.append((p.file_path, p_idx))
 
-            # Expand siblings for primary hits with strong semantic relevance (Anchor Threshold >= 0.70)
-            if p.score >= 0.70 and crumbs:
+            # Expand siblings for primary hits with strong semantic relevance (Anchor Threshold >= 0.70 on [0, 1] scale)
+            if self._unit_relevance(p.score, scores_are_logits) >= 0.70 and crumbs:
                 parent_heading = sec_crumbs[0] if sec_crumbs else crumbs[-1]
                 key = (p.file_path, parent_heading)
                 primary_indices_by_heading.setdefault(key, []).append(p_idx)
@@ -1453,18 +1484,22 @@ class ResearchAgent:
         all_sibling_candidates: List[SearchResult] = []
         all_sibling_scores: Dict[str, float] = {}
 
+        ce_scored_ids: Set[str] = set()
         for target_query in search_targets:
             if target_query in visited_queries:
                 continue
             visited_queries.append(target_query)
             search_depth = getattr(self.vault.config, "retrieval_candidates", 20)
             raw_results = self.storage.search(target_query, top_k=search_depth)
+            used_ce = False
             if self.cross_encoder is not None and raw_results:
                 try:
                     pairs = [(target_query, f"{r.section_title or ''} {r.content}") for r in raw_results]
                     ce_scores = self.cross_encoder.predict(pairs)
                     for r, sc in zip(raw_results, ce_scores):
                         r.score = float(sc)
+                        ce_scored_ids.add(r.id)
+                    used_ce = True
                     sorted_results = sorted(raw_results, key=lambda x: x.score, reverse=True)
                     elasticity_enabled = getattr(self.vault.config, "retrieval_elasticity", DEFAULT_RETRIEVAL_ELASTICITY)
                     sub_k = getattr(self.vault.config, "subquery_top_k", DEFAULT_SUBQUERY_TOP_K)
@@ -1476,7 +1511,7 @@ class ResearchAgent:
                         tau_floor = getattr(self.vault.config, "elasticity_elbow_floor", DEFAULT_ELASTICITY_ELBOW_FLOOR)
                         tau_delta = getattr(self.vault.config, "elasticity_elbow_delta", DEFAULT_ELASTICITY_ELBOW_DELTA)
 
-                        qualified, remainder = self._select_diverse_k_min(sorted_results, k_min)
+                        qualified, remainder = self._select_diverse_k_min(sorted_results, min(k_min, sub_k))
                         if remainder:
                             top1_sc = sorted_results[0].score
                             for cand in remainder[:max(0, sub_k - len(qualified))]:
@@ -1496,6 +1531,7 @@ class ResearchAgent:
                 qualified,
                 query=target_query,
                 visited_ids=visited_ids | {r.id for r in qualified},
+                scores_are_logits=used_ce,
             )
             all_sibling_candidates.extend(scoped_siblings)
             all_sibling_scores.update(scoped_sib_scores)
@@ -1508,20 +1544,24 @@ class ResearchAgent:
                 reverse=True
             )
 
-            def _get_major_sec(bc_val: Optional[str], fp_val: str) -> str:
+            def _get_major_sec(bc_val: Optional[str], fp_val: str, chunk_id: str) -> str:
                 bc_str = bc_val or ""
-                m_sec = re.search(r'(?:Sec\.|Section|§|\.)\s*(\d+\.\d+)', bc_str)
+                m_sec = re.search(r'(?:Sec\.|Section|§)\s*(\d+[\.\-]\d+)', bc_str)
                 if m_sec:
                     return f"{fp_val}#{m_sec.group(1)}"
-                m_art = re.search(r'(?:Article|Subchapter|\.)\s*([A-Za-z0-9]+)', bc_str)
+                m_art = re.search(r'(?:Article|Subchapter)\s+([A-Za-z0-9]+)', bc_str)
                 if m_art:
                     return f"{fp_val}#{m_art.group(1)}"
+                # Flat/unheaded documents (e.g., scanned PDFs per SPEC-043) are exempt from
+                # the 2-chunk statutory section quota so ±1 adjacent chunks are preserved.
+                if " > " not in bc_str:
+                    return chunk_id
                 return fp_val
 
             sec_quota_counts: Dict[str, int] = {}
             cluster_hits: List[SearchResult] = []
             for r in sorted_cands:
-                sec_k = _get_major_sec(r.breadcrumbs, r.file_path)
+                sec_k = _get_major_sec(r.breadcrumbs, r.file_path, r.id)
                 cnt = sec_quota_counts.get(sec_k, 0)
                 if cnt < 2:
                     sec_quota_counts[sec_k] = cnt + 1
@@ -1592,14 +1632,25 @@ class ResearchAgent:
         # 1. Pack primary chunks (Fair-share round-robin ordered across sub-goals)
         for r in current_turn_primary:
             tok = int(len(r.content) / 4)
+            r_is_logit = r.id in ce_scored_ids
+            r_unit_rel = self._unit_relevance(r.score, r_is_logit)
 
             # Quality-preserving displacement: If budget is full, allow high-scoring incoming
             # chunks to displace significantly lower-scoring tail chunks from earlier turns
-            if current_tokens + tok > budget_tokens and evidence_list and r.score >= 0.60:
-                min_idx = min(range(len(evidence_list)), key=lambda i: evidence_list[i].get("score", 0.0))
-                min_score = evidence_list[min_idx].get("score", 0.0)
+            if current_tokens + tok > budget_tokens and evidence_list and r_unit_rel >= 0.60:
+                min_idx = min(
+                    range(len(evidence_list)),
+                    key=lambda i: self._unit_relevance(
+                        evidence_list[i].get("score", 0.0),
+                        bool(evidence_list[i].get("score_is_logit", False)),
+                    ),
+                )
+                min_unit_rel = self._unit_relevance(
+                    evidence_list[min_idx].get("score", 0.0),
+                    bool(evidence_list[min_idx].get("score_is_logit", False)),
+                )
                 min_tok = int(len(evidence_list[min_idx]["content"]) / 4)
-                if r.score >= min_score + 0.15 and (current_tokens - min_tok + tok) <= budget_tokens:
+                if r_unit_rel >= min_unit_rel + 0.15 and (current_tokens - min_tok + tok) <= budget_tokens:
                     evidence_list.pop(min_idx)
                     current_tokens -= min_tok
 
@@ -1611,15 +1662,18 @@ class ResearchAgent:
                     {
                         "id": r.id,
                         "file_path": r.file_path,
+                        "document_title": r.document_title,
+                        "section_title": r.section_title,
                         "breadcrumbs": r.breadcrumbs,
                         "content": r.content,
                         "wikilinks": r.wikilinks,
                         "score": r.score,
+                        "score_is_logit": r_is_logit,
                     }
                 )
                 current_tokens += tok
             else:
-                if r.score >= 0.50:
+                if r_unit_rel >= 0.50:
                     pruned_high_rel.append(
                         {
                             "id": r.id,
@@ -1778,7 +1832,6 @@ class ResearchAgent:
         # Check if there are still unvisited sub-goals or pending links
         unvisited_goals = [g for g in sub_goals if g not in visited_queries]
         sub_questions = state.get("sub_questions", [])
-        sub_goals = state.get("sub_goals", [])
 
         # Ask LLM if evidence is sufficient (dynamic budget based on endpoint)
         is_local = "localhost" in self.llm.endpoint or "127.0.0.1" in self.llm.endpoint
@@ -1837,7 +1890,8 @@ class ResearchAgent:
                 if match:
                     parsed = json.loads(match.group(0))
                     thought = parsed.get("thought", thought)
-                    confidence = float(parsed.get("confidence", 0.5))
+                    raw_conf = parsed.get("confidence", 0.5)
+                    confidence = float(raw_conf) if raw_conf is not None else 0.5
 
                     raw_coverage = parsed.get("coverage", [])
                     if isinstance(raw_coverage, list) and raw_coverage and sub_questions and len(sub_questions) >= 2:
@@ -1846,7 +1900,10 @@ class ResearchAgent:
                         for item in raw_coverage:
                             if not isinstance(item, dict):
                                 continue
-                            item_id = item.get("id", 0)
+                            try:
+                                item_id = int(item.get("id", 0))
+                            except (TypeError, ValueError):
+                                continue
                             if not (1 <= item_id <= len(sub_questions)):
                                 continue
                             q_text = sub_questions[item_id - 1]
@@ -1885,8 +1942,8 @@ class ResearchAgent:
                                 next_query = ""
                             else:
                                 next_query = raw_nq
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to parse evaluation JSON response: %s", exc)
 
         # If LLM said sufficient but primary decomposed sub-goals remain unsearched, do not stop prematurely
         # UNLESS the Context Governor has already saturated the model's budget
@@ -1968,11 +2025,9 @@ class ResearchAgent:
             try:
                 query_vecs = self.storage.embedder.get_embeddings_batch(scoring_queries)
                 chunk_ids_set = {e["id"] for e in evidence_pool}
-                try:
-                    where_clause = f"id IN {tuple(chunk_ids_set)}" if len(chunk_ids_set) > 1 else f"id = '{next(iter(chunk_ids_set))}'"
-                    rows = self.storage.table.search().where(where_clause).to_list()
-                except Exception:
-                    rows = self.storage.table.search().to_list()
+                escaped_ids = ", ".join("'" + str(cid).replace("'", "''") + "'" for cid in sorted(chunk_ids_set))
+                where_clause = f"id IN ({escaped_ids})"
+                rows = self.storage.table.search().where(where_clause).to_list()
                 vectors = {r["id"]: r["vector"] for r in rows if r["id"] in chunk_ids_set}
 
                 q_norms = [math.sqrt(sum(x * x for x in q_vec)) or 1.0 for q_vec in query_vecs]
@@ -2025,8 +2080,8 @@ class ResearchAgent:
                 thought_history.append(
                     f"[PRE_SYNTHESIS_RERANK] Fair-share re-ranked {len(state['evidence'])} -> {len(evidence_pool)} chunks ({rerank_ms:.1f}ms)"
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Pre-synthesis fair-share re-ranking failed: %s", exc)
 
         if use_subquery_synthesis:
             # Sub-query isolated synthesis partitions directly from the FULL admitted evidence pool,
@@ -2045,7 +2100,8 @@ class ResearchAgent:
             chunk_vectors = {}
             if chunk_ids_set:
                 try:
-                    where_clause = f"id IN {tuple(chunk_ids_set)}" if len(chunk_ids_set) > 1 else f"id = '{next(iter(chunk_ids_set))}'"
+                    escaped_ids = ", ".join("'" + str(cid).replace("'", "''") + "'" for cid in sorted(chunk_ids_set))
+                    where_clause = f"id IN ({escaped_ids})"
                     rows = self.storage.table.search().where(where_clause).to_list()
                     chunk_vectors = {r["id"]: r["vector"] for r in rows if r["id"] in chunk_ids_set}
                 except Exception as e:
@@ -2313,13 +2369,21 @@ class ResearchAgent:
 
         ans_lower = answer.lower()
         if (
-            "not found" in ans_lower
+            not answer.strip()
+            or "could not reach llm for synthesis" in ans_lower
+            or "not found" in ans_lower
             or "no relevant documents" in ans_lower
             or "information is not found" in ans_lower
             or "not contained in the vault" in ans_lower
             or "not contained in the provided evidence" in ans_lower
         ):
             confidence = 0.0
+            if not answer.strip():
+                top_evidence = state["evidence"][0]["content"].strip()[:400] if state["evidence"] else "No evidence."
+                answer = (
+                    "Could not reach LLM for synthesis. Relevant excerpt:\n\n"
+                    f"> {top_evidence}..."
+                )
         else:
             confidence = max(state.get("confidence", 0.5), 0.7 if state["evidence"] else 0.0)
 

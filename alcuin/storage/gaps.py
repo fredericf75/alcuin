@@ -194,7 +194,12 @@ class KnowledgeGapTracker:
 
         found = False
         for gid, gap in gaps.items():
-            if gid == target or target_norm in gap.normalized_key or gap.normalized_key in target_norm:
+            exact_match = gid == target or (bool(target_norm) and target_norm == gap.normalized_key)
+            substr_match = (
+                len(target_norm) >= 4
+                and (target_norm in gap.normalized_key or gap.normalized_key in target_norm)
+            )
+            if exact_match or substr_match:
                 gap.status = "resolved"
                 gap.resolved_at = now_str
                 found = True

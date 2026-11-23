@@ -1997,6 +1997,18 @@ class ResearchAgent:
         except Exception:
             pass
 
+    @staticmethod
+    def _find_unaddressed_sub_questions(answer: str, total_questions: int) -> List[int]:
+        """Return 1-based sub-question indices missing numbered markers in `answer`."""
+        if total_questions < 2 or not answer:
+            return []
+        unaddressed: List[int] = []
+        for i in range(total_questions):
+            q_num = i + 1
+            if not re.search(rf"(?:^|\n)\s*(?:[#*]*\s*)?(?:Question\s*)?{q_num}[\.\):]", answer):
+                unaddressed.append(q_num)
+        return unaddressed
+
     def _synthesize_node(self, state: AgentState) -> Dict[str, Any]:
         if not state["evidence"]:
             answer = "No relevant documents or evidence found in vault."
@@ -2348,16 +2360,61 @@ class ResearchAgent:
                     "Could not reach LLM for synthesis. Relevant excerpt:\n\n"
                     f"> {top_evidence}..."
                 )
-
+            elif (
+                getattr(self.vault.config, "output_governor_continuation", True)
+                and sub_questions
+                and len(sub_questions) >= 2
+                and not meta.get("truncated")
+            ):
+                # SPEC-045 Option B: recover multi-question clips or skipped middle items
+                # without firing on lone trailing formatting quirks ([N] of N).
+                initial_missing = self._find_unaddressed_sub_questions(answer, len(sub_questions))
+                if initial_missing and (
+                    len(initial_missing) >= 2 or min(initial_missing) < len(sub_questions)
+                ):
+                    answered_nums = [
+                        q_num for q_num in range(1, len(sub_questions) + 1) if q_num not in initial_missing
+                    ]
+                    missing_text = "\n".join(f"{idx}. {sub_questions[idx - 1]}" for idx in initial_missing)
+                    cont_prompt = (
+                        f"Questions already answered: {answered_nums}. "
+                        "Do not repeat earlier answers; answer ONLY the remaining numbered questions below.\n\n"
+                        f"Remaining Target Questions:\n{missing_text}\n\n"
+                        f"Evidence:\n{evidence_text}\n\n"
+                        "Instructions: Answer each Remaining Target Question individually in numbered order:\n"
+                    )
+                    try:
+                        cont_res = self.llm.chat(sys_prompt, cont_prompt, return_metadata=True)
+                    except TypeError:
+                        cont_res = self.llm.chat(sys_prompt, cont_prompt)
+                    except Exception as exc:
+                        logger.warning("[SPEC-045] Output Governor continuation call failed: %s", exc)
+                        cont_res = ("", {})
+                    if isinstance(cont_res, tuple):
+                        cont_answer, cont_meta = cont_res
+                    else:
+                        cont_answer, cont_meta = cont_res, {}
+                    if cont_meta.get("thinking"):
+                        thought_history.append(f"[LATENT_THOUGHT_TRACE_CONTINUATION]\n{cont_meta['thinking']}")
+                    if cont_answer and cont_answer.strip():
+                        answer = f"{answer.rstrip()}\n\n{cont_answer.strip()}"
+                        thought_history.append(
+                            f"[OUTPUT GOVERNOR CONTINUATION] Recovered sub-questions {initial_missing}."
+                        )
+                    if cont_meta.get("truncated"):
+                        cont_reason = cont_meta.get("finish_reason") or "length"
+                        cont_alert = (
+                            "[GENERATION_TRUNCATION_ALERT]\n"
+                            f"Warning: Continuation generation was halted because the model reached its context token ceiling (finish_reason: {cont_reason}).\n"
+                            "The synthesized answer is incomplete.\n"
+                            "Actionable Guidance: Sizing up the model context window or increasing context headroom is empirically justified."
+                        )
+                        truncation_alert = cont_alert
+                        thought_history.append(cont_alert)
+                        answer = f"{answer}\n\n{cont_alert}"
 
         # Output Governor (SPEC-017): Clipped Output Completeness Audit
-        unaddressed_indices = []
-        if sub_questions and len(sub_questions) >= 2 and answer:
-            for i in range(len(sub_questions)):
-                q_num = i + 1
-                marker_found = bool(re.search(rf"(?:^|\n)\s*(?:[#*]*\s*)?(?:Question\s*)?{q_num}[\.\):]", answer))
-                if not marker_found:
-                    unaddressed_indices.append(q_num)
+        unaddressed_indices = self._find_unaddressed_sub_questions(answer, len(sub_questions))
 
         if unaddressed_indices:
             warning_msg = (

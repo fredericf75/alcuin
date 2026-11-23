@@ -99,6 +99,7 @@ class VaultConfig:
     pre_synthesis_rerank: bool = True
     pre_synthesis_top_k: Optional[int] = None
     subquery_synthesis: bool = False
+    output_governor_continuation: bool = True
     retrieval_elasticity: bool = DEFAULT_RETRIEVAL_ELASTICITY
     subquery_top_k_min: int = DEFAULT_SUBQUERY_TOP_K_MIN
     subquery_top_k: int = DEFAULT_SUBQUERY_TOP_K
@@ -233,6 +234,9 @@ class VaultConfig:
             subquery_synthesis=bool(
                 agent_sec.get("subquery_synthesis", g_agent.get("subquery_synthesis", False))
             ),
+            output_governor_continuation=bool(
+                agent_sec.get("output_governor_continuation", g_agent.get("output_governor_continuation", True))
+            ),
             retrieval_elasticity=bool(
                 agent_sec.get("retrieval_elasticity", g_agent.get("retrieval_elasticity", DEFAULT_RETRIEVAL_ELASTICITY))
             ),
@@ -320,6 +324,7 @@ class VaultConfig:
             f"pre_synthesis_rerank = {'true' if self.pre_synthesis_rerank else 'false'}",
             *( [f"pre_synthesis_top_k = {self.pre_synthesis_top_k}"] if self.pre_synthesis_top_k is not None else [] ),
             f"subquery_synthesis = {str(self.subquery_synthesis).lower()}",
+            f"output_governor_continuation = {str(self.output_governor_continuation).lower()}",
             f"retrieval_elasticity = {'true' if self.retrieval_elasticity else 'false'}",
             f"subquery_top_k_min = {self.subquery_top_k_min}",
             f"subquery_top_k = {self.subquery_top_k}",

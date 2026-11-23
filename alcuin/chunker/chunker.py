@@ -250,14 +250,20 @@ def fetch_url_content(url: str) -> Tuple[str, str]:
 
 
 _RAPIDOCR_ENGINE = None
+_RAPIDOCR_UNAVAILABLE = False
 
 
 def _get_rapidocr_engine():
-    """Lazily initialize a singleton RapidOCR engine."""
-    global _RAPIDOCR_ENGINE
+    """Lazily initialize a singleton RapidOCR engine (fallback when Tesseract is unavailable)."""
+    global _RAPIDOCR_ENGINE, _RAPIDOCR_UNAVAILABLE
+    if _RAPIDOCR_UNAVAILABLE:
+        raise ImportError("rapidocr_onnxruntime is not installed")
     if _RAPIDOCR_ENGINE is None:
-        from rapidocr_onnxruntime import RapidOCR
-
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError:
+            _RAPIDOCR_UNAVAILABLE = True
+            raise
         _RAPIDOCR_ENGINE = RapidOCR()
     return _RAPIDOCR_ENGINE
 
@@ -269,7 +275,6 @@ def _get_tesseract_langs(tess_exe: str) -> str:
     """Return installed Tesseract language pack string (preferring eng+fra when available)."""
     if tess_exe in _TESSERACT_LANGS_CACHE:
         return _TESSERACT_LANGS_CACHE[tess_exe]
-    import subprocess
 
     lang_arg = "eng"
     try:
@@ -281,13 +286,15 @@ def _get_tesseract_langs(tess_exe: str) -> str:
             errors="replace",
             timeout=10,
         )
-        available = {line.strip() for line in (res.stdout or "").splitlines() if line.strip()}
+        combined = "\n".join(filter(None, [res.stdout, res.stderr]))
+        available = {line.strip() for line in combined.splitlines() if line.strip()}
         chosen = [lang for lang in ("eng", "fra") if lang in available]
         if chosen:
             lang_arg = "+".join(chosen)
-    except Exception:
-        pass
-    _TESSERACT_LANGS_CACHE[tess_exe] = lang_arg
+        if res.returncode == 0:
+            _TESSERACT_LANGS_CACHE[tess_exe] = lang_arg
+    except Exception as exc:
+        print(f"  \033[93m[OCR Warn]\033[0m Could not query Tesseract languages ({exc}); defaulting to 'eng'")
     return lang_arg
 
 
@@ -355,47 +362,49 @@ def extract_pdf_content(pdf_path: Path, engine: str = "auto") -> Tuple[str, str]
 
     tess_exe = find_tesseract_binary()
 
-    doc = fitz.open(str(pdf_path))
-    doc_title = doc.metadata.get("title") if doc.metadata else ""
-    if not doc_title or len(doc_title.strip()) < 3:
-        doc_title = pdf_path.stem.replace("_", " ").replace("-", " ").title()
-
     pages_text = []
-    scanned_pages = []
+    rapidocr_warned = False
 
-    for page_idx in range(len(doc)):
-        page = doc[page_idx]
-        raw_text = page.get_text("text").strip()
+    with fitz.open(str(pdf_path)) as doc:
+        doc_title = doc.metadata.get("title") if doc.metadata else ""
+        if not doc_title or len(doc_title.strip()) < 3:
+            doc_title = pdf_path.stem.replace("_", " ").replace("-", " ").title()
 
-        # Detect scanned page (less than 50 chars of selectable text with images/drawings)
-        if len(raw_text) < 50 and (len(page.get_images()) > 0 or len(page.get_drawings()) > 0):
-            scanned_pages.append(page_idx + 1)
-            ocr_text = ""
-            if tess_exe:
-                try:
-                    ocr_text = _ocr_page_with_tesseract(page, tess_exe)
-                except Exception as e:
-                    print(f"  \033[91m[OCR Error]\033[0m Page {page_idx + 1}: {e}")
-            if not ocr_text:
-                try:
-                    ocr_text = _ocr_page_with_rapidocr(page)
-                except Exception as e:
-                    print(f"  \033[91m[RapidOCR Error]\033[0m Page {page_idx + 1}: {e}")
-            if ocr_text:
-                print(f"  \033[92m[OCR]\033[0m Page {page_idx + 1}: Scanned image recognized ({len(ocr_text):,} characters)")
-                pages_text.append(ocr_text)
-            else:
-                print(f"  \033[90m[OCR]\033[0m Page {page_idx + 1}: No text detected via OCR")
-            continue
+        for page_idx in range(len(doc)):
+            page = doc[page_idx]
+            raw_text = page.get_text("text").strip()
 
-        # Native coordinate-aware layout & table extraction (handles borderless tables + 2-column prose)
-        assembled_page = _extract_pdf_page_layout(page)
-        if assembled_page.strip():
-            pages_text.append(assembled_page.strip())
-        elif raw_text:
-            pages_text.append(raw_text)
+            # Detect scanned page (less than 50 chars of selectable text with images/drawings)
+            if len(raw_text) < 50 and (len(page.get_images()) > 0 or len(page.get_drawings()) > 0):
+                ocr_text = ""
+                if tess_exe:
+                    try:
+                        ocr_text = _ocr_page_with_tesseract(page, tess_exe)
+                    except Exception as e:
+                        print(f"  \033[91m[OCR Error]\033[0m Page {page_idx + 1}: {e}")
+                if not ocr_text and not _RAPIDOCR_UNAVAILABLE:
+                    try:
+                        ocr_text = _ocr_page_with_rapidocr(page)
+                    except Exception as e:
+                        if not rapidocr_warned:
+                            print(f"  \033[91m[RapidOCR Error]\033[0m Page {page_idx + 1}: {e}")
+                            rapidocr_warned = True
+                if ocr_text:
+                    print(f"  \033[92m[OCR]\033[0m Page {page_idx + 1}: Scanned image recognized ({len(ocr_text):,} characters)")
+                    pages_text.append(ocr_text)
+                elif raw_text:
+                    pages_text.append(raw_text)
+                else:
+                    print(f"  \033[90m[OCR]\033[0m Page {page_idx + 1}: No text detected via OCR")
+                continue
 
-    doc.close()
+            # Native coordinate-aware layout & table extraction (handles borderless tables + 2-column prose)
+            assembled_page = _extract_pdf_page_layout(page)
+            if assembled_page.strip():
+                pages_text.append(assembled_page.strip())
+            elif raw_text:
+                pages_text.append(raw_text)
+
     return doc_title, "\n\n".join(pages_text)
 
 
@@ -734,6 +743,10 @@ def extract_docx_content(docx_path: Path) -> Tuple[str, str]:
     """Extract structured text and tables from Word (.docx) using python-docx."""
     try:
         import docx
+        from docx.oxml.table import CT_Tbl
+        from docx.oxml.text.paragraph import CT_P
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
     except ImportError:
         raise RuntimeError("python-docx is required for Word document extraction. Run: pip install python-docx")
 
@@ -741,30 +754,38 @@ def extract_docx_content(docx_path: Path) -> Tuple[str, str]:
     doc_title = docx_path.stem.replace("_", " ").replace("-", " ").title()
 
     lines = []
-    for p in doc.paragraphs:
-        txt = p.text.strip()
-        if not txt:
-            continue
-        style_name = p.style.name.lower() if p.style else ""
-        if "heading 1" in style_name:
-            lines.append(f"\n# {txt}\n")
-        elif "heading 2" in style_name:
-            lines.append(f"\n## {txt}\n")
-        elif "heading 3" in style_name:
-            lines.append(f"\n### {txt}\n")
-        elif "heading 4" in style_name:
-            lines.append(f"\n#### {txt}\n")
-        else:
-            lines.append(txt)
-
-    for table in doc.tables:
-        lines.append("")
-        for row_idx, row in enumerate(table.rows):
-            cells = [cell.text.strip().replace("\n", " ").replace("|", "\\|") for cell in row.cells]
-            lines.append("| " + " | ".join(cells) + " |")
-            if row_idx == 0:
-                lines.append("| " + " | ".join(["---"] * len(cells)) + " |")
-        lines.append("")
+    for child in doc.element.body.iterchildren():
+        if isinstance(child, CT_P):
+            p = Paragraph(child, doc)
+            txt = p.text.strip()
+            if not txt:
+                continue
+            style_name = p.style.name.lower() if p.style else ""
+            if "heading 1" in style_name:
+                lines.append(f"\n# {txt}\n")
+            elif "heading 2" in style_name:
+                lines.append(f"\n## {txt}\n")
+            elif "heading 3" in style_name:
+                lines.append(f"\n### {txt}\n")
+            elif "heading 4" in style_name:
+                lines.append(f"\n#### {txt}\n")
+            else:
+                lines.append(txt)
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, doc)
+            lines.append("")
+            for row_idx, row in enumerate(table.rows):
+                cells = []
+                prev_tc = None
+                for cell in row.cells:
+                    if cell._tc is prev_tc:
+                        continue
+                    prev_tc = cell._tc
+                    cells.append(cell.text.strip().replace("\n", " ").replace("|", "\\|"))
+                lines.append("| " + " | ".join(cells) + " |")
+                if row_idx == 0:
+                    lines.append("| " + " | ".join(["---"] * len(cells)) + " |")
+            lines.append("")
 
     return doc_title, "\n\n".join(lines)
 
@@ -971,6 +992,21 @@ def serialize_tabular_data_with_metadata(text: str) -> Tuple[str, List[str], int
     num_cols: int = 0
     detected_type: str = "clause"
 
+    def _split_pipe_row(row_line: str) -> List[str]:
+        s = row_line.strip()
+        if s.startswith("|"):
+            s = s[1:]
+        if s.endswith("|") and not s.endswith("\\|"):
+            s = s[:-1]
+        return [c.strip() for c in re.split(r"(?<!\\)\|", s)]
+
+    def _has_preceding_badge(out_lines: List[str], prefixes: Tuple[str, ...]) -> bool:
+        for prev in reversed(out_lines):
+            st = prev.strip()
+            if st:
+                return st.startswith(prefixes)
+        return False
+
     # Pre-check for badges if text was already serialized or sliced
     m_badge = re.search(r"> \*\*(?:Table|Schedule)(?: Context)?\*\*: \[(?:Table|Schedule): (\d+) rows? [×x] (\d+) columns?", text)
     if not m_badge:
@@ -983,7 +1019,7 @@ def serialize_tabular_data_with_metadata(text: str) -> Tuple[str, List[str], int
     if "<!-- TABLE_DATA:" in text:
         for line in text.splitlines():
             if is_pipe_table_row(line):
-                raw_h = [c.strip() for c in line.strip().strip("|").split("|")]
+                raw_h = _split_pipe_row(line)
                 headers = [h for h in raw_h if h and not set(h) <= {":", "-"}]
                 if headers:
                     detected_type = "table"
@@ -1003,21 +1039,22 @@ def serialize_tabular_data_with_metadata(text: str) -> Tuple[str, List[str], int
             # Check if Markdown Pipe Table
             if is_pipe_table_row(table_lines[0]):
                 detected_type = "table"
-                raw_headers = [c.strip() for c in table_lines[0].strip().strip("|").split("|")]
+                raw_headers = _split_pipe_row(table_lines[0])
                 headers = [c for c in raw_headers if c]
                 data_rows = []
                 for row_str in table_lines[2:]:
-                    cells = [c.strip() for c in row_str.strip().strip("|").split("|")]
+                    cells = _split_pipe_row(row_str)
                     data_rows.append(cells)
 
-                num_rows = len(data_rows)
-                num_cols = len(raw_headers)
-                dim_badge = f"> **Table**: {num_rows} rows × {num_cols} columns"
+                if not m_badge:
+                    num_rows = len(data_rows)
+                    num_cols = len(raw_headers)
+                dim_badge = f"> **Table**: {len(data_rows)} rows × {len(raw_headers)} columns"
 
                 table_data = None
                 if len(raw_headers) == 2:
                     table_data = {r[0]: (r[1] if len(r) > 1 else "") for r in data_rows if r}
-                    if not (output_lines and output_lines[-1].strip().startswith("> **Table")):
+                    if not _has_preceding_badge(output_lines, ("> **Table",)):
                         output_lines.append(dim_badge)
                     output_lines.extend(table_lines)
                     if table_data:
@@ -1030,7 +1067,7 @@ def serialize_tabular_data_with_metadata(text: str) -> Tuple[str, List[str], int
                 else:
                     # Multi-column grids (> 2 columns) remain pure, unsliced,
                     # grid-padded Markdown pipe tables without row-level card and JSON bloat.
-                    if not (output_lines and output_lines[-1].strip().startswith("> **Table")):
+                    if not _has_preceding_badge(output_lines, ("> **Table",)):
                         output_lines.append(dim_badge)
                     output_lines.extend(table_lines)
                 i = end_idx
@@ -1043,7 +1080,8 @@ def serialize_tabular_data_with_metadata(text: str) -> Tuple[str, List[str], int
                     headers = hdr_words
                 else:
                     headers = ["Offense", "Penalty"]
-                num_cols = len(headers)
+                if not m_badge:
+                    num_cols = len(headers)
                 entries: Dict[str, str] = {}
                 data_rows_count = 0
                 for row in table_lines[1:]:
@@ -1052,9 +1090,10 @@ def serialize_tabular_data_with_metadata(text: str) -> Tuple[str, List[str], int
                         entries[m.group(1).strip()] = m.group(2).strip()
                         data_rows_count += 1
 
-                num_rows = data_rows_count
+                if not m_badge:
+                    num_rows = data_rows_count
                 dim_badge = f"> **Schedule**: {data_rows_count} rows × 2 columns"
-                if not (output_lines and output_lines[-1].strip().startswith("> **Schedule") or (output_lines and output_lines[-1].strip().startswith("> **Table"))):
+                if not _has_preceding_badge(output_lines, ("> **Schedule", "> **Table")):
                     output_lines.append(dim_badge)
                 output_lines.extend(table_lines)
                 if entries:
@@ -1077,7 +1116,7 @@ def serialize_tabular_data_with_metadata(text: str) -> Tuple[str, List[str], int
     if not headers:
         for line in lines:
             if is_pipe_table_row(line):
-                raw_h = [c.strip() for c in line.strip().strip("|").split("|")]
+                raw_h = _split_pipe_row(line)
                 headers = [h for h in raw_h if h and not set(h) <= {":", "-"}]
                 if headers:
                     detected_type = "table"
@@ -1103,7 +1142,12 @@ def slice_massive_table(table_lines: List[str], max_chars: int) -> List[str]:
         header_lines = table_lines[:2]
         header_text = "\n".join(header_lines) + "\n"
         data_rows = table_lines[2:]
-        raw_headers = [c.strip() for c in header_lines[0].strip().strip("|").split("|")]
+        hdr_s = header_lines[0].strip()
+        if hdr_s.startswith("|"):
+            hdr_s = hdr_s[1:]
+        if hdr_s.endswith("|") and not hdr_s.endswith("\\|"):
+            hdr_s = hdr_s[:-1]
+        raw_headers = [c.strip() for c in re.split(r"(?<!\\)\|", hdr_s)]
         num_cols = len(raw_headers)
         total_rows = len(data_rows)
 
@@ -1170,10 +1214,12 @@ def chunk_document_text(
     chunks: List[DocumentChunk] = []
 
     hierarchy: List[str] = [document_title]
+    heading_stack: List[Tuple[int, str]] = []
     current_section_title: str = "Preamble / General"
 
     current_block_lines: List[str] = []
     in_code = False
+    prev_was_heading = False
 
     def build_breadcrumbs() -> str:
         return " > ".join(hierarchy)
@@ -1206,7 +1252,11 @@ def chunk_document_text(
                 )
             )
 
-        if chunk_type == "table" or "Showing rows" in clean_content or "Showing entries" in clean_content:
+        if (
+            chunk_type == "table"
+            or "> **Table Context**:" in clean_content
+            or "> **Schedule Context**:" in clean_content
+        ):
             add_chunk(clean_content, current_section_title)
             return
 
@@ -1258,6 +1308,13 @@ def chunk_document_text(
             for p in sub_paragraphs:
                 p_len = len(p)
                 if p_len > max_size:
+                    if buffer_paras:
+                        part_content = "\n\n".join(buffer_paras)
+                        sub_title = f"{current_section_title} (Part {part_idx})"
+                        add_chunk(part_content, sub_title)
+                        buffer_paras = []
+                        curr_len = 0
+                        part_idx += 1
                     for slice_start in range(0, p_len, max_size):
                         slice_p = p[slice_start : slice_start + max_size]
                         sub_title = f"{current_section_title} (Part {part_idx})"
@@ -1290,11 +1347,13 @@ def chunk_document_text(
 
         if stripped.startswith("```"):
             in_code = not in_code
+            prev_was_heading = False
             current_block_lines.append(line)
             i += 1
             continue
 
         if in_code:
+            prev_was_heading = False
             current_block_lines.append(line)
             i += 1
             continue
@@ -1305,8 +1364,7 @@ def chunk_document_text(
             prev_stripped = lines[i - 1].strip()
             if prev_stripped:
                 if prev_stripped[-1] in (",", ";", "-", "–", "—") or (
-                    prev_stripped[-1].isalnum()
-                    and not prev_stripped.endswith((".", ":", "?", "!", '"""', "'''", "```"))
+                    not prev_was_heading and prev_stripped[-1].isalnum()
                 ):
                     is_continuation = True
 
@@ -1318,31 +1376,18 @@ def chunk_document_text(
                 finalize_chunk("\n".join(current_block_lines))
                 current_block_lines = []
 
-            if level == 1:
-                hierarchy = [document_title, title]
-                current_section_title = title
-            elif level == 2:
-                if len(hierarchy) > 1:
-                    hierarchy = hierarchy[:2] + [title]
-                else:
-                    hierarchy = [document_title, title]
-                current_section_title = title
-            elif level == 3:
-                if len(hierarchy) >= 3:
-                    hierarchy = hierarchy[:2] + [title]
-                else:
-                    hierarchy.append(title)
-                current_section_title = title
-            elif level >= 4:
-                if len(hierarchy) >= 4:
-                    hierarchy = hierarchy[:3] + [title]
-                else:
-                    hierarchy.append(title)
-                current_section_title = title
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            heading_stack.append((level, title))
+            hierarchy = [document_title] + [t for _, t in heading_stack]
+            current_section_title = title
 
+            prev_was_heading = True
             current_block_lines.append(line)
             i += 1
             continue
+
+        prev_was_heading = False
 
         # Atomic table & schedule ingestion: keep entire table together in the current block
         tbl_info = detect_table_block(lines, i)

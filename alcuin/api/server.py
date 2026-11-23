@@ -285,17 +285,20 @@ def create_note(name: str, req: CreateNoteRequest):
         raise HTTPException(status_code=404, detail=f"Vault '{name}' not found.")
     vault = Vault.load(path)
 
+    vault_root = vault.root_path.resolve()
+    alcuin_meta_dir = (vault_root / ".alcuin").resolve()
     sub = (req.subfolder or "").strip().strip("/")
-    target_dir = vault.root_path / sub if sub else vault.root_path
-    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = vault_root / sub if sub else vault_root
 
     fname = req.filename or f"{re.sub(r'[^a-zA-Z0-9_-]', '_', req.title.lower())}.md"
     if not fname.endswith(".md"):
         fname += ".md"
 
     note_path = (target_dir / fname).resolve()
-    if not note_path.is_relative_to(vault.root_path.resolve()):
+    if not note_path.is_relative_to(vault_root) or note_path.is_relative_to(alcuin_meta_dir):
         raise HTTPException(status_code=400, detail="Invalid path traversal outside vault root.")
+
+    note_path.parent.mkdir(parents=True, exist_ok=True)
 
     content = req.content
     if not content.startswith("# "):
@@ -308,7 +311,7 @@ def create_note(name: str, req: CreateNoteRequest):
     rep = storage.index()
     return {
         "status": "created",
-        "file_path": note_path.relative_to(vault.root_path).as_posix(),
+        "file_path": note_path.relative_to(vault_root).as_posix(),
         "chunks_indexed": rep.total_chunks_indexed,
     }
 
@@ -843,7 +846,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     let activeVault = '';
     let latestFinding = null;
     function escapeHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
-    let latestFinding = null;
 
     async function loadModels() {
       try {
@@ -910,7 +912,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     async function loadCatalog() {
       if (!activeVault) return;
       try {
-        const res = await fetch(`/api/v1/vaults/${activeVault}`);
+        const res = await fetch(`/api/v1/vaults/${encodeURIComponent(activeVault)}`);
         const data = await res.json();
         const tbody = document.getElementById('catalogTableBody');
         tbody.innerHTML = '';
@@ -921,9 +923,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         entries.forEach(([fp, info]) => {
           const tr = document.createElement('tr');
           const date = info.mtime ? new Date(info.mtime * 1000).toLocaleString() : '-';
+          const chunkCount = info.chunk_count ?? info.chunks ?? 0;
           tr.innerHTML = `
             <td class="py-2.5 px-3 text-cyan-300">${escapeHtml(fp)}</td>
-            <td class="py-2.5 px-3">${info.chunks || 0}</td>
+            <td class="py-2.5 px-3">${chunkCount}</td>
             <td class="py-2.5 px-3 text-slate-400">${info.size || 0}</td>
             <td class="py-2.5 px-3 text-slate-500">${date}</td>
           `;
@@ -937,14 +940,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     async function loadHealth() {
       if (!activeVault) return;
       try {
-        const resV = await fetch(`/api/v1/vaults/${activeVault}`);
+        const resV = await fetch(`/api/v1/vaults/${encodeURIComponent(activeVault)}`);
         const dataV = await resV.json();
         document.getElementById('healthChunks').innerText = dataV.chunk_count || 0;
         document.getElementById('healthEmbed').innerText = dataV.config.embedding_model || 'nomic-embed-text';
 
-        const resG = await fetch(`/api/v1/vaults/${activeVault}/gaps`);
+        const resG = await fetch(`/api/v1/vaults/${encodeURIComponent(activeVault)}/gaps`);
         const dataG = await resG.json();
-        document.getElementById('healthGaps').innerText = (dataG.gaps || []).filter(g => !g.resolved).length;
+        const isGapResolved = (g) => (g.status ? g.status !== 'unresolved' : Boolean(g.resolved));
+        document.getElementById('healthGaps').innerText = (dataG.gaps || []).filter(g => !isGapResolved(g)).length;
         renderGapsTable(dataG.gaps || []);
       } catch (e) {
         console.error('Failed to load health:', e);
@@ -960,30 +964,43 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
       gaps.forEach(g => {
         const tr = document.createElement('tr');
-        const st = g.resolved ? '<span class="text-emerald-400">Resolved</span>' : '<span class="text-amber-400">Open</span>';
-        const act = g.resolved ? '-' : `<button onclick="resolveGap('${g.id}')" class="text-cyan-400 hover:underline">Resolve</button>`;
+        const resolved = g.status ? g.status !== 'unresolved' : Boolean(g.resolved);
+        const queryText = g.query ?? g.question ?? '';
+        const confVal = Number(g.last_confidence ?? g.confidence ?? 0);
+        const st = resolved ? '<span class="text-emerald-400">Resolved</span>' : '<span class="text-amber-400">Open</span>';
         tr.innerHTML = `
-          <td class="py-2.5 px-3 text-slate-200">${escapeHtml(g.question)}</td>
-          <td class="py-2.5 px-3 text-slate-400">${Math.round(g.confidence * 100)}%</td>
+          <td class="py-2.5 px-3 text-slate-200">${escapeHtml(queryText)}</td>
+          <td class="py-2.5 px-3 text-slate-400">${Math.round(confVal * 100)}%</td>
           <td class="py-2.5 px-3 font-semibold">${st}</td>
-          <td class="py-2.5 px-3">${act}</td>
+          <td class="py-2.5 px-3"></td>
         `;
+        const actCell = tr.lastElementChild;
+        if (resolved) {
+          actCell.textContent = '-';
+        } else {
+          const btn = document.createElement('button');
+          btn.className = 'text-cyan-400 hover:underline';
+          btn.textContent = 'Resolve';
+          btn.addEventListener('click', () => resolveGap(g.id));
+          actCell.appendChild(btn);
+        }
         tbody.appendChild(tr);
       });
     }
 
     async function resolveGap(gapId) {
-      await fetch(`/api/v1/vaults/${activeVault}/gaps/${gapId}/resolve`, {method: 'POST'});
+      await fetch(`/api/v1/vaults/${encodeURIComponent(activeVault)}/gaps/${encodeURIComponent(gapId)}/resolve`, {method: 'POST'});
       loadHealth();
     }
 
     async function runLinter() {
       if (!activeVault) return;
-      const res = await fetch(`/api/v1/vaults/${activeVault}/lint`);
+      const res = await fetch(`/api/v1/vaults/${encodeURIComponent(activeVault)}/lint`);
       const data = await res.json();
       const list = document.getElementById('lintIssuesList');
       list.innerHTML = '';
-      document.getElementById('lintSummary').innerText = `Audit complete: ${data.total_issues} issue(s) detected.`;
+      const issueCount = data.total_issues ?? (data.issues || []).length;
+      document.getElementById('lintSummary').innerText = `Audit complete: ${issueCount} issue(s) detected.`;
 
       (data.issues || []).forEach(iss => {
         const li = document.createElement('li');
@@ -996,7 +1013,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
     async function fixLinter() {
       if (!activeVault) return;
-      const res = await fetch(`/api/v1/vaults/${activeVault}/lint/fix`, {method: 'POST'});
+      const res = await fetch(`/api/v1/vaults/${encodeURIComponent(activeVault)}/lint/fix`, {method: 'POST'});
       const data = await res.json();
       alert(`Auto-fix complete: ${data.fixed_count} issue(s) resolved.`);
       runLinter();
@@ -1021,23 +1038,31 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           </div>
           <div class="text-[11px] font-mono text-slate-400 truncate" title="${escapeHtml(v.path)}">${escapeHtml(v.path)}</div>
           <div class="text-xs text-slate-400">${v.chunks} chunks indexed</div>
-          <div class="flex gap-2 pt-2 border-t border-slate-800/60 text-xs">
-            <button onclick="setDefaultVault('${v.name}')" class="text-cyan-400 hover:underline">Set Default</button>
-            <button onclick="deleteVault('${v.name}')" class="text-red-400 hover:underline ml-auto">Unregister</button>
-          </div>
+          <div class="flex gap-2 pt-2 border-t border-slate-800/60 text-xs"></div>
         `;
+        const actions = card.lastElementChild;
+        const defBtn = document.createElement('button');
+        defBtn.className = 'text-cyan-400 hover:underline';
+        defBtn.textContent = 'Set Default';
+        defBtn.addEventListener('click', () => setDefaultVault(v.name));
+        const delBtn = document.createElement('button');
+        delBtn.className = 'text-red-400 hover:underline ml-auto';
+        delBtn.textContent = 'Unregister';
+        delBtn.addEventListener('click', () => deleteVault(v.name));
+        actions.appendChild(defBtn);
+        actions.appendChild(delBtn);
         grid.appendChild(card);
       });
     }
 
     async function setDefaultVault(name) {
-      await fetch(`/api/v1/vaults/${name}/default`, {method: 'POST'});
+      await fetch(`/api/v1/vaults/${encodeURIComponent(name)}/default`, {method: 'POST'});
       loadVaults();
     }
 
     async function deleteVault(name) {
       if (!confirm(`Unregister vault '${name}'? (Local files will be preserved)`)) return;
-      await fetch(`/api/v1/vaults/${name}`, {method: 'DELETE'});
+      await fetch(`/api/v1/vaults/${encodeURIComponent(name)}`, {method: 'DELETE'});
       loadVaults();
     }
 

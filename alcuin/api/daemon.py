@@ -67,26 +67,28 @@ class PeriodicIndexer:
                 continue
 
             try:
-                vault = Vault.load(path)
+                vault = await asyncio.to_thread(Vault.load, path)
 
                 # 1. Automated Background Inbox Intake (SPEC-020)
                 if vault.config.auto_ingest_inbox:
                     last_inbox = self._last_inbox_check.get(name, 0.0)
                     inbox_interval = vault.config.inbox_check_interval_seconds
-                    if (now - last_inbox) >= inbox_interval:
-                        self._last_inbox_check[name] = now
+                    if (time.time() - last_inbox) >= inbox_interval:
                         await self._process_vault_inbox(name, vault)
+                        self._last_inbox_check[name] = time.time()
 
                 # 2. Periodic LanceDB / BM25 Incremental Indexing
                 if vault.config.periodic_indexing:
                     last_sync = self._last_indexed.get(name, 0.0)
                     interval = vault.config.index_interval_seconds
 
-                    if (now - last_sync) >= interval:
+                    if (time.time() - last_sync) >= interval:
                         async with self._lock:
-                            storage = VaultStorage(vault)
-                            report = await asyncio.to_thread(storage.index)
-                            self._last_indexed[name] = now
+                            def _run_index(v: Vault):
+                                return VaultStorage(v).index()
+
+                            report = await asyncio.to_thread(_run_index, vault)
+                            self._last_indexed[name] = time.time()
                             if report.has_changes:
                                 logger.info(
                                     f"Periodic sync for '{name}': +{len(report.added_files)} "
@@ -108,7 +110,8 @@ class PeriodicIndexer:
                 for p in inbox_dir.iterdir()
                 if p.is_file() and not p.name.startswith(".") and p.name != "_rejected"
             ]
-        except OSError:
+        except OSError as exc:
+            logger.warning(f"Could not read inbox directory for vault '{name}': {exc}")
             return
 
         if not candidates:
@@ -125,13 +128,13 @@ class PeriodicIndexer:
                     stable_files.append(p)
                 else:
                     self._file_stats[key] = curr_stat
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug(f"Could not stat inbox candidate '{p}': {exc}")
 
         if stable_files:
             async with self._lock:
                 engine = InboxIngestionEngine(vault)
-                result = await asyncio.to_thread(engine.ingest_inbox)
+                result = await asyncio.to_thread(engine.ingest_inbox, only_files=stable_files)
                 if result.ingested_notes:
                     logger.info(
                         f"Auto-ingested {len(result.ingested_notes)} document(s) in vault '{name}'"

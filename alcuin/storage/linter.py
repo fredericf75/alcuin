@@ -207,9 +207,12 @@ class VaultLinter:
         if rel_md_candidate in known_targets["exact_paths"] or rel_md_candidate.lower() in known_targets["exact_paths"]:
             return True
 
-        # 3. Direct filesystem check fallback
-        if (self.vault.root_path / clean).exists() or (self.vault.root_path / f"{clean}.md").exists():
-            return True
+        # 3. Direct filesystem check fallback (strictly contained inside vault root)
+        vault_root = self.vault.root_path.resolve()
+        for rel_try in (clean, f"{clean}.md"):
+            cand = (vault_root / rel_try).resolve()
+            if cand.is_relative_to(vault_root) and cand.exists():
+                return True
 
         return False
 

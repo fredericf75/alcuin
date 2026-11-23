@@ -156,6 +156,8 @@ class VaultConfig:
             vector_weight=float(storage_sec.get("vector_weight", 0.7)),
             periodic_indexing=bool(ingest_sec.get("periodic_indexing", True)),
             index_interval_seconds=int(ingest_sec.get("index_interval_seconds", 300)),
+            auto_ingest_inbox=bool(ingest_sec.get("auto_ingest_inbox", True)),
+            inbox_check_interval_seconds=int(ingest_sec.get("inbox_check_interval_seconds", 5)),
             file_extensions=list(
                 ingest_sec.get("file_extensions", [".pdf", ".docx", ".md", ".txt"])
             ),
@@ -325,7 +327,7 @@ class VaultConfig:
             f"elasticity_elbow_floor = {self.elasticity_elbow_floor}",
             f"elasticity_elbow_delta = {self.elasticity_elbow_delta}",
             f"reranker_enabled = {'true' if self.reranker_enabled else 'false'}",
-            f'reranker_model = "{self.reranker_model}"',
+            f"reranker_model = {json.dumps(self.reranker_model)}",
             f"source_diversification = {'true' if self.source_diversification else 'false'}",
             f"source_diversification_quota = {self.source_diversification_quota}",
             f"source_diversification_decay = {self.source_diversification_decay}",
@@ -358,6 +360,11 @@ class VaultConfig:
         ])
         storage_block = "\n".join(storage_lines)
 
+        glossary_block = ""
+        if self.glossary:
+            g_lines = [f"{json.dumps(str(k))} = {json.dumps(str(v))}" for k, v in sorted(self.glossary.items())]
+            glossary_block = "\n[glossary]\n" + "\n".join(g_lines) + "\n"
+
         return f"""# Alcuin Vault Configuration
 
 [vault]
@@ -373,11 +380,13 @@ description = {json.dumps(self.description)}
 [ingestion]
 periodic_indexing = {"true" if self.periodic_indexing else "false"}
 index_interval_seconds = {self.index_interval_seconds}
+auto_ingest_inbox = {"true" if self.auto_ingest_inbox else "false"}
+inbox_check_interval_seconds = {self.inbox_check_interval_seconds}
 file_extensions = [{exts}]
 exclude_patterns = [{excludes}]
 inbox_dir = {json.dumps(self.inbox_dir)}
 archive_dir = {json.dumps(self.archive_dir)}
-"""
+{glossary_block}"""
 
 
 class VaultRegistry:

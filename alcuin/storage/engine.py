@@ -7,6 +7,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -31,6 +32,8 @@ from alcuin.chunker.chunker import (
     extract_text_file,
 )
 from alcuin.storage.vault import Vault, VaultConfig
+
+logger = logging.getLogger(__name__)
 
 WIKILINK_PATTERN = re.compile(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]")
 CHUNKS_TABLE_NAME = "chunks"
@@ -231,9 +234,16 @@ class EmbeddingClient:
                         else:
                             batch_embs = None
                     except (httpx.ConnectError, ConnectionRefusedError) as e:
-                        # Initial probe failure: mark unavailable for offline unit tests
+                        # Initial probe failure: mark unavailable and fall back to deterministic
+                        # SHA-256 vectors so offline unit tests can run without Ollama.
                         if self._available is None:
                             self._available = False
+                            logger.warning(
+                                "Embedding server at %s is unreachable (%s); falling back to "
+                                "deterministic offline hash vectors (semantic search quality will be degraded).",
+                                self.endpoint,
+                                e,
+                            )
                             return [self._fallback_embedding(t) for t in texts]
                         last_error = e
                         if attempt < max_retries - 1:
@@ -262,6 +272,11 @@ class EmbeddingClient:
                             f"after {max_retries} attempts: {last_error}"
                         )
                     self._available = False
+                    logger.warning(
+                        "Embedding server at %s failed initial batch (%s); falling back to offline hash vectors.",
+                        self.endpoint,
+                        last_error,
+                    )
                     results.extend([self._fallback_embedding(t) for t in batch])
 
         return results
@@ -381,15 +396,21 @@ class VaultStorage:
         return expanded, latency_ms
 
     def _get_or_create_table(self):
-        try:
-            tbl = self.db.open_table(CHUNKS_TABLE_NAME)
-            curr_names = set(tbl.schema.names)
-            expected_names = set(SCHEMA.names)
-            if not expected_names.issubset(curr_names):
-                return self.db.create_table(CHUNKS_TABLE_NAME, schema=SCHEMA, mode="overwrite")
-            return tbl
-        except Exception:
+        tbl_res = self.db.list_tables() if hasattr(self.db, "list_tables") else self.db.table_names()
+        existing_tables = getattr(tbl_res, "tables", tbl_res)
+        if CHUNKS_TABLE_NAME not in existing_tables:
             return self.db.create_table(CHUNKS_TABLE_NAME, schema=SCHEMA, mode="overwrite")
+        tbl = self.db.open_table(CHUNKS_TABLE_NAME)
+        curr_names = set(tbl.schema.names)
+        expected_names = set(SCHEMA.names)
+        if not expected_names.issubset(curr_names):
+            logger.warning(
+                "LanceDB table '%s' schema is missing expected columns %s; recreating table.",
+                CHUNKS_TABLE_NAME,
+                sorted(expected_names - curr_names),
+            )
+            return self.db.create_table(CHUNKS_TABLE_NAME, schema=SCHEMA, mode="overwrite")
+        return tbl
 
     def _should_exclude(self, rel_path_str: str) -> bool:
         # Normalize slashes for glob matching
@@ -598,6 +619,11 @@ class VaultStorage:
 
         for r in res:
             v = r.get("vector")
+            # NOTE (Cosine Score Harmonization, commit bc3e016f):
+            # LanceDB hybrid RRF governs Stage-1 candidate recall above (including exact FTS hits),
+            # while live-vector cosine re-scoring intentionally harmonizes scores onto [-1, 1] so
+            # downstream cosine-calibrated gates (0.40 score-cliff floor, 0.58 sibling threshold)
+            # are not distorted by RRF's top_rrf=1.0 normalization on out-of-domain queries.
             if is_live_vector and v is not None and len(v) == len(query_vec):
                 v_norm = math.sqrt(sum(x * x for x in v)) or 1.0
                 dot = sum(a * b for a, b in zip(query_vec, v))
@@ -636,7 +662,11 @@ class VaultStorage:
                 for r in results:
                     cnt = doc_counts.get(r.file_path, 0)
                     if cnt >= quota:
-                        r.score = r.score * (decay ** (cnt - quota + 1))
+                        factor = decay ** (cnt - quota + 1)
+                        if r.score > 0:
+                            r.score = r.score * factor
+                        elif r.score < 0 and factor > 0:
+                            r.score = r.score / factor
                     doc_counts[r.file_path] = cnt + 1
                 results.sort(key=lambda x: x.score, reverse=True)
 

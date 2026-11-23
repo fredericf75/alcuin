@@ -88,7 +88,7 @@ def test_output_governor_all_addressed(tmp_path):
 def test_output_governor_subquery_synthesis_all_addressed(tmp_path):
     """Verify that isolated sub-query synthesis answers all sub-questions with synthesis_clipped=False."""
     agent = _make_mock_agent(tmp_path)
-    assert agent.vault.config.subquery_synthesis is True
+    agent.vault.config.subquery_synthesis = True  # Opt-in legacy mode (SPEC-033 default is False)
     agent.llm.chat = MagicMock(side_effect=[
         "First subquery direct finding.",
         "Second subquery direct finding.",
@@ -132,7 +132,7 @@ def test_output_governor_subquery_synthesis_all_addressed(tmp_path):
 def test_output_governor_subquery_synthesis_clipped(tmp_path):
     """Verify that if a sub-query returns empty, it is omitted and triggers synthesis_clipped=True."""
     agent = _make_mock_agent(tmp_path)
-    assert agent.vault.config.subquery_synthesis is True
+    agent.vault.config.subquery_synthesis = True  # Opt-in legacy mode (SPEC-033 default is False)
     # Q1 and Q2 succeed, Q3 returns empty response
     agent.llm.chat = MagicMock(side_effect=[
         "First subquery direct finding.",

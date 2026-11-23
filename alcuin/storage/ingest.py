@@ -198,19 +198,13 @@ class InboxIngestionEngine:
 
         # 1. Digital PDF
         if ext == ".pdf":
-            try:
-                pdf_title, pdf_text = extract_pdf_content(file_path, engine=pdf_engine)
-                return pdf_title or title, pdf_text
-            except Exception as e:
-                return title, f"PDF extraction error: {e}"
+            pdf_title, pdf_text = extract_pdf_content(file_path, engine=pdf_engine)
+            return pdf_title or title, pdf_text
 
         # 2. Word documents
         elif ext == ".docx":
-            try:
-                docx_title, docx_text = extract_docx_content(file_path)
-                return docx_title or title, docx_text
-            except Exception as e:
-                return title, f"Word extraction error: {e}"
+            docx_title, docx_text = extract_docx_content(file_path)
+            return docx_title or title, docx_text
 
         # 3. Plain text / Markdown
         elif ext in (".md", ".txt"):
@@ -268,7 +262,10 @@ class InboxIngestionEngine:
                 f"Skipped: Already ingested as '{prev.vault_note_path}' on {prev.ingested_at[:10]} (SHA-256 match)",
             )
 
-        title, extracted_body = self.extract_content(file_path, pdf_engine=pdf_engine)
+        try:
+            title, extracted_body = self.extract_content(file_path, pdf_engine=pdf_engine)
+        except Exception as e:
+            return None, f"Extraction failed for '{file_path.name}': {e}"
         now_iso = datetime.now(timezone.utc).isoformat()
         date_short = now_iso[:10]
 
@@ -331,8 +328,9 @@ class InboxIngestionEngine:
         dry_run: bool = False,
         force: bool = False,
         pdf_engine: str = "auto",
+        only_files: Optional[List[Path]] = None,
     ) -> IngestResult:
-        """Process all eligible files in the vault inbox directory and quarantine unsupported files."""
+        """Process eligible files in the vault inbox directory and quarantine unsupported files."""
         result = IngestResult()
 
         valid, msg = self.validate_folders()
@@ -340,11 +338,16 @@ class InboxIngestionEngine:
             result.errors.append(msg)
             return result
 
-        raw_inbox_items = [
-            p
-            for p in self.inbox_dir.iterdir()
-            if p.is_file() and not p.name.startswith(".")
-        ]
+        if only_files is not None:
+            raw_inbox_items = [
+                p for p in only_files if p.is_file() and not p.name.startswith(".")
+            ]
+        else:
+            raw_inbox_items = [
+                p
+                for p in self.inbox_dir.iterdir()
+                if p.is_file() and not p.name.startswith(".")
+            ]
 
         if not raw_inbox_items:
             return result

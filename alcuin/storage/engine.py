@@ -7,6 +7,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -31,6 +32,8 @@ from alcuin.chunker.chunker import (
     extract_text_file,
 )
 from alcuin.storage.vault import Vault, VaultConfig
+
+logger = logging.getLogger(__name__)
 
 WIKILINK_PATTERN = re.compile(r"\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]")
 CHUNKS_TABLE_NAME = "chunks"

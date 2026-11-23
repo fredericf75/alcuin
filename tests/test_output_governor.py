@@ -207,3 +207,94 @@ def test_extract_and_clean_thinking_variants():
     clean, thinking = _extract_and_clean_thinking(raw_plain)
     assert clean == raw_plain
     assert thinking == ""
+
+
+def _base_governor_state() -> AgentState:
+    return {
+        "question": "Multi-question query",
+        "iteration": 1,
+        "max_iterations": 3,
+        "max_hops": 3,
+        "current_query": "test",
+        "visited_links": [],
+        "pending_links": [],
+        "sub_goals": ["q1", "q2", "q3"],
+        "sub_questions": ["Question 1?", "Question 2?", "Question 3?"],
+        "coverage_matrix": [],
+        "visited_queries": [],
+        "recomposed_topics": [],
+        "evidence": [{"breadcrumbs": "Doc > Sec", "file_path": "f.md", "content": "Evidence text"}],
+        "thought_history": [],
+        "is_sufficient": True,
+        "final_answer": "",
+        "confidence": 0.0,
+        "sources": [],
+        "governor_alert": None,
+        "truncation_alert": None,
+        "evidence_only": False,
+        "synthesis_clipped": False,
+        "unaddressed_sub_questions": [],
+    }
+
+
+def test_spec045_continuation_recovers_multi_question_clip(tmp_path):
+    """SPEC-045: Early EOS stopping after Q1 triggers 1 continuation call for [2, 3]."""
+    agent = _make_mock_agent(tmp_path)
+    agent.vault.config.subquery_synthesis = False
+    agent.vault.config.output_governor_continuation = True
+    agent.llm.chat = MagicMock(
+        side_effect=[
+            ("1. First answer details.", {"truncated": False, "finish_reason": "stop"}),
+            ("2. Second answer details.\n\n3. Third answer details.", {"truncated": False, "finish_reason": "stop"}),
+        ]
+    )
+
+    result = agent._synthesize_node(_base_governor_state())
+    assert agent.llm.chat.call_count == 2
+    assert result["synthesis_clipped"] is False
+    assert result["unaddressed_sub_questions"] == []
+    assert "2. Second answer details." in result["final_answer"]
+    assert "3. Third answer details." in result["final_answer"]
+    assert any("[OUTPUT GOVERNOR CONTINUATION]" in th for th in result["thought_history"])
+    # Safeguard #1: continuation prompt must not echo full prior answer
+    cont_user_prompt = agent.llm.chat.call_args_list[1].args[1]
+    assert "First answer details." not in cont_user_prompt
+
+
+def test_spec045_skips_when_truncated_or_disabled(tmp_path):
+    """SPEC-045: Do not issue continuation when finish_reason=length or flag is False."""
+    agent = _make_mock_agent(tmp_path)
+    agent.vault.config.subquery_synthesis = False
+    agent.llm.chat = MagicMock(
+        return_value=("1. First answer details.", {"truncated": True, "finish_reason": "length"})
+    )
+    res_trunc = agent._synthesize_node(_base_governor_state())
+    assert agent.llm.chat.call_count == 1
+    assert "[GENERATION_TRUNCATION_ALERT]" in res_trunc["final_answer"]
+
+    agent.vault.config.output_governor_continuation = False
+    agent.llm.chat = MagicMock(
+        return_value=("1. First answer details.", {"truncated": False, "finish_reason": "stop"})
+    )
+    res_off = agent._synthesize_node(_base_governor_state())
+    assert agent.llm.chat.call_count == 1
+    assert res_off["synthesis_clipped"] is True
+    assert res_off["unaddressed_sub_questions"] == [2, 3]
+
+
+def test_spec045_continuation_preserves_truncation_alert(tmp_path):
+    """SPEC-045 Safeguard #3: If continuation hits length ceiling, surface truncation alert."""
+    agent = _make_mock_agent(tmp_path)
+    agent.vault.config.subquery_synthesis = False
+    agent.vault.config.output_governor_continuation = True
+    agent.llm.chat = MagicMock(
+        side_effect=[
+            ("1. First answer details.", {"truncated": False, "finish_reason": "stop"}),
+            ("2. Second answer partial", {"truncated": True, "finish_reason": "length"}),
+        ]
+    )
+
+    res = agent._synthesize_node(_base_governor_state())
+    assert agent.llm.chat.call_count == 2
+    assert "[GENERATION_TRUNCATION_ALERT]" in res["final_answer"]
+    assert res["truncation_alert"] is not None

@@ -711,11 +711,10 @@ class ResearchAgent:
         """Harvest statutory anchors and build dense keyword search targets for decomposed questions."""
         sub_questions = cleaned_items
         sub_goals: List[str] = []
+        q_lower = question.lower()
 
-        global_identifiers = re.findall(
-            r"\b(?:§\s*\d+|[A-Z]{2,}(?:[\-\/][A-Z0-9]+)*|\b[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+\b|\d+[\-\w]+)\b",
-            question,
-        )
+        id_pattern = r"\b(?:§\s*\d+|[A-Z]{2,}(?:[\-\/][A-Z0-9]+)*|\b[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+\b|\d+[\-\w]+)\b"
+        global_identifiers = re.findall(id_pattern, question)
 
         filler = {
             "within", "how", "many", "days", "after", "must", "the", "a", "an", "for",
@@ -734,10 +733,10 @@ class ResearchAgent:
             parent_anchors = [g for g in global_identifiers if g.lower() in q.lower()]
 
             for clause in sub_clauses:
-                clause_identifiers = re.findall(
-                    r"\b(?:§\s*\d+|[A-Z]{2,}(?:[\-\/][A-Z0-9]+)*|\b[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+\b|\d+[\-\w]+)\b",
-                    clause,
-                )
+                raw_clause_ids = re.findall(id_pattern, clause)
+                # SPEC-046: Only promote/retain identifiers grounded in the user's inquiry
+                clause_identifiers = [cid for cid in raw_clause_ids if cid.lower() in q_lower]
+                ungrounded_ids = {cid.lower() for cid in raw_clause_ids if cid.lower() not in q_lower}
                 body = re.sub(
                     r"^(?:in|under|pursuant to|according to|for|with respect to|regarding)\s+[^,;:\n]+[,\-:]\s*",
                     "",
@@ -747,7 +746,9 @@ class ResearchAgent:
                 words = re.findall(r"\b[\w\-\.]+\b", body)
                 meaningful = [
                     w for w in words
-                    if w.lower() not in filler and (len(w) > 1 or w.isdigit() or w.upper() in ("I", "V", "X"))
+                    if w.lower() not in filler
+                    and w.lower() not in ungrounded_ids
+                    and (len(w) > 1 or w.isdigit() or w.upper() in ("I", "V", "X"))
                 ]
                 anchors = list(dict.fromkeys(clause_identifiers + parent_anchors))
                 content_terms = [w for w in meaningful if w not in anchors]
@@ -906,14 +907,14 @@ class ResearchAgent:
             "CRITICAL RULES:\n"
             "1. Output each question as a numbered item (e.g. 1. [Question], 2. [Question]).\n"
             "2. ATOMICITY: Each question must address exactly ONE requirement, topic, or condition. Never bundle multiple questions together.\n"
-            "3. ENTITY PRESERVATION: Name the specific entity, subject, or statute in every question. Never use pronouns like 'it', 'they', 'this rule', or 'the facility'.\n"
-            "4. PRESERVE SPECIFICITY: Retain all numbers, measurements, thresholds, and specific legal citations from the inquiry (e.g. '14 days', '50 feet', 'second offense').\n"
+            "3. ENTITY PRESERVATION: Name the specific entity, subject, or topic from the inquiry in every question. Never use pronouns like 'it', 'they', 'this rule', or 'the facility'.\n"
+            "4. PRESERVE SPECIFICITY: Retain all numbers, measurements, thresholds, topic keywords, and citations from the inquiry. Do NOT fabricate statute or section numbers or years not present in the inquiry.\n"
             "5. NO CONVERSATION: Do NOT answer the questions. Do NOT output preamble, intro, or JSON. Output ONLY numbered questions."
         )
         user_prompt = (
             "[Task]\n"
             "Deconstruct the user inquiry into a numbered list of standalone, atomic search questions.\n"
-            "Rules: Output ONLY numbered questions (1. ..., 2. ...). Name specific entities in every question (no pronouns). Do NOT answer the questions.\n\n"
+            "Rules: Output ONLY numbered questions (1. ..., 2. ...). Name specific entities in every question (no pronouns). Do NOT fabricate statute or section numbers or years not in the inquiry. Do NOT answer.\n\n"
             "[Examples]\n"
             "Inquiry: Can I build a 600 sq ft detached garage in the backyard, how close can it be to the property line, and does it need a separate electric permit?\n"
             "1. What is the maximum permitted size for a detached accessory garage?\n"

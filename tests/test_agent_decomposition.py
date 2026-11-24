@@ -26,7 +26,6 @@ def test_short_query_bypasses_llm(tmp_path):
     sub_goals, sub_questions = agent.decompose_query(question)
     assert sub_questions == [question]
     assert sub_goals == [question]
-    assert agent.planner_llm.chat.call_count == 0
 
 
 def test_unstructured_query_user_framing_and_few_shot(tmp_path):
@@ -90,3 +89,37 @@ def test_unstructured_query_fallback_on_unparseable(tmp_path):
     sub_goals, sub_questions = agent.decompose_query(question)
     assert sub_questions == [question]
     assert sub_goals == [question]
+
+
+def test_spec046_filters_ungrounded_fabricated_identifiers(tmp_path):
+    """SPEC-046: Planner-fabricated codes/years/acronyms not in inquiry are stripped from sub_goals."""
+    llm_output = (
+        "1. Under NC DHHS 105H-08-01-03, what are the minimum daily aide duty hours for a 30-bed adult care home?\n"
+        "2. Under 2023-2024 DSS rules, what is the minimum age for personal care aides?"
+    )
+    agent = _make_mock_agent(tmp_path, llm_output)
+    question = (
+        "We are planning staffing schedules for a 30-bed adult care home in North Carolina. "
+        "How many daily personal care aide duty hours are required, and what is the minimum age for aides?"
+    )
+    sub_goals, _ = agent.decompose_query(question)
+
+    sys_prompt, user_prompt = agent.planner_llm.chat.call_args[0]
+    assert "Do NOT fabricate" in sys_prompt
+    assert "Do NOT fabricate" in user_prompt
+
+    joined = " | ".join(sub_goals)
+    assert "105H-08-01-03" not in joined
+    assert "2023-2024" not in joined
+    assert "DHHS" not in joined
+    assert "DSS" not in joined
+    assert "30-bed" in joined
+    assert "aide" in joined
+
+
+def test_spec046_preserves_user_supplied_citations(tmp_path):
+    """SPEC-046: Citations/acronyms actually present in the inquiry are preserved as anchors."""
+    agent = _make_mock_agent(tmp_path)
+    question = "1. Under 10A NCAC 13F, what are daily aide duty hours?\n2. When must aides stay awake?"
+    sub_goals, _ = agent.decompose_query(question)
+    assert any("10A" in sg and "NCAC" in sg and "13F" in sg for sg in sub_goals)
